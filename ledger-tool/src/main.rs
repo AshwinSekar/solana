@@ -2248,6 +2248,117 @@ fn main() {
                     }
                 }
             }
+            ("recreate-tower", Some(arg_matches)) => {
+                let log_path = value_t_or_exit!(arg_matches, "log_path", String);
+                let start_vote = value_t_or_exit!(arg_matches, "start_vote", Slot);
+
+                let vote_regex = Regex::new(r"voting: (\d*)").unwrap();
+                let new_root_regex = Regex::new(r"new root (\d*)").unwrap();
+
+                let f = BufReader::new(File::open(&log_path).unwrap());
+                println!("Reading log file {}", log_path);
+                let mut current_vote_state = VoteState::default();
+
+                // Tracks when the recreated vote state becomes consistent with the
+                // original vote state
+                let mut is_consistent = false;
+                for line in f.lines().flatten() {
+                    if let Some(vote_slot_string) = vote_regex.captures_iter(&line).next() {
+                        let vote_slot = vote_slot_string
+                            .get(1)
+                            .expect("Only one match group")
+                            .as_str()
+                            .parse::<u64>()
+                            .unwrap();
+                        current_vote_state.process_slot_vote_unchecked(vote_slot);
+                        if is_consistent && vote_slot >= start_vote {
+                            println!("Parsed vote for slot: {}", vote_slot);
+                            println!(
+                                "root: {:?}, Local vote state: {:#?}",
+                                current_vote_state.root_slot, current_vote_state.votes
+                            );
+                        }
+                    } else if let Some(new_root_string) = new_root_regex.captures_iter(&line).next()
+                    {
+                        let root = new_root_string
+                            .get(1)
+                            .expect("Only one match group")
+                            .as_str()
+                            .parse::<u64>()
+                            .unwrap();
+                        if root >= start_vote {
+                            println!("Parsed new root: {}", root);
+                        }
+                        if Some(root) == current_vote_state.root_slot {
+                            if !is_consistent {
+                                println!("Current vote state is consistent as of root: {}", root);
+                                is_consistent = true;
+                            }
+                        } else if is_consistent {
+                            panic!(
+                                "Our tower was consistent and then became inconsistent, maybe
+                            the log is missing some votes!"
+                            );
+                        }
+                    }
+                }
+
+                let accounts_index_config = value_t!(arg_matches, "accounts_index_bins", usize)
+                    .ok()
+                    .map(|bins| AccountsIndexConfig { bins: Some(bins) });
+
+                let accounts_db_config = Some(AccountsDbConfig {
+                    index: accounts_index_config,
+                    accounts_hash_cache_path: Some(ledger_path.clone()),
+                });
+
+                let process_options = ProcessOptions {
+                    dev_halt_at_slot: value_t!(arg_matches, "halt_at_slot", Slot).ok(),
+                    new_hard_forks: hardforks_of(arg_matches, "hard_forks"),
+                    poh_verify: !arg_matches.is_present("skip_poh_verify"),
+                    bpf_jit: !matches.is_present("no_bpf_jit"),
+                    accounts_db_caching_enabled: !arg_matches.is_present("no_accounts_db_caching"),
+                    limit_load_slot_count_from_snapshot: value_t!(
+                        arg_matches,
+                        "limit_load_slot_count_from_snapshot",
+                        usize
+                    )
+                    .ok(),
+                    accounts_db_config,
+                    verify_index: arg_matches.is_present("verify_accounts_index"),
+                    allow_dead_slots: arg_matches.is_present("allow_dead_slots"),
+                    accounts_db_test_hash_calculation: arg_matches
+                        .is_present("accounts_db_test_hash_calculation"),
+                    ..ProcessOptions::default()
+                };
+                let print_accounts_stats = arg_matches.is_present("print_accounts_stats");
+                println!(
+                    "genesis hash: {}",
+                    open_genesis_config_by(&ledger_path, arg_matches).hash()
+                );
+
+                let blockstore = open_blockstore(
+                    &ledger_path,
+                    AccessType::TryPrimaryThenSecondary,
+                    wal_recovery_mode,
+                );
+                let (bank_forks, ..) = load_bank_forks(
+                    arg_matches,
+                    &open_genesis_config_by(&ledger_path, arg_matches),
+                    &blockstore,
+                    process_options,
+                    snapshot_archive_path,
+                )
+                .unwrap_or_else(|err| {
+                    eprintln!("Ledger verification failed: {:?}", err);
+                    exit(1);
+                });
+                if print_accounts_stats {
+                    let working_bank = bank_forks.working_bank();
+                    working_bank.print_accounts_stats();
+                }
+                println!("Ok");
+            }
             ("create-snapshot", Some(arg_matches)) => {
                 let output_directory = value_t!(arg_matches, "output_directory", PathBuf)
                     .unwrap_or_else(|_| ledger_path.clone());
