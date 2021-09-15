@@ -2132,6 +2132,12 @@ fn main() {
                 println!("Reading log file {}", log_path);
                 let mut current_vote_state = VoteState::default();
 
+                let mut current_vote_state = VoteState::default();
+                let mut pending_votes: VecDeque<Slot> = VecDeque::new();
+
+                let snapshot_root_slot =
+                    snapshot_utils::get_highest_full_snapshot_archive_slot(&ledger_path).unwrap();
+
                 // Tracks when the recreated vote state becomes consistent with the
                 // original vote state
                 let mut is_consistent = false;
@@ -2143,44 +2149,59 @@ fn main() {
                             .as_str()
                             .parse::<u64>()
                             .unwrap();
-                        current_vote_state.process_slot_vote_unchecked(vote_slot);
-                        if is_consistent && vote_slot >= start_vote {
-                            println!("Parsed vote for slot: {}", vote_slot);
-                            println!(
-                                "root: {:?}, Local vote state: {:#?}",
-                                current_vote_state.root_slot, current_vote_state.votes
-                            );
-                        }
-                    } else if let Some(new_root_string) = new_root_regex.captures_iter(&line).next()
-                    {
-                        let root = new_root_string
-                            .get(1)
-                            .expect("Only one match group")
-                            .as_str()
-                            .parse::<u64>()
-                            .unwrap();
-                        if root >= start_vote {
-                            println!("Parsed new root: {}", root);
-                        }
-                        if Some(root) == current_vote_state.root_slot {
-                            if !is_consistent {
-                                println!("Current vote state is consistent as of root: {}", root);
-                                is_consistent = true;
-                            }
-                        } else if is_consistent && pending_votes.is_empty() {
-                            // If
-                            // 1) the root doesn't match AND
-                            // 2) we haven't stopped applying the votes
-                            // to the `current_vote_state` (we know we haven't stopped by checking if
-                            // the `pending_votes` has been added to) AND
-                            // 3) We were previously consistent, i.e. `is_consistent == true`
-                            //
-                            // Then we have become unexpectedly inconsistent.
 
-                            panic!(
-                                "Our tower was consistent and then became inconsistent, maybe
+                        if vote_slot > snapshot_root_slot {
+                            if !is_consistent {
+                                panic!(
+                                    "vote state was not consistent by vote {} > snapshot slot: {}",
+                                    vote_slot, snapshot_root_slot
+                                );
+                            }
+                            pending_votes.push_back(vote_slot);
+                        } else if let Some(new_root_string) =
+                            new_root_regex.captures_iter(&line).next()
+                        {
+                            let root = new_root_string
+                                .get(1)
+                                .expect("Only one match group")
+                                .as_str()
+                                .parse::<u64>()
+                                .unwrap();
+                            if root >= start_vote {
+                                println!("Parsed new root: {}", root);
+                            }
+                            if Some(root) == current_vote_state.root_slot {
+                                if !is_consistent {
+                                    println!(
+                                        "Current vote state is consistent as of root: {}",
+                                        root
+                                    );
+                                    is_consistent = true;
+                                }
+                            } else if is_consistent && pending_votes.is_empty() {
+                                // If
+                                // 1) the root doesn't match AND
+                                // 2) we haven't stopped applying the votes
+                                // to the `current_vote_state` (we know we haven't stopped by checking if
+                                // the `pending_votes` has been added to) AND
+                                // 3) We were previously consistent, i.e. `is_consistent == true`
+                                //
+                                // Then we have become unexpectedly inconsistent.
+
+                                panic!(
+                                    "Our tower was consistent and then became inconsistent, maybe
                             the log is missing some votes!"
-                            );
+                                );
+                            }
+                        } else {
+                            current_vote_state.process_slot_vote_unchecked(vote_slot);
+                            if is_consistent && vote_slot >= start_vote {
+                                println!("Parsed vote for slot: {}", vote_slot);
+                                println!(
+                                    "root: {:?}, Local vote state: {:#?}",
+                                    current_vote_state.root_slot, current_vote_state.votes
+                                );
+                            }
                         }
                     }
                 }
