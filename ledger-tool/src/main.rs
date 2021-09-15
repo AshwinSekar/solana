@@ -729,6 +729,42 @@ fn load_bank_forks(
     process_options: ProcessOptions,
     snapshot_archive_path: Option<PathBuf>,
 ) -> Result<(BankForks, Option<StartingSnapshotHashes>), BlockstoreProcessorError> {
+    do_load_bank_forks(
+        arg_matches,
+        genesis_config,
+        blockstore,
+        process_options,
+        snapshot_archive_path,
+        None,
+    )
+}
+
+fn load_bank_forks_with_simulated_tower(
+    arg_matches: &ArgMatches,
+    genesis_config: &GenesisConfig,
+    blockstore: &Blockstore,
+    process_options: ProcessOptions,
+    snapshot_archive_path: Option<PathBuf>,
+    simulated_tower: SimulatedTower,
+) -> Result<(BankForks, Option<StartingSnapshotHashes>), BlockstoreProcessorError> {
+    do_load_bank_forks(
+        arg_matches,
+        genesis_config,
+        blockstore,
+        process_options,
+        snapshot_archive_path,
+        Some(simulated_tower),
+    )
+}
+
+fn do_load_bank_forks(
+    arg_matches: &ArgMatches,
+    genesis_config: &GenesisConfig,
+    blockstore: &Blockstore,
+    process_options: ProcessOptions,
+    snapshot_archive_path: Option<PathBuf>,
+    simulated_tower: Option<SimulatedTower>,
+) -> Result<(BankForks, Option<StartingSnapshotHashes>), BlockstoreProcessorError> {
     let bank_snapshots_dir = blockstore
         .ledger_path()
         .join(if blockstore.is_primary_access() {
@@ -779,6 +815,7 @@ fn load_bank_forks(
         None,
         PendingAccountsPackage::default(),
         None,
+        simulated_tower,
     )
     .map(|(bank_forks, .., starting_snapshot_hashes)| (bank_forks, starting_snapshot_hashes))
 }
