@@ -221,6 +221,12 @@ impl Tower {
         // keyed by end of the range
         let mut lockout_intervals = LockoutIntervals::new();
         let mut my_latest_landed_vote = None;
+        let mut top_keys: Vec<(u64, Pubkey)> =
+            vote_accounts.iter().map(|(k, (s, _vote_state))| (*s, *k)).collect();
+        top_keys.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+        top_keys.truncate(10);
+        let top_keys: HashSet<Pubkey> = top_keys.into_iter().map(|(_, k)| k).collect();
+
         for (&key, (voted_stake, account)) in vote_accounts.iter() {
             let voted_stake = *voted_stake;
             if voted_stake == 0 {
@@ -248,7 +254,18 @@ impl Tower {
                     .push((vote.slot, key));
             }
 
-            if key == *vote_account_pubkey {
+            let node_pubkey = vote_state.node_pubkey;
+            if top_keys.contains(&key) {
+                println!(
+                    "validator {} vote state root: {:?}, votes: {:#?}",
+                    node_pubkey, vote_state.root_slot, vote_state.votes
+                );
+            }
+            if key == *vote_account_pubkey || key == node_pubkey {
+                println!(
+                    "my vote state root: {:?}, votes: {:#?}",
+                    vote_state.root_slot, vote_state.votes
+                );
                 my_latest_landed_vote = vote_state.nth_recent_vote(0).map(|v| v.slot);
                 debug!("vote state {:?}", vote_state);
                 debug!(
@@ -279,6 +296,10 @@ impl Tower {
             }
 
             vote_state.process_slot_vote_unchecked(bank_slot);
+            println!(
+                "validator {} vote state root: {:?}, votes: {:#?} after applying {}",
+                node_pubkey, vote_state.root_slot, vote_state.votes, bank_slot
+            );
 
             for vote in &vote_state.votes {
                 bank_weight += vote.lockout() as u128 * voted_stake as u128;
@@ -867,23 +888,34 @@ impl Tower {
         let mut vote_state = self.vote_state.clone();
         vote_state.process_slot_vote_unchecked(slot);
         let vote = vote_state.nth_recent_vote(self.threshold_depth);
+
         if let Some(vote) = vote {
             if let Some(fork_stake) = voted_stakes.get(&vote.slot) {
                 let lockout = *fork_stake as f64 / total_stake as f64;
-                trace!(
-                    "fork_stake slot: {}, vote slot: {}, lockout: {} fork_stake: {} total_stake: {}",
-                    slot, vote.slot, lockout, fork_stake, total_stake
-                );
-                if vote.confirmation_count as usize > self.threshold_depth {
-                    for old_vote in &self.vote_state.votes {
-                        if old_vote.slot == vote.slot
-                            && old_vote.confirmation_count == vote.confirmation_count
-                        {
-                            return true;
+
+                let res = {
+                    if vote.confirmation_count as usize > self.threshold_depth {
+                        for old_vote in &self.vote_state.votes {
+                            if old_vote.slot == vote.slot
+                                && old_vote.confirmation_count == vote.confirmation_count
+                            {
+                                return true;
+                            }
                         }
                     }
-                }
-                lockout > self.threshold_size
+                    lockout > self.threshold_size
+                };
+
+                println!(
+                    "fork_stake slot: {}, 
+                    threshold vote slot: {}, 
+                    lockout: {}
+                    cluster_voted_stake: {}
+                    total_stake: {},
+                    result: {}",
+                    slot, vote.slot, lockout, fork_stake, total_stake, res
+                );
+                res
             } else {
                 false
             }
