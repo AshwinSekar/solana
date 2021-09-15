@@ -87,6 +87,7 @@ pub fn load(
                 transaction_status_sender,
                 cache_block_meta_sender,
                 accounts_package_sender,
+                simulated_tower,
             );
         } else {
             info!("No snapshot package available; will load from genesis");
@@ -145,6 +146,7 @@ fn load_from_snapshot(
     transaction_status_sender: Option<&TransactionStatusSender>,
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
     accounts_package_sender: AccountsPackageSender,
+    simulated_tower: &mut Option<&mut SimulatedTower>,
 ) -> LoadResult {
     // Fail hard here if snapshot fails to load, don't silently continue
     if account_paths.is_empty() {
@@ -193,6 +195,7 @@ fn load_from_snapshot(
             accounts_package_sender,
             timings,
             full_snapshot_archive_info.slot(),
+            simulated_tower,
         ),
         Some(deserialized_bank_slot_and_hash),
     )
