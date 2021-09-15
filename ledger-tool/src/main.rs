@@ -2123,7 +2123,16 @@ fn main() {
                             println!("Current vote state is consistent as of root: {}", root);
                             is_consistent = true;
                         }
-                    } else if is_consistent {
+                    }
+                    // If
+                    // 1) the root doesn't match AND
+                    // 2) we haven't stopped applying the votes
+                    // to the `current_vote_state` (we know we haven't stopped by checking if
+                    // the `pending_votes` has been added to) AND
+                    // 3) We were previously consistent, i.e. `is_consistent == true`
+                    //
+                    // Then we have become unexpectedly inconsistent.
+                    else if is_consistent && pending_votes.is_empty() {
                         panic!(
                             "Our tower was consistent and then became inconsistent, maybe
                             the log is missing some votes!"
