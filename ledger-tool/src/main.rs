@@ -1378,6 +1378,14 @@ fn main() {
                     .required(true)
                     .help("first vote slot after which to start printing the tower"),
             )
+            .arg(
+                Arg::with_name("validator_pubkey")
+                    .index(3)
+                    .value_name("PUBKEY")
+                    .takes_value(true)
+                    .required(true)
+                    .help("pubkey of this validator"),
+            )
         )
         .subcommand(
             SubCommand::with_name("create-snapshot")
@@ -2089,10 +2097,10 @@ fn main() {
                     );
                 }
             }
-
             ("recreate-tower", Some(arg_matches)) => {
                 let log_path = value_t_or_exit!(arg_matches, "log_path", String);
                 let start_vote = value_t_or_exit!(arg_matches, "start_vote", Slot);
+                let validator_pubkey = pubkey_of(arg_matches, "validator_pubkey").unwrap();
 
                 let vote_regex = Regex::new(r"voting: (\d*)").unwrap();
                 let new_root_regex = Regex::new(r"new root (\d*)").unwrap();
@@ -2180,6 +2188,7 @@ fn main() {
                 let mut simulated_tower = SimulatedTower {
                     tower,
                     pending_votes,
+                    validator_pubkey,
                 };
 
                 let filler_account_count =

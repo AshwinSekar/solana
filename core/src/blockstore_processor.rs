@@ -1332,7 +1332,7 @@ fn process_single_slot(
                 });
 
             // Simulate collecting vote lockouts
-            let me = Pubkey::new_unique();
+            let me = sim_tower.validator_pubkey;
             let computed_bank_state = Tower::collect_vote_lockouts(
                 &me, // only used for debug purposes
                 bank.slot(),
@@ -1350,10 +1350,21 @@ fn process_single_slot(
                 ..
             } = computed_bank_state;
 
-            sim_tower.tower.check_vote_stake_threshold(bank.slot(), &voted_stakes, total_stake);
+            sim_tower
+                .tower
+                .check_vote_stake_threshold(bank.slot(), &voted_stakes, total_stake);
 
             if sim_tower.pending_votes.contains(&bank.slot()) {
-                return Ok(sim_tower.tower.record_bank_vote(bank, &me).is_some());
+                let new_root = sim_tower.tower.record_bank_vote(bank, &me);
+                println!("Voted on slot {}", bank.slot());
+                if let Some(new_root) = &new_root {
+                    println!("new root: {}", new_root);
+                }
+                println!(
+                    "root: {:?}, Local vote state: {:#?}",
+                    sim_tower.tower.vote_state.root_slot, sim_tower.tower.vote_state.votes
+                );
+                return Ok(new_root.is_some());
             }
         }
         None => (),
