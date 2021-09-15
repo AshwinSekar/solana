@@ -1363,7 +1363,7 @@ impl Bank {
     }
 
     /// Returns all ancestors excluding self.slot.
-    pub(crate) fn proper_ancestors(&self) -> impl Iterator<Item = Slot> + '_ {
+    pub fn proper_ancestors(&self) -> impl Iterator<Item = Slot> + '_ {
         self.ancestors
             .keys()
             .into_iter()
