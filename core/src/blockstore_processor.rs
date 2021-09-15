@@ -1147,7 +1147,9 @@ fn load_frozen_forks(
             // for newer cluster confirmed roots
             let new_root_bank = {
                 if rooted {
-                    Some(&bank)
+                    let root_slot = simulated_tower.as_ref().unwrap().tower.root();
+                    let root_bank = all_banks.get(&root_slot).unwrap();
+                    Some(root_bank)
                 } else {
                     None
                 }
