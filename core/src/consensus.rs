@@ -221,8 +221,10 @@ impl Tower {
         // keyed by end of the range
         let mut lockout_intervals = LockoutIntervals::new();
         let mut my_latest_landed_vote = None;
-        let mut top_keys: Vec<(u64, Pubkey)> =
-            vote_accounts.iter().map(|(k, (s, _vote_state))| (*s, *k)).collect();
+        let mut top_keys: Vec<(u64, Pubkey)> = vote_accounts
+            .iter()
+            .map(|(k, (s, _vote_state))| (*s, *k))
+            .collect();
         top_keys.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
         top_keys.truncate(10);
         let top_keys: HashSet<Pubkey> = top_keys.into_iter().map(|(_, k)| k).collect();
