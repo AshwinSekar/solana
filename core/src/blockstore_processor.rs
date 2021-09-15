@@ -1102,6 +1102,15 @@ fn load_frozen_forks(
     if root_bank.slot() != dev_halt_at_slot {
         while !pending_slots.is_empty() {
             let (meta, bank, last_entry_hash) = pending_slots.pop().unwrap();
+            if bank.slot()
+                > simulated_tower
+                    .as_ref()
+                    .and_then(|simulated_tower| simulated_tower.pending_votes.front().copied())
+                    .unwrap_or(Slot::MAX)
+            {
+                pending_slots.insert(0, (meta, bank, last_entry_hash));
+                continue;
+            }
             let slot = bank.slot();
             if last_status_report.elapsed() > Duration::from_secs(2) {
                 let secs = last_status_report.elapsed().as_secs() as f32;
@@ -1335,6 +1344,21 @@ fn process_single_slot(
 
             // Simulate collecting vote lockouts
             let me = sim_tower.validator_pubkey;
+
+            if sim_tower.pending_votes.front() == Some(&bank.slot()) {
+                sim_tower.pending_votes.pop_front();
+                let new_root = sim_tower.tower.record_bank_vote(bank, &me);
+                println!("Voted on slot {}", bank.slot());
+                if let Some(new_root) = &new_root {
+                    println!("new root: {}", new_root);
+                }
+                println!(
+                    "root: {:?}, Local vote state: {:#?}",
+                    sim_tower.tower.vote_state.root_slot, sim_tower.tower.vote_state.votes
+                );
+                return Ok(new_root.is_some());
+            }
+
             let computed_bank_state = Tower::collect_vote_lockouts(
                 &me, // only used for debug purposes
                 bank.slot(),
@@ -1355,19 +1379,6 @@ fn process_single_slot(
             sim_tower
                 .tower
                 .check_vote_stake_threshold(bank.slot(), &voted_stakes, total_stake);
-
-            if sim_tower.pending_votes.contains(&bank.slot()) {
-                let new_root = sim_tower.tower.record_bank_vote(bank, &me);
-                println!("Voted on slot {}", bank.slot());
-                if let Some(new_root) = &new_root {
-                    println!("new root: {}", new_root);
-                }
-                println!(
-                    "root: {:?}, Local vote state: {:#?}",
-                    sim_tower.tower.vote_state.root_slot, sim_tower.tower.vote_state.votes
-                );
-                return Ok(new_root.is_some());
-            }
         }
         None => (),
     }
