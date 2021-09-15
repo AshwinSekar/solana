@@ -60,7 +60,7 @@ pub fn load(
     transaction_status_sender: Option<&TransactionStatusSender>,
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
     accounts_package_sender: AccountsPackageSender,
-    simulated_tower: Option<SimulatedTower>,
+    simulated_tower: &mut Option<&mut SimulatedTower>,
 ) -> LoadResult {
     if let Some(snapshot_config) = snapshot_config {
         info!(
@@ -115,7 +115,7 @@ fn load_from_genesis(
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
     snapshot_config: Option<&SnapshotConfig>,
     accounts_package_sender: AccountsPackageSender,
-    simulated_tower: Option<SimulatedTower>,
+    simulated_tower: &mut Option<&mut SimulatedTower>,
 ) -> LoadResult {
     info!("Processing ledger from genesis");
     to_loadresult(

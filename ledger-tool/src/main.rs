@@ -735,7 +735,7 @@ fn load_bank_forks(
         blockstore,
         process_options,
         snapshot_archive_path,
-        None,
+        &mut None,
     )
 }
 
@@ -745,7 +745,7 @@ fn load_bank_forks_with_simulated_tower(
     blockstore: &Blockstore,
     process_options: ProcessOptions,
     snapshot_archive_path: Option<PathBuf>,
-    simulated_tower: SimulatedTower,
+    simulated_tower: &mut SimulatedTower,
 ) -> Result<(BankForks, Option<StartingSnapshotHashes>), BlockstoreProcessorError> {
     do_load_bank_forks(
         arg_matches,
@@ -753,7 +753,7 @@ fn load_bank_forks_with_simulated_tower(
         blockstore,
         process_options,
         snapshot_archive_path,
-        Some(simulated_tower),
+        &mut Some(simulated_tower),
     )
 }
 
@@ -763,7 +763,7 @@ fn do_load_bank_forks(
     blockstore: &Blockstore,
     process_options: ProcessOptions,
     snapshot_archive_path: Option<PathBuf>,
-    simulated_tower: Option<SimulatedTower>,
+    simulated_tower: &mut Option<&mut SimulatedTower>,
 ) -> Result<(BankForks, Option<StartingSnapshotHashes>), BlockstoreProcessorError> {
     let bank_snapshots_dir = blockstore
         .ledger_path()
@@ -2177,6 +2177,10 @@ fn main() {
                     }
                     accounts_index_config.drives = Some(accounts_index_paths);
                 }
+                let mut simulated_tower = SimulatedTower {
+                    tower,
+                    pending_votes,
+                };
 
                 let filler_account_count =
                     value_t!(arg_matches, "accounts_filler_count", usize).ok();
@@ -2219,12 +2223,13 @@ fn main() {
                     AccessType::TryPrimaryThenSecondary,
                     wal_recovery_mode,
                 );
-                let (bank_forks, ..) = load_bank_forks(
+                let (bank_forks, ..) = load_bank_forks_with_simulated_tower(
                     arg_matches,
                     &open_genesis_config_by(&ledger_path, arg_matches),
                     &blockstore,
                     process_options,
                     snapshot_archive_path,
+                    &mut simulated_tower,
                 )
                 .unwrap_or_else(|err| {
                     eprintln!("Ledger verification failed: {:?}", err);
