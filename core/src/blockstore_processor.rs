@@ -549,6 +549,7 @@ pub(crate) fn process_blockstore_from_root(
     accounts_package_sender: AccountsPackageSender,
     timings: BankFromArchiveTimings,
     last_full_snapshot_slot: Slot,
+    simulated_tower: &mut Option<&mut SimulatedTower>,
 ) -> BlockstoreProcessorResult {
     do_process_blockstore_from_root(
         blockstore,
@@ -561,7 +562,7 @@ pub(crate) fn process_blockstore_from_root(
         accounts_package_sender,
         timings,
         Some(last_full_snapshot_slot),
-        &mut None,
+        simulated_tower,
     )
 }
 
