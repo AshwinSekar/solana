@@ -63,7 +63,7 @@ use solana_vote_program::{
     vote_state::{self, VoteState},
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     ffi::OsStr,
     fs::{self, File},
     io::{self, stdout, BufRead, BufReader, Write},
@@ -2096,7 +2096,7 @@ fn main() {
             println!("Reading log file {}", log_path);
 
             let mut current_vote_state = VoteState::default();
-            let mut pending_votes: HashSet<Slot> = HashSet::new();
+            let mut pending_votes: VecDeque<Slot> = VecDeque::new();
 
             let snapshot_root_slot =
                 snapshot_utils::get_highest_full_snapshot_archive_slot(&ledger_path).unwrap();
@@ -2120,7 +2120,7 @@ fn main() {
                                 vote_slot, snapshot_root_slot
                             );
                         }
-                        pending_votes.insert(vote_slot);
+                        pending_votes.push_back(vote_slot);
                     } else {
                         current_vote_state.process_slot_vote_unchecked(vote_slot);
                         if is_consistent && vote_slot >= start_vote {

@@ -13,11 +13,11 @@ use solana_runtime::{
     snapshot_config::SnapshotConfig, snapshot_package::AccountsPackageSender, snapshot_utils,
 };
 use solana_sdk::{clock::Slot, genesis_config::GenesisConfig, hash::Hash, pubkey::Pubkey};
-use std::{collections::HashSet, fs, path::PathBuf, process, result};
+use std::{collections::VecDeque, fs, path::PathBuf, process, result};
 
 pub struct SimulatedTower {
     pub tower: Tower,
-    pub pending_votes: HashSet<Slot>,
+    pub pending_votes: VecDeque<Slot>,
     pub validator_pubkey: Pubkey,
 }
 
