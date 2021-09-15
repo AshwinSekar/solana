@@ -1158,8 +1158,7 @@ fn load_frozen_forks(
             let new_root_bank = {
                 if rooted {
                     let root_slot = simulated_tower.as_ref().unwrap().tower.root();
-                    let root_bank = all_banks.get(&root_slot).unwrap();
-                    Some(root_bank)
+                    all_banks.get(&root_slot)
                 } else {
                     None
                 }
