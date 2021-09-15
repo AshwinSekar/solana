@@ -273,13 +273,6 @@ impl Tower {
         // keyed by end of the range
         let mut lockout_intervals = LockoutIntervals::new();
         let mut my_latest_landed_vote = None;
-        let mut top_keys: Vec<(u64, Pubkey)> = vote_accounts
-            .iter()
-            .map(|(k, (s, _vote_state))| (*s, *k))
-            .collect();
-        top_keys.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
-        top_keys.truncate(10);
-        let top_keys: HashSet<Pubkey> = top_keys.into_iter().map(|(_, k)| k).collect();
 
         for (&key, (voted_stake, account)) in vote_accounts.iter() {
             let voted_stake = *voted_stake;
@@ -309,12 +302,10 @@ impl Tower {
             }
 
             let node_pubkey = vote_state.node_pubkey;
-            if top_keys.contains(&key) {
-                println!(
-                    "validator {} vote state root: {:?}, votes: {:#?}",
-                    node_pubkey, vote_state.root_slot, vote_state.votes
-                );
-            }
+            println!(
+                "validator {} vote state root: {:?}, votes: {:#?}",
+                node_pubkey, vote_state.root_slot, vote_state.votes
+            );
             if key == *vote_account_pubkey || key == node_pubkey {
                 println!(
                     "my vote state root: {:?}, votes: {:#?}",

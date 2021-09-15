@@ -1654,6 +1654,17 @@ fn main() {
             )
         )
         .subcommand(
+            SubCommand::with_name("list-ancestors")
+            .about("Output all ancestors of given start slot")
+            .arg(
+                Arg::with_name("start_slot")
+                    .long("start-slot")
+                    .value_name("NUM")
+                    .takes_value(true)
+                    .help("Starting slot to get the ancestors of")
+            )
+        )
+        .subcommand(
             SubCommand::with_name("list-roots")
             .about("Output up to last <num-roots> root hashes and their \
                     heights starting at the given block height")
@@ -3420,6 +3431,19 @@ fn main() {
                         purge_from_blockstore(dead_slot, dead_slot);
                     }
                 }
+            }
+            ("list-ancestors", Some(arg_matches)) => {
+                let blockstore = open_blockstore(
+                    &ledger_path,
+                    AccessType::TryPrimaryThenSecondary,
+                    wal_recovery_mode,
+                );
+
+                let start_slot = Slot::from_str(arg_matches.value_of("start_slot").unwrap())
+                    .expect("Starting root must be a number");
+
+                let ancestors: Vec<Slot> = AncestorIterator::new(start_slot, &blockstore).collect();
+                println!("ancestors of {} are {:?}", start_slot, ancestors);
             }
             ("list-roots", Some(arg_matches)) => {
                 let blockstore = open_blockstore(
