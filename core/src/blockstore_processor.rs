@@ -1,4 +1,7 @@
 use crate::bank_forks_utils::SimulatedTower;
+use crate::consensus::Tower;
+use crate::consensus::ComputedBankState;
+use crate::latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks;
 use chrono_humanize::{Accuracy, HumanTime, Tense};
 use crossbeam_channel::Sender;
 use itertools::Itertools;
@@ -640,6 +643,7 @@ fn do_process_blockstore_from_root(
                 accounts_package_sender,
                 &mut timing,
                 &mut last_full_snapshot_slot,
+                simulated_tower,
             )?;
             initial_forks.sort_by_key(|bank| bank.slot());
 
@@ -1068,6 +1072,7 @@ fn load_frozen_forks(
     accounts_package_sender: AccountsPackageSender,
     timing: &mut ExecuteTimings,
     last_full_snapshot_slot: &mut Option<Slot>,
+    simulated_tower: Option<SimulatedTower>,
 ) -> result::Result<Vec<Arc<Bank>>, BlockstoreProcessorError> {
     let mut initial_forks = HashMap::new();
     let mut all_banks = HashMap::new();
@@ -1115,7 +1120,7 @@ fn load_frozen_forks(
 
             let mut progress = ConfirmationProgress::new(last_entry_hash);
 
-            if process_single_slot(
+            let rooted = match process_single_slot(
                 blockstore,
                 &bank,
                 opts,
@@ -1125,11 +1130,12 @@ fn load_frozen_forks(
                 cache_block_meta_sender,
                 None,
                 timing,
-            )
-            .is_err()
-            {
-                continue;
-            }
+                simulated_tower.as_ref(),
+                &all_banks,
+            ) {
+                Ok(result) => result,
+                Err(_) => continue,
+            };
             txs += progress.num_txs;
 
             // Block must be frozen by this point, otherwise `process_single_slot` would
@@ -1140,44 +1146,7 @@ fn load_frozen_forks(
             // If we've reached the last known root in blockstore, start looking
             // for newer cluster confirmed roots
             let new_root_bank = {
-                if *root >= max_root {
-                    supermajority_root_from_vote_accounts(
-                        bank.slot(),
-                        bank.total_epoch_stake(),
-                        &bank.vote_accounts(),
-                    ).and_then(|supermajority_root| {
-                        if supermajority_root > *root {
-                            // If there's a cluster confirmed root greater than our last
-                            // replayed root, then because the cluster confirmed root should
-                            // be descended from our last root, it must exist in `all_banks`
-                            let cluster_root_bank = all_banks.get(&supermajority_root).unwrap();
-
-                            // cluster root must be a descendant of our root, otherwise something
-                            // is drastically wrong
-                            assert!(cluster_root_bank.ancestors.contains_key(root));
-                            info!("blockstore processor found new cluster confirmed root: {}, observed in bank: {}", cluster_root_bank.slot(), bank.slot());
-
-                            // Ensure cluster-confirmed root and parents are set as root in blockstore
-                            let mut rooted_slots = vec![];
-                            let mut new_root_bank = cluster_root_bank.clone();
-                            loop {
-                                if new_root_bank.slot() == *root { break; } // Found the last root in the chain, yay!
-                                assert!(new_root_bank.slot() > *root);
-
-                                rooted_slots.push((new_root_bank.slot(), new_root_bank.hash()));
-                                // As noted, the cluster confirmed root should be descended from
-                                // our last root; therefore parent should be set
-                                new_root_bank = new_root_bank.parent().unwrap();
-                            }
-                            inc_new_counter_info!("load_frozen_forks-cluster-confirmed-root", rooted_slots.len());
-                            blockstore.set_roots(rooted_slots.iter().map(|(slot, _hash)| slot)).expect("Blockstore::set_roots should succeed");
-                            blockstore.set_duplicate_confirmed_slots_and_hashes(rooted_slots.into_iter()).expect("Blockstore::set_duplicate_confirmed should succeed");
-                            Some(cluster_root_bank)
-                        } else {
-                            None
-                        }
-                    })
-                } else if blockstore.is_root(slot) {
+                if rooted {
                     Some(&bank)
                 } else {
                     None
@@ -1332,7 +1301,9 @@ fn process_single_slot(
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
     timing: &mut ExecuteTimings,
-) -> result::Result<(), BlockstoreProcessorError> {
+    simulated_tower: Option<&SimulatedTower>,
+    all_banks: &HashMap<Slot, Arc<Bank>>,
+) -> result::Result<bool, BlockstoreProcessorError> {
     // Mark corrupt slots as dead so validators don't replay this slot and
     // see AlreadyProcessed errors later in ReplayStage
     confirm_full_slot(blockstore, bank, opts, recyclers, progress, transaction_status_sender, replay_vote_sender, timing).map_err(|err| {
@@ -1349,10 +1320,48 @@ fn process_single_slot(
     })?;
 
     bank.freeze(); // all banks handled by this routine are created from complete slots
+
+    match simulated_tower {
+        Some(sim_tower) => {
+            if sim_tower.pending_votes.contains(&bank.slot()) {
+                let mut ancestors = HashMap::new();
+                bank.proper_ancestors()
+                    .fold(HashSet::new(), |mut so_far, slot| {
+                        ancestors.insert(slot, so_far.clone());
+                        so_far.insert(slot);
+                        so_far
+                    });
+
+                // Simulate collecting vote lockouts
+                let computed_bank_state = Tower::collect_vote_lockouts(
+                    &Pubkey::new_unique(), // only used for debug purposes
+                    bank.slot(),
+                    &bank.vote_accounts(),
+                    &ancestors,
+                    |slot| None,
+                    &mut LatestValidatorVotesForFrozenBanks::default(),
+                );
+
+                let ComputedBankState {
+                    voted_stakes,
+                    total_stake,
+                    lockout_intervals,
+                    my_latest_landed_vote,
+                    ..
+                } = computed_bank_state;
+
+                // Simulate checking vote stake threshold
+                // stats.vote_threshold = tower.check_vote_stake_threshold(bank_slot, &stats.voted_stakes, stats.total_stake);
+            }
+        }
+        None => (),
+    }
+
     blockstore.insert_bank_hash(bank.slot(), bank.hash(), false);
     cache_block_meta(bank, cache_block_meta_sender);
 
-    Ok(())
+    // TODO: fix
+    Ok(true)
 }
 
 pub enum TransactionStatusMessage {
