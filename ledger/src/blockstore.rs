@@ -1622,7 +1622,7 @@ impl Blockstore {
 
     // Only used by tests
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn write_entries(
+    pub fn write_entries(
         &self,
         start_slot: Slot,
         num_ticks_in_start_slot: u64,

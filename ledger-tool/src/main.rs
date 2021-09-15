@@ -1,5 +1,6 @@
 #![allow(clippy::integer_arithmetic)]
 use {
+    crate::{bigtable::*, ledger_path::*},
     clap::{
         crate_description, crate_name, value_t, value_t_or_exit, values_t_or_exit, App,
         AppSettings, Arg, ArgMatches, SubCommand,
@@ -22,8 +23,11 @@ use {
         ancestor_iterator::AncestorIterator,
         bank_forks_utils,
         blockstore::{create_new_ledger, Blockstore, PurgeType},
-        blockstore_db::{self, AccessType, BlockstoreRecoveryMode, Database},
-        blockstore_processor::ProcessOptions,
+        blockstore_db::{
+            self, AccessType, BlockstoreOptions, BlockstoreRecoveryMode, Database,
+            LedgerColumnOptions,
+        },
+        blockstore_processor::{BlockstoreProcessorError, ProcessOptions},
         shred::Shred,
     },
     solana_measure::measure::Measure,
@@ -37,6 +41,8 @@ use {
         hardened_unpack::{open_genesis_config, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE},
         snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_config::SnapshotConfig,
+        snapshot_hash::StartingSnapshotHashes,
+        snapshot_package::PendingAccountsPackage,
         snapshot_utils::{
             self, ArchiveFormat, SnapshotVersion, DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN,
             DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN,
@@ -55,9 +61,10 @@ use {
         shred_version::compute_shred_version,
         stake::{self, state::StakeState},
         system_program,
-        transaction::{SanitizedTransaction, TransactionError},
+        transaction::{MessageHash, SanitizedTransaction, SimpleAddressLoader},
     },
     solana_stake_program::stake_state::{self, PointValue},
+    solana_transaction_status::VersionedTransactionWithStatusMeta,
     solana_vote_program::{
         self,
         vote_state::{self, VoteState},
@@ -72,16 +79,13 @@ use {
         str::FromStr,
         sync::{
             atomic::{AtomicBool, Ordering},
-            mpsc::channel,
             Arc, RwLock,
         },
     },
 };
 
 mod bigtable;
-use bigtable::*;
 mod ledger_path;
-use ledger_path::*;
 
 #[derive(PartialEq)]
 enum LedgerOutputMethod {
@@ -134,7 +138,7 @@ fn output_entry(
     match method {
         LedgerOutputMethod::Print => {
             println!(
-                "  Entry {} - num_hashes: {}, hashes: {}, transactions: {}",
+                "  Entry {} - num_hashes: {}, hash: {}, transactions: {}",
                 entry_index,
                 entry.num_hashes,
                 entry.hash,
@@ -143,7 +147,7 @@ fn output_entry(
             for (transactions_index, transaction) in entry.transactions.into_iter().enumerate() {
                 println!("    Transaction {}", transactions_index);
                 let tx_signature = transaction.signatures[0];
-                let tx_status = blockstore
+                let tx_with_meta = blockstore
                     .read_transaction_status((tx_signature, slot))
                     .unwrap_or_else(|err| {
                         eprintln!(
@@ -152,16 +156,16 @@ fn output_entry(
                         );
                         None
                     })
-                    .map(|transaction_status| transaction_status.into());
+                    .map(|meta| VersionedTransactionWithStatusMeta { transaction, meta });
 
-                if let Some(legacy_tx) = transaction.into_legacy_transaction() {
+                if let Some(tx_with_meta) = tx_with_meta {
+                    let status = tx_with_meta.meta.into();
                     solana_cli_output::display::println_transaction(
-                        &legacy_tx, &tx_status, "      ", None, None,
-                    );
-                } else {
-                    eprintln!(
-                        "Failed to print unsupported transaction for {} at slot {}",
-                        tx_signature, slot
+                        &tx_with_meta.transaction,
+                        Some(&status),
+                        "      ",
+                        None,
+                        None,
                     );
                 }
             }
@@ -219,7 +223,7 @@ fn output_slot(
         output_slot_rewards(blockstore, slot, method);
     } else if verbose_level >= 1 {
         let mut transactions = 0;
-        let mut hashes = 0;
+        let mut num_hashes = 0;
         let mut program_ids = HashMap::new();
         let blockhash = if let Some(entry) = entries.last() {
             entry.hash
@@ -229,13 +233,15 @@ fn output_slot(
 
         for entry in entries {
             transactions += entry.transactions.len();
-            hashes += entry.num_hashes;
+            num_hashes += entry.num_hashes;
             for transaction in entry.transactions {
                 let tx_signature = transaction.signatures[0];
-                let sanitize_result =
-                    SanitizedTransaction::try_create(transaction, Hash::default(), None, |_| {
-                        Err(TransactionError::UnsupportedVersion)
-                    });
+                let sanitize_result = SanitizedTransaction::try_create(
+                    transaction,
+                    MessageHash::Compute,
+                    None,
+                    SimpleAddressLoader::Disabled,
+                );
 
                 match sanitize_result {
                     Ok(transaction) => {
@@ -254,8 +260,8 @@ fn output_slot(
         }
 
         println!(
-            "  Transactions: {} hashes: {} block_hash: {}",
-            transactions, hashes, blockhash,
+            "  Transactions: {}, hashes: {}, block_hash: {}",
+            transactions, num_hashes, blockhash,
         );
         println!("  Programs: {:?}", program_ids);
     }
@@ -317,6 +323,26 @@ fn output_ledger(
 
     if method == LedgerOutputMethod::Json {
         stdout().write_all(b"\n]}\n").expect("close array");
+    }
+}
+
+fn output_account(
+    pubkey: &Pubkey,
+    account: &AccountSharedData,
+    modified_slot: Option<Slot>,
+    print_account_data: bool,
+) {
+    println!("{}", pubkey);
+    println!("  balance: {} SOL", lamports_to_sol(account.lamports()));
+    println!("  owner: '{}'", account.owner());
+    println!("  executable: {}", account.executable());
+    if let Some(slot) = modified_slot {
+        println!("  slot: {}", slot);
+    }
+    println!("  rent_epoch: {}", account.rent_epoch());
+    println!("  data_len: {}", account.data().len());
+    if print_account_data {
+        println!("  data: '{}'", bs58::encode(account.data()).into_string());
     }
 }
 
@@ -670,7 +696,15 @@ fn open_blockstore(
     access_type: AccessType,
     wal_recovery_mode: Option<BlockstoreRecoveryMode>,
 ) -> Blockstore {
-    match Blockstore::open_with_access_type(ledger_path, access_type, wal_recovery_mode, true) {
+    match Blockstore::open_with_options(
+        ledger_path,
+        BlockstoreOptions {
+            access_type,
+            recovery_mode: wal_recovery_mode,
+            enforce_ulimit_nofile: true,
+            ..BlockstoreOptions::default()
+        },
+    ) {
         Ok(blockstore) => blockstore,
         Err(err) => {
             eprintln!("Failed to open ledger at {:?}: {:?}", ledger_path, err);
@@ -694,7 +728,43 @@ fn load_bank_forks(
     blockstore: &Blockstore,
     process_options: ProcessOptions,
     snapshot_archive_path: Option<PathBuf>,
-) -> bank_forks_utils::LoadResult {
+) -> Result<(BankForks, Option<StartingSnapshotHashes>), BlockstoreProcessorError> {
+    do_load_bank_forks(
+        arg_matches,
+        genesis_config,
+        blockstore,
+        process_options,
+        snapshot_archive_path,
+        None,
+    )
+}
+
+fn load_bank_forks_with_simulated_tower(
+    arg_matches: &ArgMatches,
+    genesis_config: &GenesisConfig,
+    blockstore: &Blockstore,
+    process_options: ProcessOptions,
+    snapshot_archive_path: Option<PathBuf>,
+    simulated_tower: SimulatedTower,
+) -> Result<(BankForks, Option<StartingSnapshotHashes>), BlockstoreProcessorError> {
+    do_load_bank_forks(
+        arg_matches,
+        genesis_config,
+        blockstore,
+        process_options,
+        snapshot_archive_path,
+        Some(simulated_tower),
+    )
+}
+
+fn do_load_bank_forks(
+    arg_matches: &ArgMatches,
+    genesis_config: &GenesisConfig,
+    blockstore: &Blockstore,
+    process_options: ProcessOptions,
+    snapshot_archive_path: Option<PathBuf>,
+    simulated_tower: Option<SimulatedTower>,
+) -> Result<(BankForks, Option<StartingSnapshotHashes>), BlockstoreProcessorError> {
     let bank_snapshots_dir = blockstore
         .ledger_path()
         .join(if blockstore.is_primary_access() {
@@ -734,7 +804,6 @@ fn load_bank_forks(
         vec![non_primary_accounts_path]
     };
 
-    let (accounts_package_sender, _) = channel();
     bank_forks_utils::load(
         genesis_config,
         blockstore,
@@ -744,9 +813,11 @@ fn load_bank_forks(
         process_options,
         None,
         None,
-        accounts_package_sender,
+        PendingAccountsPackage::default(),
         None,
+        simulated_tower,
     )
+    .map(|(bank_forks, .., starting_snapshot_hashes)| (bank_forks, starting_snapshot_hashes))
 }
 
 fn compute_slot_cost(blockstore: &Blockstore, slot: Slot) -> Result<(), String> {
@@ -773,9 +844,12 @@ fn compute_slot_cost(blockstore: &Blockstore, slot: Slot) -> Result<(), String> 
             .transactions
             .into_iter()
             .filter_map(|transaction| {
-                SanitizedTransaction::try_create(transaction, Hash::default(), None, |_| {
-                    Err(TransactionError::UnsupportedVersion)
-                })
+                SanitizedTransaction::try_create(
+                    transaction,
+                    MessageHash::Compute,
+                    None,
+                    SimpleAddressLoader::Disabled,
+                )
                 .map_err(|err| {
                     warn!("Failed to compute cost of transaction: {:?}", err);
                 })
@@ -785,7 +859,7 @@ fn compute_slot_cost(blockstore: &Blockstore, slot: Slot) -> Result<(), String> 
                 num_programs += transaction.message().instructions().len();
 
                 let tx_cost = cost_model.calculate_cost(&transaction);
-                let result = cost_tracker.try_add(&tx_cost);
+                let result = cost_tracker.try_add(&transaction, &tx_cost);
                 if result.is_err() {
                     println!(
                         "Slot: {}, CostModel rejected transaction {:?}, reason {:?}",
@@ -876,6 +950,10 @@ fn main() {
         .validator(is_parsable::<usize>)
         .takes_value(true)
         .help("How much memory the accounts index can consume. If this is exceeded, some account index entries will be stored on disk. If missing, the entire index is stored in memory.");
+    let disable_disk_index = Arg::with_name("disable_accounts_disk_index")
+        .long("disable-accounts-disk-index")
+        .help("Disable the disk-based accounts index if it is enabled by default.")
+        .conflicts_with("accounts_index_memory_limit_mb");
     let accountsdb_skip_shrink = Arg::with_name("accounts_db_skip_shrink")
         .long("accounts-db-skip-shrink")
         .help(
@@ -1140,6 +1218,24 @@ fn main() {
             SubCommand::with_name("genesis")
             .about("Prints the ledger's genesis config")
             .arg(&max_genesis_archive_unpacked_size_arg)
+            .arg(
+                Arg::with_name("accounts")
+                    .long("accounts")
+                    .takes_value(false)
+                    .help("Print the ledger's genesis accounts"),
+            )
+            .arg(
+                Arg::with_name("no_account_data")
+                    .long("no-account-data")
+                    .takes_value(false)
+                    .requires("accounts")
+                    .help("Do not print account data when printing account contents."),
+            )
+        )
+        .subcommand(
+            SubCommand::with_name("genesis-hash")
+            .about("Prints the ledger's genesis hash")
+            .arg(&max_genesis_archive_unpacked_size_arg)
         )
         .subcommand(
             SubCommand::with_name("parse_full_frozen")
@@ -1154,11 +1250,6 @@ fn main() {
                     .takes_value(true)
                     .help("path to log file to parse"),
             )
-        )
-        .subcommand(
-            SubCommand::with_name("genesis-hash")
-            .about("Prints the ledger's genesis hash")
-            .arg(&max_genesis_archive_unpacked_size_arg)
         )
         .subcommand(
             SubCommand::with_name("modify-genesis")
@@ -1226,6 +1317,7 @@ fn main() {
             .arg(&limit_load_slot_count_from_snapshot_arg)
             .arg(&accounts_index_bins)
             .arg(&accounts_index_limit)
+            .arg(&disable_disk_index)
             .arg(&accountsdb_skip_shrink)
             .arg(&accounts_filler_count)
             .arg(&verify_index_arg)
@@ -1454,11 +1546,10 @@ fn main() {
                     .takes_value(false)
                     .help("Do not print contents of each account, which is very slow with lots of accounts."),
             )
-            .arg(
-                Arg::with_name("no_account_data")
-                    .long("no-account-data")
-                    .takes_value(false)
-                    .help("Do not print account data when printing account contents."),
+            .arg(Arg::with_name("no_account_data")
+                .long("no-account-data")
+                .takes_value(false)
+                .help("Do not print account data when printing account contents."),
             )
             .arg(&max_genesis_archive_unpacked_size_arg)
         ).subcommand(
@@ -1687,7 +1778,21 @@ fn main() {
                 }
             }
             ("genesis", Some(arg_matches)) => {
-                println!("{}", open_genesis_config_by(&ledger_path, arg_matches));
+                let genesis_config = open_genesis_config_by(&ledger_path, arg_matches);
+                let print_accouunts = arg_matches.is_present("accounts");
+                if print_accouunts {
+                    let print_account_data = !arg_matches.is_present("no_account_data");
+                    for (pubkey, account) in genesis_config.accounts {
+                        output_account(
+                            &pubkey,
+                            &AccountSharedData::from(account),
+                            None,
+                            print_account_data,
+                        );
+                    }
+                } else {
+                    println!("{}", genesis_config);
+                }
             }
             ("genesis-hash", Some(arg_matches)) => {
                 println!(
@@ -1716,7 +1821,7 @@ fn main() {
                     &output_directory,
                     &genesis_config,
                     solana_runtime::hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
-                    AccessType::PrimaryOnly,
+                    LedgerColumnOptions::default(),
                 )
                 .unwrap_or_else(|err| {
                     eprintln!("Failed to write genesis config: {:?}", err);
@@ -1846,7 +1951,7 @@ fn main() {
                         slot,
                         allow_dead_slots,
                         &LedgerOutputMethod::Print,
-                        std::u64::MAX,
+                        verbose_level,
                     ) {
                         eprintln!("{}", err);
                     }
@@ -2047,12 +2152,14 @@ fn main() {
                 }
                 let exit_signal = Arc::new(AtomicBool::new(false));
                 let system_monitor_service =
-                    SystemMonitorService::new(Arc::clone(&exit_signal), false);
+                    SystemMonitorService::new(Arc::clone(&exit_signal), true, false);
 
                 if let Some(limit) =
                     value_t!(arg_matches, "accounts_index_memory_limit_mb", usize).ok()
                 {
                     accounts_index_config.index_limit_mb = Some(limit);
+                } else if arg_matches.is_present("disable_accounts_disk_index") {
+                    accounts_index_config.index_limit_mb = None;
                 }
 
                 {
@@ -2379,7 +2486,7 @@ fn main() {
                     },
                     snapshot_archive_path,
                 ) {
-                    Ok((bank_forks, .., starting_snapshot_hashes)) => {
+                    Ok((bank_forks, starting_snapshot_hashes)) => {
                         let mut bank = bank_forks
                             .get(snapshot_slot)
                             .unwrap_or_else(|| {
@@ -2597,10 +2704,11 @@ fn main() {
                             }
                             let full_snapshot_slot = starting_snapshot_hashes.unwrap().full.hash.0;
                             if bank.slot() <= full_snapshot_slot {
-                                eprintln!("Unable to create incremental snapshot: Slot must be greater than full snapshot slot. slot: {}, full snapshot slot: {}",
-                                bank.slot(),
-                                full_snapshot_slot,
-                            );
+                                eprintln!(
+                                    "Unable to create incremental snapshot: Slot must be greater than full snapshot slot. slot: {}, full snapshot slot: {}",
+                                    bank.slot(),
+                                    full_snapshot_slot,
+                                );
                                 exit(1);
                             }
 
@@ -2621,12 +2729,12 @@ fn main() {
                                 });
 
                             println!(
-                            "Successfully created incremental snapshot for slot {}, hash {}, base slot: {}: {}",
-                            bank.slot(),
-                            bank.hash(),
-                            full_snapshot_slot,
-                            incremental_snapshot_archive_info.path().display(),
-                        );
+                                "Successfully created incremental snapshot for slot {}, hash {}, base slot: {}: {}",
+                                bank.slot(),
+                                bank.hash(),
+                                full_snapshot_slot,
+                                incremental_snapshot_archive_info.path().display(),
+                            );
                         } else {
                             let full_snapshot_archive_info =
                                 snapshot_utils::bank_to_full_snapshot_archive(
@@ -2720,17 +2828,7 @@ fn main() {
                     let print_account_data = !arg_matches.is_present("no_account_data");
                     let mut measure = Measure::start("printing account contents");
                     for (pubkey, (account, slot)) in accounts.into_iter() {
-                        let data_len = account.data().len();
-                        println!("{}:", pubkey);
-                        println!("  - balance: {} SOL", lamports_to_sol(account.lamports()));
-                        println!("  - owner: '{}'", account.owner());
-                        println!("  - executable: {}", account.executable());
-                        println!("  - slot: {}", slot);
-                        println!("  - rent_epoch: {}", account.rent_epoch());
-                        if print_account_data {
-                            println!("  - data: '{}'", bs58::encode(account.data()).into_string());
-                        }
-                        println!("  - data_len: {}", data_len);
+                        output_account(&pubkey, &account, Some(slot), print_account_data);
                     }
                     measure.stop();
                     info!("{}", measure);
