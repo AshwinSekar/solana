@@ -1,6 +1,6 @@
 use crate::bank_forks_utils::SimulatedTower;
-use crate::consensus::Tower;
 use crate::consensus::ComputedBankState;
+use crate::consensus::Tower;
 use crate::latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks;
 use chrono_humanize::{Accuracy, HumanTime, Tense};
 use crossbeam_channel::Sender;
@@ -1323,35 +1323,37 @@ fn process_single_slot(
 
     match simulated_tower {
         Some(sim_tower) => {
+            let mut ancestors = HashMap::new();
+            bank.proper_ancestors()
+                .fold(HashSet::new(), |mut so_far, slot| {
+                    ancestors.insert(slot, so_far.clone());
+                    so_far.insert(slot);
+                    so_far
+                });
+
+            // Simulate collecting vote lockouts
+            let me = Pubkey::new_unique();
+            let computed_bank_state = Tower::collect_vote_lockouts(
+                &me, // only used for debug purposes
+                bank.slot(),
+                &bank.vote_accounts(),
+                &ancestors,
+                |slot| None,
+                &mut LatestValidatorVotesForFrozenBanks::default(),
+            );
+
+            let ComputedBankState {
+                voted_stakes,
+                total_stake,
+                lockout_intervals,
+                my_latest_landed_vote,
+                ..
+            } = computed_bank_state;
+
+            sim_tower.tower.check_vote_stake_threshold(bank.slot(), &voted_stakes, total_stake);
+
             if sim_tower.pending_votes.contains(&bank.slot()) {
-                let mut ancestors = HashMap::new();
-                bank.proper_ancestors()
-                    .fold(HashSet::new(), |mut so_far, slot| {
-                        ancestors.insert(slot, so_far.clone());
-                        so_far.insert(slot);
-                        so_far
-                    });
-
-                // Simulate collecting vote lockouts
-                let computed_bank_state = Tower::collect_vote_lockouts(
-                    &Pubkey::new_unique(), // only used for debug purposes
-                    bank.slot(),
-                    &bank.vote_accounts(),
-                    &ancestors,
-                    |slot| None,
-                    &mut LatestValidatorVotesForFrozenBanks::default(),
-                );
-
-                let ComputedBankState {
-                    voted_stakes,
-                    total_stake,
-                    lockout_intervals,
-                    my_latest_landed_vote,
-                    ..
-                } = computed_bank_state;
-
-                // Simulate checking vote stake threshold
-                // stats.vote_threshold = tower.check_vote_stake_threshold(bank_slot, &stats.voted_stakes, stats.total_stake);
+                sim_tower.tower.record_bank_vote(bank, &me);
             }
         }
         None => (),
