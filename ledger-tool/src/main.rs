@@ -712,7 +712,7 @@ fn load_bank_forks(
         blockstore,
         process_options,
         snapshot_archive_path,
-        None,
+        &mut None,
     )
 }
 
@@ -722,7 +722,7 @@ fn load_bank_forks_with_simulated_tower(
     blockstore: &Blockstore,
     process_options: ProcessOptions,
     snapshot_archive_path: Option<PathBuf>,
-    simulated_tower: SimulatedTower,
+    simulated_tower: &mut SimulatedTower,
 ) -> bank_forks_utils::LoadResult {
     do_load_bank_forks(
         arg_matches,
@@ -730,7 +730,7 @@ fn load_bank_forks_with_simulated_tower(
         blockstore,
         process_options,
         snapshot_archive_path,
-        Some(simulated_tower),
+        &mut Some(simulated_tower),
     )
 }
 
@@ -740,7 +740,7 @@ fn do_load_bank_forks(
     blockstore: &Blockstore,
     process_options: ProcessOptions,
     snapshot_archive_path: Option<PathBuf>,
-    simulated_tower: Option<SimulatedTower>,
+    simulated_tower: &mut Option<&mut SimulatedTower>,
 ) -> bank_forks_utils::LoadResult {
     let bank_snapshots_dir = blockstore
         .ledger_path()
@@ -2125,7 +2125,7 @@ fn main() {
 
             let tower = Tower::new_from_vote_state(current_vote_state);
 
-            let simulated_tower = SimulatedTower {
+            let mut simulated_tower = SimulatedTower {
                 tower,
                 pending_votes,
             };
@@ -2176,7 +2176,7 @@ fn main() {
                 &blockstore,
                 process_options,
                 snapshot_archive_path,
-                simulated_tower,
+                &mut simulated_tower,
             )
             .unwrap_or_else(|err| {
                 eprintln!("Ledger verification failed: {:?}", err);

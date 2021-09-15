@@ -487,7 +487,7 @@ pub fn process_blockstore(
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
     snapshot_config: Option<&SnapshotConfig>,
     accounts_package_sender: AccountsPackageSender,
-    simulated_tower: Option<SimulatedTower>,
+    simulated_tower: &mut Option<&mut SimulatedTower>,
 ) -> BlockstoreProcessorResult {
     if let Some(num_threads) = opts.override_num_threads {
         PAR_THREAD_POOL.with(|pool| {
@@ -561,7 +561,7 @@ pub(crate) fn process_blockstore_from_root(
         accounts_package_sender,
         timings,
         Some(last_full_snapshot_slot),
-        None,
+        &mut None,
     )
 }
 
@@ -577,7 +577,7 @@ fn do_process_blockstore_from_root(
     accounts_package_sender: AccountsPackageSender,
     timings: BankFromArchiveTimings,
     mut last_full_snapshot_slot: Option<Slot>,
-    simulated_tower: Option<SimulatedTower>,
+    simulated_tower: &mut Option<&mut SimulatedTower>,
 ) -> BlockstoreProcessorResult {
     info!("processing ledger from slot {}...", bank.slot());
 
@@ -1072,7 +1072,7 @@ fn load_frozen_forks(
     accounts_package_sender: AccountsPackageSender,
     timing: &mut ExecuteTimings,
     last_full_snapshot_slot: &mut Option<Slot>,
-    simulated_tower: Option<SimulatedTower>,
+    simulated_tower: &mut Option<&mut SimulatedTower>,
 ) -> result::Result<Vec<Arc<Bank>>, BlockstoreProcessorError> {
     let mut initial_forks = HashMap::new();
     let mut all_banks = HashMap::new();
@@ -1130,7 +1130,7 @@ fn load_frozen_forks(
                 cache_block_meta_sender,
                 None,
                 timing,
-                simulated_tower.as_ref(),
+                simulated_tower,
                 &all_banks,
             ) {
                 Ok(result) => result,
@@ -1301,7 +1301,7 @@ fn process_single_slot(
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
     timing: &mut ExecuteTimings,
-    simulated_tower: Option<&SimulatedTower>,
+    simulated_tower: &mut Option<&mut SimulatedTower>,
     all_banks: &HashMap<Slot, Arc<Bank>>,
 ) -> result::Result<bool, BlockstoreProcessorError> {
     // Mark corrupt slots as dead so validators don't replay this slot and
@@ -1353,7 +1353,7 @@ fn process_single_slot(
             sim_tower.tower.check_vote_stake_threshold(bank.slot(), &voted_stakes, total_stake);
 
             if sim_tower.pending_votes.contains(&bank.slot()) {
-                sim_tower.tower.record_bank_vote(bank, &me);
+                return Ok(sim_tower.tower.record_bank_vote(bank, &me).is_some());
             }
         }
         None => (),
@@ -1362,8 +1362,7 @@ fn process_single_slot(
     blockstore.insert_bank_hash(bank.slot(), bank.hash(), false);
     cache_block_meta(bank, cache_block_meta_sender);
 
-    // TODO: fix
-    Ok(true)
+    Ok(false)
 }
 
 pub enum TransactionStatusMessage {
