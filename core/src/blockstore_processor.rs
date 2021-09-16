@@ -1359,10 +1359,22 @@ fn process_single_slot(
                 return Ok(new_root.is_some());
             }
 
+            let vote_accounts = bank.vote_accounts();
+            let vote_account_key = vote_accounts
+                .get(&me)
+                .and_then(|(_voted_stake, account)| {
+                    account
+                        .vote_state()
+                        .as_ref()
+                        .ok()
+                        .map(|vote_state| vote_state.node_pubkey)
+                })
+                .unwrap_or_default();
+            println!("my vote key: {}", vote_account_key);
             let computed_bank_state = Tower::collect_vote_lockouts(
-                &me, // only used for debug purposes
+                &vote_account_key, // only used for debug purposes
                 bank.slot(),
-                &bank.vote_accounts(),
+                &vote_accounts,
                 &ancestors,
                 |slot| None,
                 &mut LatestValidatorVotesForFrozenBanks::default(),

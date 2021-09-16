@@ -224,10 +224,11 @@ impl Tower {
 
         for (&key, (voted_stake, account)) in vote_accounts.iter() {
             let voted_stake = *voted_stake;
-            if voted_stake == 0 {
+            if voted_stake == 0 && key != *vote_account_pubkey {
                 continue;
             }
             trace!("{} {} with stake {}", vote_account_pubkey, key, voted_stake);
+
             let mut vote_state = match account.vote_state().as_ref() {
                 Err(_) => {
                     datapoint_warn!(
@@ -242,6 +243,7 @@ impl Tower {
                 }
                 Ok(vote_state) => vote_state.clone(),
             };
+
             for vote in &vote_state.votes {
                 lockout_intervals
                     .entry(vote.last_locked_out_slot())
@@ -254,7 +256,7 @@ impl Tower {
                 "validator {} vote state root: {:?}, votes: {:#?}",
                 node_pubkey, vote_state.root_slot, vote_state.votes
             );
-            if key == *vote_account_pubkey || key == node_pubkey {
+            if key == *vote_account_pubkey {
                 println!(
                     "my vote state root: {:?}, votes: {:#?}",
                     vote_state.root_slot, vote_state.votes
@@ -883,33 +885,30 @@ impl Tower {
         let vote = vote_state.nth_recent_vote(self.threshold_depth);
 
         if let Some(vote) = vote {
+            println!("nth recent vote: {:?}", vote);
             if let Some(fork_stake) = voted_stakes.get(&vote.slot) {
                 let lockout = *fork_stake as f64 / total_stake as f64;
-
-                let res = {
-                    if vote.confirmation_count as usize > self.threshold_depth {
-                        for old_vote in &self.vote_state.votes {
-                            if old_vote.slot == vote.slot
-                                && old_vote.confirmation_count == vote.confirmation_count
-                            {
-                                return true;
-                            }
-                        }
-                    }
-                    lockout > self.threshold_size
-                };
-
                 println!(
-                    "fork_stake slot: {}, 
+                    "fork_stake slot: {},
                     threshold vote slot: {}, 
                     lockout: {}
                     cluster_voted_stake: {}
-                    total_stake: {},
-                    result: {}",
-                    slot, vote.slot, lockout, fork_stake, total_stake, res
+                    total_stake: {}",
+                    slot, vote.slot, lockout, fork_stake, total_stake
                 );
-                res
+                if vote.confirmation_count as usize > self.threshold_depth {
+                    for old_vote in &self.vote_state.votes {
+                        if old_vote.slot == vote.slot
+                            && old_vote.confirmation_count == vote.confirmation_count
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                lockout > self.threshold_size
             } else {
+                println!("Couldn't get voted stakes for {}", vote.slot);
                 false
             }
         } else {
