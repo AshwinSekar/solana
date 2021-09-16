@@ -2068,6 +2068,8 @@ fn main() {
                         render_dot(dot, &output_file, "pdf")
                     } else if extension == Some(OsStr::new("png")) {
                         render_dot(dot, &output_file, "png")
+                    } else if extension == Some(OsStr::new("svg")) {
+                        render_dot(dot, &output_file, "svg")
                     } else {
                         File::create(&output_file)
                             .and_then(|mut file| file.write_all(&dot.into_bytes()))
