@@ -290,11 +290,11 @@ impl Tower {
                 );
             }
 
-            vote_state.process_slot_vote_unchecked(bank_slot);
+            /*vote_state.process_slot_vote_unchecked(bank_slot);
             println!(
                 "validator {} vote state root: {:?}, votes: {:#?} after applying {}",
                 node_pubkey, vote_state.root_slot, vote_state.votes, bank_slot
-            );
+            );*/
 
             for vote in &vote_state.votes {
                 bank_weight += vote.lockout() as u128 * voted_stake as u128;
@@ -349,6 +349,7 @@ impl Tower {
         // TODO: populate_ancestor_voted_stakes only adds zeros. Comment why
         // that is necessary (if so).
         Self::populate_ancestor_voted_stakes(&mut voted_stakes, vote_slots, ancestors);
+        println!("voted stakes for slot {}: {:#?}", bank_slot, voted_stakes);
         ComputedBankState {
             voted_stakes,
             total_stake,
