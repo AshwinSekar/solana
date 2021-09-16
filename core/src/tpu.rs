@@ -5,6 +5,7 @@ use {
     crate::{
         banking_stage::BankingStage,
         broadcast_stage::{BroadcastStage, BroadcastStageType, RetransmitSlotsReceiver},
+        cluster_info_entries_listener::ClusterInfoEntriesListener,
         cluster_info_vote_listener::{
             ClusterInfoVoteListener, GossipDuplicateConfirmedSlotsSender,
             GossipVerifiedVoteHashSender, VerifiedVoteSender, VoteTracker,
@@ -13,6 +14,7 @@ use {
         find_packet_sender_stake_stage::FindPacketSenderStakeStage,
         sigverify::TransactionSigVerifier,
         sigverify_stage::SigVerifyStage,
+        window_service::DuplicateSlotSender,
     },
     crossbeam_channel::{unbounded, Receiver},
     solana_gossip::cluster_info::ClusterInfo,
@@ -54,6 +56,7 @@ pub struct Tpu {
     vote_sigverify_stage: SigVerifyStage,
     banking_stage: BankingStage,
     cluster_info_vote_listener: ClusterInfoVoteListener,
+    cluster_info_entries_listener: ClusterInfoEntriesListener,
     broadcast_stage: BroadcastStage,
     tpu_quic_t: thread::JoinHandle<()>,
     find_packet_sender_stake_stage: FindPacketSenderStakeStage,
@@ -85,6 +88,7 @@ impl Tpu {
         cluster_confirmed_slot_sender: GossipDuplicateConfirmedSlotsSender,
         cost_model: &Arc<RwLock<CostModel>>,
         keypair: &Keypair,
+        duplicate_slot_sender: DuplicateSlotSender,
     ) -> Self {
         let TpuSockets {
             transactions: transactions_sockets,
@@ -171,6 +175,13 @@ impl Tpu {
             bank_notification_sender,
             cluster_confirmed_slot_sender,
         );
+        let cluster_info_entries_listener = ClusterInfoEntriesListener::new(
+            exit,
+            cluster_info.clone(),
+            bank_forks.clone(),
+            blockstore.clone(),
+            duplicate_slot_sender,
+        );
 
         let banking_stage = BankingStage::new(
             cluster_info,
@@ -200,6 +211,7 @@ impl Tpu {
             vote_sigverify_stage,
             banking_stage,
             cluster_info_vote_listener,
+            cluster_info_entries_listener,
             broadcast_stage,
             tpu_quic_t,
             find_packet_sender_stake_stage,
@@ -213,6 +225,7 @@ impl Tpu {
             self.sigverify_stage.join(),
             self.vote_sigverify_stage.join(),
             self.cluster_info_vote_listener.join(),
+            self.cluster_info_entries_listener.join(),
             self.banking_stage.join(),
             self.find_packet_sender_stake_stage.join(),
             self.vote_find_packet_sender_stake_stage.join(),

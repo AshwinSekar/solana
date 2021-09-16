@@ -26,6 +26,7 @@ use {
             self, CrdsData, CrdsValue, CrdsValueLabel, EpochSlotsIndex, IncrementalSnapshotHashes,
             LowestSlot, NodeInstance, SnapshotHashes, Version, Vote, MAX_WALLCLOCK,
         },
+        duplicate_shred::DuplicateShred,
         epoch_slots::EpochSlots,
         gossip_error::GossipError,
         ping_pong::{self, PingCache, Pong},
@@ -1130,6 +1131,15 @@ impl ClusterInfo {
         (labels, txs)
     }
 
+    /// Returns entries inserted since the given cursor.
+    pub fn get_entries(&self, cursor: &mut Cursor) -> Vec<CrdsValue> {
+        let gossip_crds = self.gossip.crds.read().unwrap();
+        gossip_crds
+            .get_entries(cursor)
+            .map(|value| value.value.clone())
+            .collect()
+    }
+
     pub fn push_duplicate_shred(
         &self,
         shred: &Shred,
@@ -2221,6 +2231,21 @@ impl ClusterInfo {
                 ping_cache.add(&pong, addr, now);
             }
         }
+    }
+
+    pub fn get_duplicate_shreds_from(
+        &self,
+        pubkey: &Pubkey,
+    ) -> impl Iterator<Item = DuplicateShred> {
+        let crds = self.gossip.crds.read().unwrap();
+        crds.get_records(pubkey)
+            .filter_map(move |value| match &value.value.data {
+                CrdsData::DuplicateShred(_, chunk) => Some(chunk),
+                _ => None,
+            })
+            .cloned()
+            .collect::<Vec<DuplicateShred>>()
+            .into_iter()
     }
 
     #[allow(clippy::needless_collect)]

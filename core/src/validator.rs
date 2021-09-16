@@ -866,6 +866,7 @@ impl Validator {
         let (verified_vote_sender, verified_vote_receiver) = unbounded();
         let (gossip_verified_vote_hash_sender, gossip_verified_vote_hash_receiver) = unbounded();
         let (cluster_confirmed_slot_sender, cluster_confirmed_slot_receiver) = unbounded();
+        let (duplicate_slot_sender, duplicate_slot_receiver) = unbounded();
 
         let rpc_completed_slots_service =
             RpcCompletedSlotsService::spawn(completed_slots_receiver, rpc_subscriptions.clone());
@@ -927,6 +928,8 @@ impl Validator {
             last_full_snapshot_slot,
             block_metadata_notifier,
             config.wait_to_vote_slot,
+            duplicate_slot_sender.clone(),
+            duplicate_slot_receiver,
         );
 
         let tpu = Tpu::new(
@@ -958,6 +961,7 @@ impl Validator {
             cluster_confirmed_slot_sender,
             &cost_model,
             &identity_keypair,
+            duplicate_slot_sender,
         );
 
         datapoint_info!("validator-new", ("id", id.to_string(), String));

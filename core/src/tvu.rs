@@ -25,6 +25,7 @@ use {
         sigverify_stage::SigVerifyStage,
         tower_storage::TowerStorage,
         voting_service::VotingService,
+        window_service::{DuplicateSlotSender, DuplicateSlotReceiver},
     },
     crossbeam_channel::{unbounded, Receiver},
     solana_geyser_plugin_manager::block_metadata_notifier_interface::BlockMetadataNotifierLock,
@@ -148,6 +149,8 @@ impl Tvu {
         last_full_snapshot_slot: Option<Slot>,
         block_metadata_notifier: Option<BlockMetadataNotifierLock>,
         wait_to_vote_slot: Option<Slot>,
+        duplicate_slot_sender: DuplicateSlotSender,
+        duplicate_slot_receiver: DuplicateSlotReceiver,
     ) -> Self {
         let TvuSockets {
             repair: repair_socket,
@@ -184,7 +187,6 @@ impl Tvu {
         let (duplicate_slots_reset_sender, duplicate_slots_reset_receiver) = unbounded();
         let compaction_interval = tvu_config.rocksdb_compaction_interval;
         let max_compaction_jitter = tvu_config.rocksdb_max_compaction_jitter;
-        let (duplicate_slots_sender, duplicate_slots_receiver) = unbounded();
         let (cluster_slots_update_sender, cluster_slots_update_receiver) = unbounded();
         let (ancestor_hashes_replay_update_sender, ancestor_hashes_replay_update_receiver) =
             unbounded();
@@ -209,7 +211,7 @@ impl Tvu {
             completed_data_sets_sender,
             max_slots.clone(),
             Some(rpc_subscriptions.clone()),
-            duplicate_slots_sender,
+            duplicate_slot_sender,
             ancestor_hashes_replay_update_receiver,
         );
 
@@ -322,7 +324,7 @@ impl Tvu {
             bank_forks.clone(),
             cluster_info.clone(),
             ledger_signal_receiver,
-            duplicate_slots_receiver,
+            duplicate_slot_receiver,
             poh_recorder.clone(),
             tower,
             vote_tracker,
@@ -465,6 +467,7 @@ pub mod tests {
         let tower = Tower::default();
         let accounts_package_channel = unbounded();
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
+        let (duplicate_slot_sender, duplicate_slot_receiver) = unbounded();
         let tvu = Tvu::new(
             &vote_keypair.pubkey(),
             Arc::new(RwLock::new(vec![Arc::new(vote_keypair)])),
@@ -514,6 +517,8 @@ pub mod tests {
             None,
             None,
             None,
+            duplicate_slot_sender,
+            duplicate_slot_receiver,
         );
         exit.store(true, Ordering::Relaxed);
         tvu.join().unwrap();
