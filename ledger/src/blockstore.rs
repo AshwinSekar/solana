@@ -350,6 +350,7 @@ impl BlockstoreInsertionMetrics {
     }
 }
 
+#[automock]
 impl Blockstore {
     pub fn db(self) -> Arc<Database> {
         self.db

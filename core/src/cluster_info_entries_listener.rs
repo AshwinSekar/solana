@@ -85,6 +85,7 @@ impl ClusterInfoEntriesListener {
         while !exit.load(Ordering::Relaxed) {
             let entries = cluster_info.get_entries(&mut cursor);
             inc_new_counter_debug!("cluster_info_entries_listener-recv_count", entries.len());
+            // TODO: dedup the pubkeys being sent?
             if !entries.is_empty() {
                 entries.iter().for_each(|value| {
                     if let CrdsData::DuplicateShred(_, _) = value.data {
@@ -199,5 +200,36 @@ impl ClusterInfoEntriesListener {
             // TODO: make a test case for this
             _ => (),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn test_recv_loop() {
+        let me = ContactInfo::new_localhost(&solana_sd::pubkey::new_unique(), timestamp());
+        let exit = AtomicBool::new(false);
+        let (duplicate_shred_sender, duplicate_shred_receiver) = unbounded();
+        let cluster_info = Arc::new(Cluster_info::new(
+            me,
+            Arc::new(Keypair::new()),
+            SocketAddrSpace::Unspecified,
+        ));
+
+        let proof = ();
+        let leader_schedule = ();
+        let keypairs: Vec<Keypair> = iter::repeat_with(keypair::new).take(10).collect().dedup();
+        {
+            let crds = cluster_info.gossip.crds.write().unwrap();
+            keypairs.iter().for_each(|keypair| {
+                crds.insert(CrdsValue::new_signed(
+                    CrdsData::DuplicateShred(0, DuplicateShred::default()),
+                    keypair,
+                ))
+            });
+        }
+
+        let _ = Self::process_duplicate_shreds_loop(exit, &cluster_info, duplicate_shred_sender);
     }
 }

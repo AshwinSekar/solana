@@ -230,6 +230,7 @@ pub struct PohRecorder {
     pub is_exited: Arc<AtomicBool>,
 }
 
+#[automock]
 impl PohRecorder {
     fn clear_bank(&mut self) {
         if let Some(working_bank) = self.working_bank.take() {
