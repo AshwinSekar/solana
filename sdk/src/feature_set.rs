@@ -195,6 +195,7 @@ pub mod stakes_remove_delegation_if_inactive {
     solana_sdk::declare_id!("HFpdDDNQjvcXnXKec697HDDsyk6tFoWS2o8fkxuhQZpL");
 }
 
+<<<<<<< HEAD
 pub mod do_support_realloc {
     solana_sdk::declare_id!("75m6ysz33AfLA5DDEzWM1obBrnPQRSsdVQ2nRmc8Vuu1");
 }
@@ -243,6 +244,10 @@ pub mod nonce_must_be_writable {
 
 pub mod spl_token_v3_3_0_release {
     solana_sdk::declare_id!("Ftok2jhqAqxUWEiCVRrfRs9DPppWP8cgTB7NQNKL88mS");
+}
+
+pub mod allow_votes_to_directly_update_vote_state {
+    solana_sdk::declare_id!("Ff8b1fBeB86q8cjq47ZhsQLgv5EkHu3G1C99zjUfAzrq");
 }
 
 lazy_static! {

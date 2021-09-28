@@ -57,7 +57,7 @@ use {
         timing::timestamp,
         transaction::Transaction,
     },
-    solana_vote_program::vote_state::Vote,
+    solana_vote_program::vote_state::VoteTransaction,
     std::{
         collections::{HashMap, HashSet},
         result,
@@ -1714,7 +1714,7 @@ impl ReplayStage {
         bank: &Bank,
         vote_account_pubkey: &Pubkey,
         authorized_voter_keypairs: &[Arc<Keypair>],
-        vote: Vote,
+        vote: Box<dyn VoteTransaction>,
         switch_fork_decision: &SwitchForkDecision,
         vote_signatures: &mut Vec<Signature>,
         has_new_vote_been_rooted: bool,
