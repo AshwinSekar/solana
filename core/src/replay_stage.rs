@@ -519,6 +519,7 @@ impl ReplayStage {
 
                     let mut compute_bank_stats_time = Measure::start("compute_bank_stats");
                     let newly_computed_slot_stats = Self::compute_bank_stats(
+                        &my_pubkey,
                         &vote_account,
                         &ancestors,
                         &mut frozen_banks,
@@ -588,8 +589,9 @@ impl ReplayStage {
 
                     let mut heaviest_fork_failures_time = Measure::start("heaviest_fork_failures_time");
                     if tower.is_recent(heaviest_bank.slot()) && !heaviest_fork_failures.is_empty() {
-                        info!(
-                            "Couldn't vote on heaviest fork: {:?}, heaviest_fork_failures: {:?}",
+                        println!(
+                            "{} Couldn't vote on heaviest fork: {:?}, heaviest_fork_failures: {:?}",
+                            my_pubkey,
                             heaviest_bank.slot(),
                             heaviest_fork_failures
                         );
@@ -655,8 +657,9 @@ impl ReplayStage {
                     // Reset onto a fork
                     if let Some(reset_bank) = reset_bank {
                         if last_reset != reset_bank.last_blockhash() {
-                            info!(
-                                "vote bank: {:?} reset bank: {:?}",
+                            println!(
+                                "{} vote bank: {:?} reset bank: {:?}",
+                                my_pubkey,
                                 vote_bank.as_ref().map(|(b, switch_fork_decision)| (
                                     b.slot(),
                                     switch_fork_decision
@@ -1682,7 +1685,7 @@ impl ReplayStage {
                     trace!("latest root send failed: {:?}", e);
                 }
             });
-            info!("new root {}", new_root);
+            println!("{} new root {}", identity_keypair.pubkey(), new_root);
         }
 
         let mut update_commitment_cache_time = Measure::start("update_commitment_cache");
@@ -2173,6 +2176,7 @@ impl ReplayStage {
 
     #[allow(clippy::too_many_arguments)]
     pub fn compute_bank_stats(
+        id: &Pubkey,
         my_vote_pubkey: &Pubkey,
         ancestors: &HashMap<u64, HashSet<u64>>,
         frozen_banks: &mut Vec<Arc<Bank>>,
@@ -2186,6 +2190,7 @@ impl ReplayStage {
     ) -> Vec<Slot> {
         frozen_banks.sort_by_key(|bank| bank.slot());
         let mut new_stats = vec![];
+        println!("{} computing bank stats", id);
         for bank in frozen_banks {
             let bank_slot = bank.slot();
             // Only time progress map should be missing a bank slot
@@ -2317,8 +2322,12 @@ impl ReplayStage {
                 .get_fork_stats_mut(bank_slot)
                 .expect("All frozen banks must exist in the Progress map");
 
-            stats.vote_threshold =
-                tower.check_vote_stake_threshold(bank_slot, &stats.voted_stakes, stats.total_stake);
+            stats.vote_threshold = tower.check_vote_stake_threshold(
+                id,
+                bank_slot,
+                &stats.voted_stakes,
+                stats.total_stake,
+            );
             stats.is_locked_out = tower.is_locked_out(
                 bank_slot,
                 ancestors
@@ -3893,6 +3902,7 @@ pub mod tests {
         let mut tower = Tower::new_for_tests(0, 0.67);
         let newly_computed = ReplayStage::compute_bank_stats(
             &my_vote_pubkey,
+            &my_vote_pubkey,
             &ancestors,
             &mut frozen_banks,
             &mut tower,
@@ -3937,6 +3947,7 @@ pub mod tests {
             .collect();
         let newly_computed = ReplayStage::compute_bank_stats(
             &my_vote_pubkey,
+            &my_vote_pubkey,
             &ancestors,
             &mut frozen_banks,
             &mut tower,
@@ -3972,6 +3983,7 @@ pub mod tests {
             .cloned()
             .collect();
         let newly_computed = ReplayStage::compute_bank_stats(
+            &my_vote_pubkey,
             &my_vote_pubkey,
             &ancestors,
             &mut frozen_banks,
@@ -4011,6 +4023,7 @@ pub mod tests {
 
         let my_vote_pubkey = vote_simulator.vote_pubkeys[0];
         ReplayStage::compute_bank_stats(
+            &my_vote_pubkey,
             &my_vote_pubkey,
             &ancestors,
             &mut frozen_banks,
@@ -4092,6 +4105,7 @@ pub mod tests {
 
         let my_vote_pubkey = vote_simulator.vote_pubkeys[0];
         ReplayStage::compute_bank_stats(
+            &my_vote_pubkey,
             &my_vote_pubkey,
             &vote_simulator.bank_forks.read().unwrap().ancestors(),
             &mut frozen_banks,
@@ -5008,6 +5022,7 @@ pub mod tests {
         // Update propagation status
         let mut tower = Tower::new_for_tests(0, 0.67);
         ReplayStage::compute_bank_stats(
+            &Pubkey::default(),
             &validator_node_to_vote_keys[&my_pubkey],
             &ancestors,
             &mut frozen_banks,
@@ -5387,6 +5402,7 @@ pub mod tests {
         let descendants = bank_forks.read().unwrap().descendants().clone();
 
         ReplayStage::compute_bank_stats(
+            &Pubkey::default(),
             &Pubkey::new_unique(),
             &ancestors,
             &mut frozen_banks,
@@ -5514,6 +5530,7 @@ pub mod tests {
         let descendants = bank_forks.read().unwrap().descendants().clone();
 
         ReplayStage::compute_bank_stats(
+            &Pubkey::default(),
             &Pubkey::new_unique(),
             &ancestors,
             &mut frozen_banks,
@@ -5924,6 +5941,7 @@ pub mod tests {
         let ancestors = &bank_forks.read().unwrap().ancestors();
         let descendants = &bank_forks.read().unwrap().descendants().clone();
         ReplayStage::compute_bank_stats(
+            &Pubkey::default(),
             &Pubkey::default(),
             &bank_forks.read().unwrap().ancestors(),
             &mut frozen_banks,
