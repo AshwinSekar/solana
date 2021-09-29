@@ -474,6 +474,8 @@ impl Validator {
             transaction_notifier,
         );
 
+        info!("Cluster type: {:?}", genesis_config.cluster_type);
+
         *start_progress.write().unwrap() = ValidatorStartProgress::StartingServices;
 
         if !config.no_os_network_stats_reporting {
