@@ -195,7 +195,6 @@ pub mod stakes_remove_delegation_if_inactive {
     solana_sdk::declare_id!("HFpdDDNQjvcXnXKec697HDDsyk6tFoWS2o8fkxuhQZpL");
 }
 
-<<<<<<< HEAD
 pub mod do_support_realloc {
     solana_sdk::declare_id!("75m6ysz33AfLA5DDEzWM1obBrnPQRSsdVQ2nRmc8Vuu1");
 }
