@@ -306,6 +306,7 @@ lazy_static! {
         (reject_deployment_of_unresolved_syscalls::id(), "Reject deployment of programs with unresolved syscall symbols"),
         (nonce_must_be_writable::id(), "nonce must be writable"),
         (spl_token_v3_3_0_release::id(), "spl-token v3.3.0 release"),
+        (allow_votes_to_directly_update_vote_state::id(), "enable direct vote state update"),
         /*************** ADD NEW FEATURES HERE ***************/
     ]
     .iter()
