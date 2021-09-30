@@ -1,5 +1,6 @@
 use {
-    crate::consensus::{Result, Tower, TowerError},
+    crate::consensus::{Result, Tower, TowerError, TowerVersions},
+    crate::tower1_7_14::Tower1_7_14,
     solana_sdk::{
         pubkey::Pubkey,
         signature::{Signature, Signer},
@@ -40,6 +41,24 @@ impl SavedTower {
         })
     }
 
+    pub fn new1_7_14<T: Signer>(tower: &Tower1_7_14, keypair: &T) -> Result<Self> {
+        let node_pubkey = keypair.pubkey();
+        if tower.node_pubkey != node_pubkey {
+            return Err(TowerError::WrongTower(format!(
+                "node_pubkey is {:?} but found tower for {:?}",
+                node_pubkey, tower.node_pubkey
+            )));
+        }
+
+        let data = bincode::serialize(tower)?;
+        let signature = keypair.sign_message(&data);
+        Ok(Self {
+            signature,
+            data,
+            node_pubkey,
+        })
+    }
+
     pub fn try_into_tower(self, node_pubkey: &Pubkey) -> Result<Tower> {
         // This method assumes that `self` was just deserialized
         assert_eq!(self.node_pubkey, Pubkey::default());
@@ -48,8 +67,11 @@ impl SavedTower {
             return Err(TowerError::InvalidSignature);
         }
         bincode::deserialize(&self.data)
+            .map(TowerVersions::Current)
+            .or_else(|_| bincode::deserialize(&self.data).map(TowerVersions::V1_17_14))
             .map_err(|e| e.into())
-            .and_then(|tower: Tower| {
+            .and_then(|tv: TowerVersions| {
+                let tower = tv.convert_to_current();
                 if tower.node_pubkey != *node_pubkey {
                     return Err(TowerError::WrongTower(format!(
                         "node_pubkey is {:?} but found tower for {:?}",

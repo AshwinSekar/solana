@@ -1,3 +1,4 @@
+use crate::tower1_7_14::Tower1_7_14;
 use {
     crate::{
         heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
@@ -127,6 +128,39 @@ pub(crate) struct ComputedBankState {
     // keyed by end of the range
     pub lockout_intervals: LockoutIntervals,
     pub my_latest_landed_vote: Option<Slot>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub enum TowerVersions {
+    V1_17_14(Tower1_7_14),
+    Current(Tower),
+}
+
+impl TowerVersions {
+    pub fn new_current(tower: Tower) -> Self {
+        Self::Current(tower)
+    }
+
+    pub fn convert_to_current(self) -> Tower {
+        match self {
+            TowerVersions::V1_17_14(tower) => {
+                let box_last_vote = Box::new(tower.last_vote) as Box<dyn VoteTransaction>;
+
+                Tower {
+                    node_pubkey: tower.node_pubkey,
+                    threshold_depth: tower.threshold_depth,
+                    threshold_size: tower.threshold_size,
+                    vote_state: tower.vote_state,
+                    last_vote: box_last_vote,
+                    last_vote_tx_blockhash: tower.last_vote_tx_blockhash,
+                    last_timestamp: tower.last_timestamp,
+                    stray_restored_slot: tower.stray_restored_slot,
+                    last_switch_threshold_check: tower.last_switch_threshold_check,
+                }
+            }
+            TowerVersions::Current(tower) => tower,
+        }
+    }
 }
 
 #[frozen_abi(digest = "GMs1FxKteU7K4ZFRofMBqNhBpM4xkPVxfYod6R8DQmpT")]
@@ -2766,6 +2800,31 @@ pub mod test {
             },
         );
         assert_matches!(loaded, Err(TowerError::SerializeError(_)))
+    }
+
+    #[test]
+    fn test_tower_migration() {
+        let tower_path = TempDir::new().unwrap();
+        let identity_keypair = Arc::new(Keypair::new());
+        let node_pubkey = identity_keypair.pubkey();
+
+        let old_tower = Tower1_7_14 {
+            node_pubkey,
+            threshold_depth: 10,
+            threshold_size: 0.9,
+            vote_state: VoteState::default(),
+            last_vote: Vote::default(),
+            last_timestamp: BlockTimestamp::default(),
+            last_vote_tx_blockhash: Hash::default(),
+            stray_restored_slot: Option::default(),
+            last_switch_threshold_check: Option::default(),
+        };
+
+        let tower_storage = FileTowerStorage::new(tower_path.path().to_path_buf());
+        old_tower.save(&tower_storage, &identity_keypair).unwrap();
+
+        let loaded = Tower::restore(&tower_storage, &node_pubkey).unwrap();
+        assert_eq!(loaded.last_vote, Box::new(Vote::default()) as Box<dyn VoteTransaction>);
     }
 
     #[test]
