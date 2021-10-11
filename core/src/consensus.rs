@@ -1371,7 +1371,7 @@ pub mod test {
             collections::HashMap,
             fs::{remove_file, OpenOptions},
             io::{Read, Seek, SeekFrom, Write},
-            path::PathBuf,
+            path::{Path, PathBuf},
             sync::Arc,
         },
         tempfile::TempDir,
@@ -2518,7 +2518,7 @@ pub mod test {
         F: Fn(&mut Tower, &Pubkey),
         G: Fn(&PathBuf),
     {
-        let tower_path = TempDir::new().unwrap();
+        let tower_path =  TempDir::new().unwrap();
         let identity_keypair = Arc::new(Keypair::new());
         let node_pubkey = identity_keypair.pubkey();
 
@@ -2823,7 +2823,10 @@ pub mod test {
         let tower_storage = FileTowerStorage::new(tower_path.path().to_path_buf());
         old_tower.save(&tower_storage, &identity_keypair).unwrap();
 
-        let loaded = Tower::restore(&tower_storage, &node_pubkey).unwrap();
+        let migration_tower_storage = FileTowerStorage::new_migration(tower_path.path().to_path_buf(), true);
+
+        let loaded = Tower::restore(&migration_tower_storage, &node_pubkey).unwrap();
+        assert_eq!(loaded.node_pubkey, old_tower.node_pubkey);
         assert_eq!(loaded.last_vote, Box::new(Vote::default()) as Box<dyn VoteTransaction>);
     }
 
