@@ -1342,6 +1342,12 @@ pub fn main() {
                 .help("Where to store the tower"),
         )
         .arg(
+            Arg::with_name("tower_migration")
+                .long("tower-migration")
+                .takes_value(false)
+                .help("Only use this flag when migrating from the old tower in version <= 1_7_14. Improper use of this flagcould result in a corrupted tower")
+        )
+        .arg(
             Arg::with_name("etcd_endpoint")
                 .long("etcd-endpoint")
                 .required_if("tower_storage", "etcd")
@@ -2481,6 +2487,8 @@ pub fn main() {
         .ok()
         .or_else(|| get_cluster_shred_version(&entrypoint_addrs));
 
+    let migration = matches.is_present("tower_migration");
+
     let tower_storage: Arc<dyn solana_core::tower_storage::TowerStorage> =
         match value_t_or_exit!(matches, "tower_storage", String).as_str() {
             "file" => {
@@ -2488,7 +2496,7 @@ pub fn main() {
                     .ok()
                     .unwrap_or_else(|| ledger_path.clone());
 
-                Arc::new(tower_storage::FileTowerStorage::new(tower_path))
+                Arc::new(tower_storage::FileTowerStorage::new(tower_path, migration))
             }
             "etcd" => {
                 let endpoints = values_t_or_exit!(matches, "etcd_endpoint", String);
@@ -2512,7 +2520,7 @@ pub fn main() {
                 };
 
                 Arc::new(
-                    tower_storage::EtcdTowerStorage::new(endpoints, Some(tls_config))
+                    tower_storage::EtcdTowerStorage::new(endpoints, Some(tls_config), migration)
                         .unwrap_or_else(|err| {
                             eprintln!("Failed to connect to etcd: {}", err);
                             exit(1);

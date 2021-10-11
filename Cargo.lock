@@ -4561,6 +4561,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "trees",
+ "typetag",
 ]
 
 [[package]]

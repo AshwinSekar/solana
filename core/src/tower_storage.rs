@@ -1,6 +1,6 @@
 use {
     crate::consensus::{Result, Tower, TowerError, TowerVersions},
-    crate::tower1_7_14::Tower1_7_14,
+    crate::tower1_7_14::SavedTower1_7_14,
     solana_sdk::{
         pubkey::Pubkey,
         signature::{Signature, Signer},
@@ -12,6 +12,12 @@ use {
         sync::RwLock,
     },
 };
+
+#[typetag::serde{tag = "type"}]
+pub trait SavedTowerVersion {
+    fn try_into_tower(&self, node_pubkey: &Pubkey) -> Result<Tower>;
+    fn pubkey(&self) -> Pubkey;
+}
 
 #[frozen_abi(digest = "Gaxfwvx5MArn52mKZQgzHmDCyn5YfCuTHvp5Et3rFfpp")]
 #[derive(Default, Clone, Serialize, Deserialize, Debug, PartialEq, AbiExample)]
@@ -40,26 +46,11 @@ impl SavedTower {
             node_pubkey,
         })
     }
+}
 
-    pub fn new1_7_14<T: Signer>(tower: &Tower1_7_14, keypair: &T) -> Result<Self> {
-        let node_pubkey = keypair.pubkey();
-        if tower.node_pubkey != node_pubkey {
-            return Err(TowerError::WrongTower(format!(
-                "node_pubkey is {:?} but found tower for {:?}",
-                node_pubkey, tower.node_pubkey
-            )));
-        }
-
-        let data = bincode::serialize(tower)?;
-        let signature = keypair.sign_message(&data);
-        Ok(Self {
-            signature,
-            data,
-            node_pubkey,
-        })
-    }
-
-    pub fn try_into_tower(self, node_pubkey: &Pubkey) -> Result<Tower> {
+#[typetag::serde]
+impl SavedTowerVersion for SavedTower {
+    fn try_into_tower(&self, node_pubkey: &Pubkey) -> Result<Tower> {
         // This method assumes that `self` was just deserialized
         assert_eq!(self.node_pubkey, Pubkey::default());
 
@@ -68,7 +59,6 @@ impl SavedTower {
         }
         bincode::deserialize(&self.data)
             .map(TowerVersions::Current)
-            .or_else(|_| bincode::deserialize(&self.data).map(TowerVersions::V1_17_14))
             .map_err(|e| e.into())
             .and_then(|tv: TowerVersions| {
                 let tower = tv.convert_to_current();
@@ -81,25 +71,29 @@ impl SavedTower {
                 Ok(tower)
             })
     }
+
+    fn pubkey(&self) -> Pubkey {
+        self.node_pubkey
+    }
 }
 
 pub trait TowerStorage: Sync + Send {
-    fn load(&self, node_pubkey: &Pubkey) -> Result<SavedTower>;
-    fn store(&self, saved_tower: &SavedTower) -> Result<()>;
+    fn load(&self, node_pubkey: &Pubkey) -> Result<Box<dyn SavedTowerVersion>>;
+    fn store(&self, saved_tower: &dyn SavedTowerVersion) -> Result<()>;
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct NullTowerStorage {}
 
 impl TowerStorage for NullTowerStorage {
-    fn load(&self, _node_pubkey: &Pubkey) -> Result<SavedTower> {
+    fn load(&self, _node_pubkey: &Pubkey) -> Result<Box<dyn SavedTowerVersion>> {
         Err(TowerError::IoError(io::Error::new(
             io::ErrorKind::Other,
             "NullTowerStorage::load() not available",
         )))
     }
 
-    fn store(&self, _saved_tower: &SavedTower) -> Result<()> {
+    fn store(&self, _saved_tower: &dyn SavedTowerVersion) -> Result<()> {
         Ok(())
     }
 }
@@ -107,11 +101,22 @@ impl TowerStorage for NullTowerStorage {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct FileTowerStorage {
     pub tower_path: PathBuf,
+    migration: bool,
 }
 
 impl FileTowerStorage {
     pub fn new(tower_path: PathBuf) -> Self {
-        Self { tower_path }
+        Self {
+            tower_path,
+            migration: false,
+        }
+    }
+
+    pub fn new_migration(tower_path: PathBuf, migration: bool) -> Self {
+        Self {
+            tower_path,
+            migration,
+        }
     }
 
     pub fn filename(&self, node_pubkey: &Pubkey) -> PathBuf {
@@ -122,7 +127,7 @@ impl FileTowerStorage {
 }
 
 impl TowerStorage for FileTowerStorage {
-    fn load(&self, node_pubkey: &Pubkey) -> Result<SavedTower> {
+    fn load(&self, node_pubkey: &Pubkey) -> Result<Box<dyn SavedTowerVersion>> {
         let filename = self.filename(node_pubkey);
         trace!("load {}", filename.display());
 
@@ -131,11 +136,21 @@ impl TowerStorage for FileTowerStorage {
 
         let file = File::open(&filename)?;
         let mut stream = BufReader::new(file);
-        bincode::deserialize_from(&mut stream).map_err(|e| e.into())
+
+        if self.migration {
+            bincode::deserialize_from(&mut stream)
+                .map_err(|e| e.into())
+                .map(|t: SavedTower1_7_14| Box::new(t) as Box<dyn SavedTowerVersion>)
+        } else {
+            bincode::deserialize_from(&mut stream)
+                .map_err(|e| e.into())
+                .map(|t: SavedTower| Box::new(t) as Box<dyn SavedTowerVersion>)
+        }
     }
 
-    fn store(&self, saved_tower: &SavedTower) -> Result<()> {
-        let filename = self.filename(&saved_tower.node_pubkey);
+    fn store(&self, saved_tower: &dyn SavedTowerVersion) -> Result<()> {
+        let pubkey = saved_tower.pubkey().clone();
+        let filename = self.filename(&pubkey);
         trace!("store: {}", filename.display());
         let new_filename = filename.with_extension("bin.new");
 
@@ -155,6 +170,7 @@ pub struct EtcdTowerStorage {
     client: RwLock<etcd_client::Client>,
     instance_id: [u8; 8],
     runtime: tokio::runtime::Runtime,
+    migration: bool,
 }
 
 pub struct EtcdTlsConfig {
@@ -168,6 +184,14 @@ impl EtcdTowerStorage {
     pub fn new<E: AsRef<str>, S: AsRef<[E]>>(
         endpoints: S,
         tls_config: Option<EtcdTlsConfig>,
+    ) -> Result<Self> {
+        Self::new_migration(endpoints, tls_config, false)
+    }
+
+    pub fn new_migration<E: AsRef<str>, S: AsRef<[E]>>(
+        endpoints: S,
+        tls_config: Option<EtcdTlsConfig>,
+        migration: bool,
     ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -201,6 +225,7 @@ impl EtcdTowerStorage {
             client: RwLock::new(client),
             instance_id: solana_sdk::timing::timestamp().to_le_bytes(),
             runtime,
+            migration,
         })
     }
 
@@ -216,7 +241,7 @@ impl EtcdTowerStorage {
 }
 
 impl TowerStorage for EtcdTowerStorage {
-    fn load(&self, node_pubkey: &Pubkey) -> Result<SavedTower> {
+    fn load(&self, node_pubkey: &Pubkey) -> Result<Box<dyn SavedTowerVersion>> {
         let (instance_key, tower_key) = Self::get_keys(node_pubkey);
         let mut client = self.client.write().unwrap();
 
@@ -258,7 +283,15 @@ impl TowerStorage for EtcdTowerStorage {
         for op_response in response.op_responses() {
             if let etcd_client::TxnOpResponse::Get(get_response) = op_response {
                 if let Some(kv) = get_response.kvs().get(0) {
-                    return bincode::deserialize_from(kv.value()).map_err(|e| e.into());
+                    if self.migration {
+                        return bincode::deserialize_from(kv.value())
+                            .map_err(|e| e.into())
+                            .map(|t: SavedTower1_7_14| Box::new(t) as Box<dyn SavedTowerVersion>);
+                    } else {
+                        return bincode::deserialize_from(kv.value())
+                            .map_err(|e| e.into())
+                            .map(|t: SavedTower| Box::new(t) as Box<dyn SavedTowerVersion>);
+                    }
                 }
             }
         }
@@ -270,8 +303,8 @@ impl TowerStorage for EtcdTowerStorage {
         )))
     }
 
-    fn store(&self, saved_tower: &SavedTower) -> Result<()> {
-        let (instance_key, tower_key) = Self::get_keys(&saved_tower.node_pubkey);
+    fn store(&self, saved_tower: &dyn SavedTowerVersion) -> Result<()> {
+        let (instance_key, tower_key) = Self::get_keys(&saved_tower.pubkey());
         let mut client = self.client.write().unwrap();
 
         let txn = etcd_client::Txn::new()
@@ -298,7 +331,7 @@ impl TowerStorage for EtcdTowerStorage {
         if !response.succeeded() {
             return Err(TowerError::IoError(io::Error::new(
                 io::ErrorKind::Other,
-                format!("Lost etcd instance lock for {}", saved_tower.node_pubkey),
+                format!("Lost etcd instance lock for {}", saved_tower.pubkey()),
             )));
         }
         Ok(())

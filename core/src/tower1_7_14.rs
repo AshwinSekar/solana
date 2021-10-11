@@ -1,7 +1,12 @@
-use crate::consensus::{SwitchForkDecision, TowerError};
-use crate::tower_storage::{TowerStorage, SavedTower};
-use solana_sdk::{pubkey::Pubkey, hash::Hash, clock::Slot, signature::Keypair};
-use solana_vote_program::vote_state::{VoteState, Vote, BlockTimestamp};
+use crate::consensus::{SwitchForkDecision, Tower, TowerError, TowerVersions};
+use crate::tower_storage::{TowerStorage, SavedTowerVersion};
+use solana_sdk::{
+    clock::Slot,
+    hash::Hash,
+    pubkey::Pubkey,
+    signature::{Keypair, Signature, Signer},
+};
+use solana_vote_program::vote_state::{BlockTimestamp, Vote, VoteState};
 
 #[frozen_abi(digest = "GMs1FxKteU7K4ZFRofMBqNhBpM4xkPVxfYod6R8DQmpT")]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, AbiExample)]
@@ -31,9 +36,72 @@ pub struct Tower1_7_14 {
 }
 
 impl Tower1_7_14 {
-    pub fn save(&self, tower_storage: &dyn TowerStorage, node_keypair: &Keypair) -> Result<(), TowerError> {
-        let saved_tower = SavedTower::new1_7_14(self, node_keypair)?;
+    #[cfg(test)]
+    pub fn save(
+        &self,
+        tower_storage: &dyn TowerStorage,
+        node_keypair: &Keypair,
+    ) -> Result<(), TowerError> {
+        let saved_tower = SavedTower1_7_14::new(self, node_keypair)?;
         tower_storage.store(&saved_tower)?;
         Ok(())
+    }
+}
+
+#[frozen_abi(digest = "Gaxfwvx5MArn52mKZQgzHmDCyn5YfCuTHvp5Et3rFfpp")]
+#[derive(Default, Clone, Serialize, Deserialize, Debug, PartialEq, AbiExample)]
+pub struct SavedTower1_7_14 {
+    pub(crate) signature: Signature,
+    pub(crate) data: Vec<u8>,
+    #[serde(skip)]
+    pub(crate) node_pubkey: Pubkey,
+}
+
+impl SavedTower1_7_14 {
+    pub fn new<T: Signer>(tower: &Tower1_7_14, keypair: &T) -> Result<Self, TowerError> {
+        let node_pubkey = keypair.pubkey();
+        if tower.node_pubkey != node_pubkey {
+            return Err(TowerError::WrongTower(format!(
+                "node_pubkey is {:?} but found tower for {:?}",
+                node_pubkey, tower.node_pubkey
+            )));
+        }
+
+        let data = bincode::serialize(tower)?;
+        let signature = keypair.sign_message(&data);
+        Ok(Self {
+            signature,
+            data,
+            node_pubkey,
+        })
+    }
+}
+
+#[typetag::serde]
+impl SavedTowerVersion for SavedTower1_7_14 {
+    fn try_into_tower(&self, node_pubkey: &Pubkey) -> Result<Tower, TowerError> {
+        // This method assumes that `self` was just deserialized
+        assert_eq!(self.node_pubkey, Pubkey::default());
+
+        if !self.signature.verify(node_pubkey.as_ref(), &self.data) {
+            return Err(TowerError::InvalidSignature);
+        }
+        bincode::deserialize(&self.data)
+            .map(TowerVersions::V1_17_14)
+            .map_err(|e| e.into())
+            .and_then(|tv: TowerVersions| {
+                let tower = tv.convert_to_current();
+                if tower.node_pubkey != *node_pubkey {
+                    return Err(TowerError::WrongTower(format!(
+                        "node_pubkey is {:?} but found tower for {:?}",
+                        node_pubkey, tower.node_pubkey
+                    )));
+                }
+                Ok(tower)
+            })
+    }
+
+    fn pubkey(&self) -> Pubkey {
+        self.node_pubkey
     }
 }
