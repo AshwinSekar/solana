@@ -26,6 +26,9 @@ fn parse_vote(vote_ix: &CompiledInstruction, vote_key: &Pubkey) -> Option<Parsed
             VoteInstruction::UpdateVoteState(vote_state_update) => {
                 Some((*vote_key, Box::new(vote_state_update), None))
             }
+            VoteInstruction::UpdateVoteStateSwitch(vote_state_update, hash) => {
+                Some((*vote_key, Box::new(vote_state_update), Some(hash)))
+            }
             VoteInstruction::Authorize(_, _)
             | VoteInstruction::AuthorizeChecked(_)
             | VoteInstruction::InitializeAccount(_)
