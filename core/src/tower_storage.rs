@@ -16,6 +16,7 @@ use {
 #[typetag::serde{tag = "type"}]
 pub trait SavedTowerVersion {
     fn try_into_tower(&self, node_pubkey: &Pubkey) -> Result<Tower>;
+    fn serialize_into(&self, file: &mut File) -> Result<()>;
     fn pubkey(&self) -> Pubkey;
 }
 
@@ -70,6 +71,10 @@ impl SavedTowerVersion for SavedTower {
                 }
                 Ok(tower)
             })
+    }
+
+    fn serialize_into(&self, file: &mut File) -> Result<()> {
+        bincode::serialize_into(file, self).map_err(|e| e.into())
     }
 
     fn pubkey(&self) -> Pubkey {
@@ -149,7 +154,7 @@ impl TowerStorage for FileTowerStorage {
     }
 
     fn store(&self, saved_tower: &dyn SavedTowerVersion) -> Result<()> {
-        let pubkey = saved_tower.pubkey().clone();
+        let pubkey = saved_tower.pubkey();
         let filename = self.filename(&pubkey);
         trace!("store: {}", filename.display());
         let new_filename = filename.with_extension("bin.new");
@@ -157,7 +162,7 @@ impl TowerStorage for FileTowerStorage {
         {
             // overwrite anything if exists
             let mut file = File::create(&new_filename)?;
-            bincode::serialize_into(&mut file, saved_tower)?;
+            saved_tower.serialize_into(&mut file)?;
             // file.sync_all() hurts performance; pipeline sync-ing and submitting votes to the cluster!
         }
         fs::rename(&new_filename, &filename)?;
@@ -303,6 +308,7 @@ impl TowerStorage for EtcdTowerStorage {
         )))
     }
 
+    // TODO: make compatible
     fn store(&self, saved_tower: &dyn SavedTowerVersion) -> Result<()> {
         let (instance_key, tower_key) = Self::get_keys(&saved_tower.pubkey());
         let mut client = self.client.write().unwrap();

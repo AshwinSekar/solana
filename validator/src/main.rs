@@ -2075,7 +2075,7 @@ pub fn main() {
                     .ok()
                     .unwrap_or_else(|| ledger_path.clone());
 
-                Arc::new(tower_storage::FileTowerStorage::new(tower_path, migration))
+                Arc::new(tower_storage::FileTowerStorage::new_migration(tower_path, migration))
             }
             "etcd" => {
                 let endpoints = values_t_or_exit!(matches, "etcd_endpoint", String);
@@ -2099,7 +2099,7 @@ pub fn main() {
                 };
 
                 Arc::new(
-                    tower_storage::EtcdTowerStorage::new(endpoints, Some(tls_config), migration)
+                    tower_storage::EtcdTowerStorage::new_migration(endpoints, Some(tls_config), migration)
                         .unwrap_or_else(|err| {
                             eprintln!("Failed to connect to etcd: {}", err);
                             exit(1);

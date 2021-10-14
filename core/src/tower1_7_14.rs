@@ -1,5 +1,5 @@
 use crate::consensus::{SwitchForkDecision, Tower, TowerError, TowerVersions};
-use crate::tower_storage::{TowerStorage, SavedTowerVersion};
+use crate::tower_storage::{SavedTowerVersion, TowerStorage};
 use solana_sdk::{
     clock::Slot,
     hash::Hash,
@@ -7,6 +7,7 @@ use solana_sdk::{
     signature::{Keypair, Signature, Signer},
 };
 use solana_vote_program::vote_state::{BlockTimestamp, Vote, VoteState};
+use std::fs::File;
 
 #[frozen_abi(digest = "GMs1FxKteU7K4ZFRofMBqNhBpM4xkPVxfYod6R8DQmpT")]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, AbiExample)]
@@ -36,7 +37,6 @@ pub struct Tower1_7_14 {
 }
 
 impl Tower1_7_14 {
-    #[cfg(test)]
     pub fn save(
         &self,
         tower_storage: &dyn TowerStorage,
@@ -99,6 +99,10 @@ impl SavedTowerVersion for SavedTower1_7_14 {
                 }
                 Ok(tower)
             })
+    }
+
+    fn serialize_into(&self, file: &mut File) -> Result<(), TowerError> {
+        bincode::serialize_into(file, self).map_err(|e| e.into())
     }
 
     fn pubkey(&self) -> Pubkey {
