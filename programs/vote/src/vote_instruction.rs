@@ -163,6 +163,15 @@ pub enum VoteInstruction {
     ///   2. `[]` Clock sysvar
     ///   3. `[SIGNER]` Vote authority
     UpdateVoteState(VoteStateUpdate),
+
+    /// Update the onchain vote state for the signer along with a switching proof.
+    ///
+    /// # Account references
+    ///   0. `[Write]` Vote account to vote with
+    ///   1. `[]` Slot hashes sysvar
+    ///   2. `[]` Clock sysvar
+    ///   3. `[SIGNER]` Vote authority
+    UpdateVoteStateSwitch(VoteStateUpdate, Hash),
 }
 
 fn initialize_account(vote_pubkey: &Pubkey, vote_init: &VoteInit) -> Instruction {
@@ -339,6 +348,26 @@ pub fn update_vote_state(
     )
 }
 
+pub fn update_vote_state_switch(
+    vote_pubkey: &Pubkey,
+    authorized_voter_pubkey: &Pubkey,
+    vote_state_update: VoteStateUpdate,
+    proof_hash: Hash,
+) -> Instruction {
+    let account_metas = vec![
+        AccountMeta::new(*vote_pubkey, false),
+        AccountMeta::new_readonly(sysvar::slot_hashes::id(), false),
+        AccountMeta::new_readonly(sysvar::clock::id(), false),
+        AccountMeta::new_readonly(*authorized_voter_pubkey, true),
+    ];
+
+    Instruction::new_with_bincode(
+        id(),
+        &VoteInstruction::UpdateVoteStateSwitch(vote_state_update, proof_hash),
+        account_metas,
+    )
+}
+
 pub fn withdraw(
     vote_pubkey: &Pubkey,
     authorized_withdrawer_pubkey: &Pubkey,
@@ -420,7 +449,8 @@ pub fn process_instruction(
                 &signers,
             )
         }
-        VoteInstruction::UpdateVoteState(vote_state_update) => {
+        VoteInstruction::UpdateVoteState(vote_state_update)
+        | VoteInstruction::UpdateVoteStateSwitch(vote_state_update, _) => {
             inc_new_counter_info!("vote-state-native", 1);
             vote_state::process_vote_state_update(
                 me,
@@ -589,6 +619,16 @@ mod tests {
             )),
             Err(InstructionError::InvalidAccountData),
         );
+        assert_eq!(
+            process_instruction(&update_vote_state_switch(
+                &Pubkey::default(),
+                &Pubkey::default(),
+                VoteStateUpdate::default(),
+                Hash::default(),
+            )),
+            Err(InstructionError::InvalidAccountData),
+        );
+
         assert_eq!(
             process_instruction(&authorize(
                 &Pubkey::default(),
