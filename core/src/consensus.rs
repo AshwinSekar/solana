@@ -1259,7 +1259,9 @@ impl Tower {
     }
 
     pub fn restore(tower_storage: &dyn TowerStorage, node_pubkey: &Pubkey) -> Result<Self> {
+        println!("Loading saved tower");
         let saved_tower = tower_storage.load(node_pubkey)?;
+        println!("trying into tower");
         saved_tower.try_into_tower(node_pubkey)
     }
 }
@@ -1371,7 +1373,7 @@ pub mod test {
             collections::HashMap,
             fs::{remove_file, OpenOptions},
             io::{Read, Seek, SeekFrom, Write},
-            path::{Path, PathBuf},
+            path::PathBuf,
             sync::Arc,
         },
         tempfile::TempDir,
@@ -2518,7 +2520,7 @@ pub mod test {
         F: Fn(&mut Tower, &Pubkey),
         G: Fn(&PathBuf),
     {
-        let tower_path =  TempDir::new().unwrap();
+        let tower_path = TempDir::new().unwrap();
         let identity_keypair = Arc::new(Keypair::new());
         let node_pubkey = identity_keypair.pubkey();
 
@@ -2820,14 +2822,20 @@ pub mod test {
             last_switch_threshold_check: Option::default(),
         };
 
-        let tower_storage = FileTowerStorage::new(tower_path.path().to_path_buf());
-        old_tower.save(&tower_storage, &identity_keypair).unwrap();
+        {
+            let tower_storage = FileTowerStorage::new(tower_path.path().to_path_buf());
+            old_tower.save(&tower_storage, &identity_keypair).unwrap();
+        }
 
-        let migration_tower_storage = FileTowerStorage::new_migration(tower_path.path().to_path_buf(), true);
+        let migration_tower_storage =
+            FileTowerStorage::new_migration(tower_path.path().to_path_buf(), true);
 
         let loaded = Tower::restore(&migration_tower_storage, &node_pubkey).unwrap();
         assert_eq!(loaded.node_pubkey, old_tower.node_pubkey);
-        assert_eq!(loaded.last_vote, Box::new(Vote::default()) as Box<dyn VoteTransaction>);
+        assert_eq!(
+            loaded.last_vote,
+            Box::new(Vote::default()) as Box<dyn VoteTransaction>
+        );
     }
 
     #[test]
