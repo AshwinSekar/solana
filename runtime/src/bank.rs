@@ -3497,9 +3497,15 @@ impl Bank {
                         (Ok(()), Some(NoncePartial::new(address, account)))
                     } else if hash_age == Some(false) {
                         error_counters.blockhash_too_old += 1;
+                        if is_simple_vote_transaction(tx) {
+                            inc_new_counter_debug!("bank-vote_reject_blockhash_too_old", 1);
+                        }
                         (Err(TransactionError::BlockhashNotFound), None)
                     } else {
                         error_counters.blockhash_not_found += 1;
+                        if is_simple_vote_transaction(tx) {
+                            inc_new_counter_debug!("bank-vote_reject_blockhash_not_found", 1);
+                        }
                         (Err(TransactionError::BlockhashNotFound), None)
                     }
                 }
@@ -3772,6 +3778,10 @@ impl Bank {
         let sanitized_txs = batch.sanitized_transactions();
         debug!("processing transactions: {}", sanitized_txs.len());
         inc_new_counter_info!("bank-process_transactions", sanitized_txs.len());
+
+        let sanitized_votes = sanitized_txs.iter().filter(|&tx| is_simple_vote_transaction(tx)).count();
+        inc_new_counter_info!("bank-sanitized_votes", sanitized_votes);
+
         let mut error_counters = ErrorCounters::default();
 
         let retryable_txs: Vec<_> = batch
