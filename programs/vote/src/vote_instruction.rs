@@ -402,8 +402,8 @@ pub fn process_instruction(
 ) -> Result<(), InstructionError> {
     let keyed_accounts = invoke_context.get_keyed_accounts()?;
 
-    trace!("process_instruction: {:?}", data);
-    trace!("keyed_accounts: {:?}", keyed_accounts);
+    info!("process_instruction: {:?}", data);
+    info!("keyed_accounts: {:?}", keyed_accounts);
 
     let me = &mut keyed_account_at_index(keyed_accounts, first_instruction_account)?;
     if me.owner()? != id() {
