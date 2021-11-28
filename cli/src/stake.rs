@@ -2333,11 +2333,15 @@ pub fn process_delegate_stake(
             })?
             .data;
 
+        println!("Vote account data {:?}", vote_account_data);
+
         let vote_state = VoteState::deserialize(&vote_account_data).map_err(|_| {
             CliError::RpcRequestError(
                 "Account data could not be deserialized to vote state".to_string(),
             )
         })?;
+
+        println!("Deserialized vote_state {:?}", vote_state);
 
         let sanity_check_result = match vote_state.root_slot {
             None => Err(CliError::BadParameter(
