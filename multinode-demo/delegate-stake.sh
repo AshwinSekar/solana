@@ -92,6 +92,7 @@ VALIDATOR_KEYS_DIR=$SOLANA_CONFIG_DIR/validator$label
 vote_account="${vote_account:-$VALIDATOR_KEYS_DIR/vote-account.json}"
 stake_account="${stake_account:-$VALIDATOR_KEYS_DIR/stake-account.json}"
 
+set -x
 if [[ ! -f $vote_account ]]; then
   echo "Error: $vote_account not found"
   exit 1
@@ -117,7 +118,6 @@ else
   echo "$stake_account already exists! Using it"
 fi
 
-set -x
 $solana_cli "${common_args[@]}" \
   vote-account "$vote_account"
 $solana_cli "${common_args[@]}" \
