@@ -2314,11 +2314,13 @@ pub fn process_delegate_stake(
     memo: Option<&String>,
     fee_payer: SignerIndex,
 ) -> ProcessResult {
+    println!("processing delegate stake");
     check_unique_pubkeys(
         (&config.signers[0].pubkey(), "cli keypair".to_string()),
         (stake_account_pubkey, "stake_account_pubkey".to_string()),
     )?;
     let stake_authority = config.signers[stake_authority];
+    println!("found stake authority");
 
     // if !sign_only {
     //     // Sanity check the vote account to ensure it is attached to a validator that has recently
@@ -2395,6 +2397,7 @@ pub fn process_delegate_stake(
     };
     let mut tx = Transaction::new_unsigned(message);
 
+    println!("constructed tx");
     if sign_only {
         tx.try_partial_sign(&config.signers, recent_blockhash)?;
         return_signers_with_config(
@@ -2420,6 +2423,7 @@ pub fn process_delegate_stake(
             &tx.message,
             config.commitment,
         )?;
+        println!("sending tx");
         let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
         log_instruction_custom_error::<StakeError>(result, config)
     }
