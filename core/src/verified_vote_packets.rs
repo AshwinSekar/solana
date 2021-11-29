@@ -6,7 +6,7 @@ use solana_sdk::{
     account::from_account, clock::Slot, hash::Hash, pubkey::Pubkey, signature::Signature,
     slot_hashes::SlotHashes, sysvar,
 };
-use solana_vote_program::vote_state::VoteTransaction;
+use solana_vote_program::vote_state::{VoteTransaction, Vote};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,

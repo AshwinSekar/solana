@@ -1396,12 +1396,14 @@ mod tests {
         vote_state
             .votes
             .resize(MAX_LOCKOUT_HISTORY, Lockout::default());
+        vote_state.root_slot = Some(1);
         let versioned = VoteStateVersions::new_current(vote_state);
         assert!(VoteState::serialize(&versioned, &mut buffer[0..4]).is_err());
         VoteState::serialize(&versioned, &mut buffer).unwrap();
+        let des = VoteState::deserialize(&buffer).unwrap();
         assert_eq!(
-            VoteStateVersions::new_current(VoteState::deserialize(&buffer).unwrap()),
-            versioned
+            des,
+            versioned.convert_to_current(),
         );
     }
 

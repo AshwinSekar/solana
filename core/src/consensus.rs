@@ -2172,7 +2172,7 @@ pub mod test {
     fn test_check_vote_threshold_without_votes() {
         let tower = Tower::new_for_tests(1, 0.67);
         let stakes = vec![(0, 1)].into_iter().collect();
-        assert!(tower.check_vote_stake_threshold(0, &stakes, 2));
+        assert!(tower.check_vote_stake_threshold(&Pubkey::default(), 0, &stakes, 2));
     }
 
     #[test]
@@ -2184,7 +2184,7 @@ pub mod test {
             stakes.insert(i, 1);
             tower.record_vote(i, Hash::default());
         }
-        assert!(!tower.check_vote_stake_threshold(MAX_LOCKOUT_HISTORY as u64 + 1, &stakes, 2,));
+        assert!(!tower.check_vote_stake_threshold(&Pubkey::default(), MAX_LOCKOUT_HISTORY as u64 + 1, &stakes, 2,));
     }
 
     #[test]
@@ -2299,14 +2299,14 @@ pub mod test {
         let mut tower = Tower::new_for_tests(1, 0.67);
         let stakes = vec![(0, 1)].into_iter().collect();
         tower.record_vote(0, Hash::default());
-        assert!(!tower.check_vote_stake_threshold(1, &stakes, 2));
+        assert!(!tower.check_vote_stake_threshold(&Pubkey::default(), 1, &stakes, 2));
     }
     #[test]
     fn test_check_vote_threshold_above_threshold() {
         let mut tower = Tower::new_for_tests(1, 0.67);
         let stakes = vec![(0, 2)].into_iter().collect();
         tower.record_vote(0, Hash::default());
-        assert!(tower.check_vote_stake_threshold(1, &stakes, 2));
+        assert!(tower.check_vote_stake_threshold(&Pubkey::default(), 1, &stakes, 2));
     }
 
     #[test]
@@ -2316,7 +2316,7 @@ pub mod test {
         tower.record_vote(0, Hash::default());
         tower.record_vote(1, Hash::default());
         tower.record_vote(2, Hash::default());
-        assert!(tower.check_vote_stake_threshold(6, &stakes, 2));
+        assert!(tower.check_vote_stake_threshold(&Pubkey::default(), 6, &stakes, 2));
     }
 
     #[test]
@@ -2324,7 +2324,7 @@ pub mod test {
         let mut tower = Tower::new_for_tests(1, 0.67);
         let stakes = HashMap::new();
         tower.record_vote(0, Hash::default());
-        assert!(!tower.check_vote_stake_threshold(1, &stakes, 2));
+        assert!(!tower.check_vote_stake_threshold(&Pubkey::default(), 1, &stakes, 2));
     }
 
     #[test]
@@ -2335,7 +2335,7 @@ pub mod test {
         tower.record_vote(0, Hash::default());
         tower.record_vote(1, Hash::default());
         tower.record_vote(2, Hash::default());
-        assert!(tower.check_vote_stake_threshold(6, &stakes, 2,));
+        assert!(tower.check_vote_stake_threshold(&Pubkey::default(), 6, &stakes, 2,));
     }
 
     #[test]
@@ -2453,7 +2453,7 @@ pub mod test {
             |_| None,
             &mut LatestValidatorVotesForFrozenBanks::default(),
         );
-        assert!(tower.check_vote_stake_threshold(vote_to_evaluate, &voted_stakes, total_stake,));
+        assert!(tower.check_vote_stake_threshold(&Pubkey::default(), vote_to_evaluate, &voted_stakes, total_stake,));
 
         // CASE 2: Now we want to evaluate a vote for slot VOTE_THRESHOLD_DEPTH + 1. This slot
         // will expire the vote in one of the vote accounts, so we should have insufficient
@@ -2471,7 +2471,7 @@ pub mod test {
             |_| None,
             &mut LatestValidatorVotesForFrozenBanks::default(),
         );
-        assert!(!tower.check_vote_stake_threshold(vote_to_evaluate, &voted_stakes, total_stake,));
+        assert!(!tower.check_vote_stake_threshold(&Pubkey::default(), vote_to_evaluate, &voted_stakes, total_stake,));
     }
 
     fn vote_and_check_recent(num_votes: usize) {
@@ -2817,12 +2817,17 @@ pub mod test {
         let tower_path = TempDir::new().unwrap();
         let identity_keypair = Arc::new(Keypair::new());
         let node_pubkey = identity_keypair.pubkey();
+        let mut vote_state = VoteState::default();
+        vote_state
+            .votes
+            .resize(MAX_LOCKOUT_HISTORY, Lockout::default());
+        vote_state.root_slot = Some(1);
 
         let old_tower = Tower1_7_14 {
             node_pubkey,
             threshold_depth: 10,
             threshold_size: 0.9,
-            vote_state: VoteState::default(),
+            vote_state: vote_state,
             last_vote: Vote::default(),
             last_timestamp: BlockTimestamp::default(),
             last_vote_tx_blockhash: Hash::default(),
@@ -2843,6 +2848,10 @@ pub mod test {
         assert_eq!(
             loaded.last_vote,
             Box::new(Vote::default()) as Box<dyn VoteTransaction>
+        );
+        assert_eq!(
+            loaded.vote_state.root_slot, 
+            Some(1)
         );
     }
 

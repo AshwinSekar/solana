@@ -596,7 +596,7 @@ mod tests {
             Err(InstructionError::InvalidAccountOwner),
         );
         assert_eq!(
-            process_instruction(&update_vote_state(
+            process_instruction_as_one_arg(&update_vote_state(
                 &invalid_vote_state_pubkey(),
                 &Pubkey::default(),
                 VoteStateUpdate::default(),
@@ -645,7 +645,7 @@ mod tests {
             Err(InstructionError::InvalidAccountData),
         );
         assert_eq!(
-            process_instruction(&update_vote_state(
+            process_instruction_as_one_arg(&update_vote_state(
                 &Pubkey::default(),
                 &Pubkey::default(),
                 VoteStateUpdate::default(),
@@ -655,21 +655,11 @@ mod tests {
 
 
         assert_eq!(
-            process_instruction(&update_vote_state_switch(
+            process_instruction_as_one_arg(&update_vote_state_switch(
                 &Pubkey::default(),
                 &Pubkey::default(),
                 VoteStateUpdate::default(),
                 Hash::default(),
-            )),
-            Err(InstructionError::InvalidAccountData),
-        );
-
-        assert_eq!(
-            process_instruction(&authorize(
-                &Pubkey::default(),
-                &Pubkey::default(),
-                &Pubkey::default(),
-                VoteStateUpdate::default(),
             )),
             Err(InstructionError::InvalidAccountData),
         );
