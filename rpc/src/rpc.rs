@@ -842,6 +842,7 @@ impl JsonRpcRequestProcessor {
                 }
 
                 let vote_state = account.vote_state();
+                info!("ASHWIN DEBUG: vote state for this vote account {} is {:?}", vote_pubkey, vote_state);
                 let vote_state = vote_state.as_ref().unwrap_or(&default_vote_state);
                 let last_vote = if let Some(vote) = vote_state.votes.iter().last() {
                     vote.slot
