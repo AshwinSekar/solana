@@ -71,6 +71,7 @@ pub fn parse_vote(
             })
         }
         VoteInstruction::UpdateVoteState(vote_state_update) => {
+            println!("Received a vote state update");
             check_num_vote_accounts(&instruction.accounts, 4)?;
             let vote_state_update = json!({
                 "lockouts": vote_state_update.lockouts,
@@ -78,6 +79,7 @@ pub fn parse_vote(
                 "hash": vote_state_update.hash.to_string(),
                 "timestamp": vote_state_update.timestamp,
             });
+            println!("parsing vote state update");
             Ok(ParsedInstructionEnum {
                 instruction_type: "updatevotestate".to_string(),
                 info: json!({
