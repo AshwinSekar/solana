@@ -470,8 +470,8 @@ pub fn process_instruction(
             info!("calling process_vote_state_update");
             vote_state::process_vote_state_update(
                 me,
-                &from_keyed_account::<SlotHashes>(keyed_account_at_index(keyed_accounts, 1)?)?,
-                &from_keyed_account::<Clock>(keyed_account_at_index(keyed_accounts, 2)?)?,
+                &from_keyed_account::<SlotHashes>(keyed_account_at_index(keyed_accounts, first_instruction_account + 1)?)?,
+                &from_keyed_account::<Clock>(keyed_account_at_index(keyed_accounts, first_instruction_account + 2)?)?,
                 &vote_state_update,
                 &signers,
             )
