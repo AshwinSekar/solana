@@ -404,6 +404,7 @@ pub fn process_instruction(
 
     info!("process_instruction: {:?}", data);
     info!("keyed_accounts: {:?}", keyed_accounts);
+    info!("first_instruction_account {}", first_instruction_account);
 
     let me = &mut keyed_account_at_index(keyed_accounts, first_instruction_account)?;
     if me.owner()? != id() {
@@ -411,7 +412,9 @@ pub fn process_instruction(
     }
 
     let signers: HashSet<Pubkey> = get_signers(&keyed_accounts[first_instruction_account..]);
-    match limited_deserialize(data)? {
+    let des = limited_deserialize(data);
+    info!("des: {:?}", des);
+    match des? {
         VoteInstruction::InitializeAccount(vote_init) => {
             verify_rent_exemption(
                 me,
@@ -464,6 +467,7 @@ pub fn process_instruction(
         VoteInstruction::UpdateVoteState(vote_state_update)
         | VoteInstruction::UpdateVoteStateSwitch(vote_state_update, _) => {
             inc_new_counter_info!("vote-state-native", 1);
+            info!("calling process_vote_state_update");
             vote_state::process_vote_state_update(
                 me,
                 &from_keyed_account::<SlotHashes>(keyed_account_at_index(keyed_accounts, 1)?)?,
