@@ -12,6 +12,7 @@ documentation = "https://docs.rs/solana-local-cluster"
 [dependencies]
 crossbeam-channel = "0.5"
 itertools = "0.10.3"
+flate2 = "1.0.22"
 fs_extra = "1.2.0"
 log = "0.4.14"
 rand = "0.7.0"
@@ -28,6 +29,7 @@ solana-stake-program = { path = "../programs/stake", version = "=1.10.0" }
 solana-streamer = { path = "../streamer", version = "=1.10.0" }
 solana-vote-program = { path = "../programs/vote", version = "=1.10.0" }
 tempfile = "3.2.0"
+tar = "0.4.38"
 
 [dev-dependencies]
 assert_matches = "1.5.0"
