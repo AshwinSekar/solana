@@ -607,11 +607,12 @@ impl VoteState {
             // doesn't match the expected hash for that slot on this
             // fork
             warn!(
-                "{} dropped vote {:?} failed to match hash {} {}",
+                "{} dropped vote {:?} failed to match hash {} {}. slot hashes {:?}",
                 self.node_pubkey,
                 vote_state_update,
                 vote_state_update.hash,
-                slot_hashes[slot_hashes_index].1
+                slot_hashes[slot_hashes_index].1,
+                slot_hashes,
             );
             inc_new_counter_info!("dropped-vote-hash", 1);
             return Err(VoteError::SlotHashMismatch);
