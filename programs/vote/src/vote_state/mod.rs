@@ -614,6 +614,8 @@ impl VoteState {
                 slot_hashes[slot_hashes_index].1,
                 slot_hashes,
             );
+            warn!("current votes {:?}", self.votes);
+            warn!("votes to filter {:?}", vote_state_update_indexes_to_filter);
             inc_new_counter_info!("dropped-vote-hash", 1);
             return Err(VoteError::SlotHashMismatch);
         }
