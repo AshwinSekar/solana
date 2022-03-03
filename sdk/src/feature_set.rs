@@ -233,7 +233,6 @@ pub mod record_instruction_in_transaction_context_push {
 lazy_static! {
     /// Map of feature identifiers to user-visible description
     pub static ref FEATURE_NAMES: HashMap<Pubkey, &'static str> = [
-        (secp256k1_program_enabled::id(), "secp256k1 program"),
         (deprecate_rewards_sysvar::id(), "deprecate unused rewards sysvar"),
         (pico_inflation::id(), "pico inflation"),
         (full_inflation::id(), "full inflation on devnet and testnet"),

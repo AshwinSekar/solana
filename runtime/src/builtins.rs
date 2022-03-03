@@ -233,15 +233,6 @@ fn builtin_feature_transitions() -> Vec<BuiltinFeatureTransition> {
         }),
         BuiltinFeatureTransition(InnerBuiltinFeatureTransition::RemoveOrRetain {
             previously_added_builtin: Builtin::new(
-                "secp256k1_program",
-                solana_sdk::secp256k1_program::id(),
-                dummy_process_instruction,
-            ),
-            addition_feature_id: feature_set::secp256k1_program_enabled::id(),
-            removal_feature_id: feature_set::prevent_calling_precompiles_as_programs::id(),
-        }),
-        BuiltinFeatureTransition(InnerBuiltinFeatureTransition::RemoveOrRetain {
-            previously_added_builtin: Builtin::new(
                 "ed25519_program",
                 solana_sdk::ed25519_program::id(),
                 dummy_process_instruction,
