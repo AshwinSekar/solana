@@ -949,7 +949,9 @@ impl Validator {
     }
 
     pub fn close(mut self) {
+        info!("exiting");
         self.exit();
+        info!("join");
         self.join();
     }
 
@@ -979,11 +981,14 @@ impl Validator {
     }
 
     pub fn join(self) {
+        info!("hi");
         drop(self.bank_forks);
         drop(self.cluster_info);
+        info!("hi1");
 
         self.poh_service.join().expect("poh_service");
         drop(self.poh_recorder);
+        info!("hi2");
 
         if let Some(json_rpc_service) = self.json_rpc_service {
             json_rpc_service.join().expect("rpc_service");
@@ -993,6 +998,7 @@ impl Validator {
             pubsub_service.join().expect("pubsub_service");
         }
 
+        info!("hi3");
         self.rpc_completed_slots_service
             .join()
             .expect("rpc_completed_slots_service");
@@ -1005,6 +1011,7 @@ impl Validator {
                 .expect("optimistically_confirmed_bank_tracker");
         }
 
+        info!("hi4");
         if let Some(transaction_status_service) = self.transaction_status_service {
             transaction_status_service
                 .join()
@@ -1023,6 +1030,7 @@ impl Validator {
                 .expect("cache_block_meta_service");
         }
 
+        info!("hi5");
         if let Some(system_monitor_service) = self.system_monitor_service {
             system_monitor_service
                 .join()
@@ -1035,10 +1043,12 @@ impl Validator {
                 .expect("sample_performance_service");
         }
 
+        info!("hi6");
         if let Some(s) = self.snapshot_packager_service {
             s.join().expect("snapshot_packager_service");
         }
 
+        info!("hi7");
         self.gossip_service.join().expect("gossip_service");
         self.serve_repair_service
             .join()
@@ -1046,14 +1056,18 @@ impl Validator {
         self.stats_reporter_service
             .join()
             .expect("stats_reporter_service");
+
+        info!("hi8");
         self.tpu.join().expect("tpu");
         self.tvu.join().expect("tvu");
+        info!("hi9");
         self.completed_data_sets_service
             .join()
             .expect("completed_data_sets_service");
         if let Some(ip_echo_server) = self.ip_echo_server {
             ip_echo_server.shutdown_background();
         }
+        info!("hi10");
 
         if let Some(accountsdb_repl_service) = self.accountsdb_repl_service {
             accountsdb_repl_service
@@ -1061,6 +1075,7 @@ impl Validator {
                 .expect("accountsdb_repl_service");
         }
 
+        info!("hi11");
         if let Some(accountsdb_plugin_service) = self.accountsdb_plugin_service {
             accountsdb_plugin_service
                 .join()
