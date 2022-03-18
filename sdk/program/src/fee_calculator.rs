@@ -95,12 +95,13 @@ impl FeeRateGovernor {
             ..FeeRateGovernor::default()
         };
 
-        Self::new_derived(&base_fee_rate_governor, 0)
+        Self::new_derived(&base_fee_rate_governor, 0, 0)
     }
 
     pub fn new_derived(
         base_fee_rate_governor: &FeeRateGovernor,
         latest_signatures_per_slot: u64,
+        slot: u64,
     ) -> Self {
         let mut me = base_fee_rate_governor.clone();
 
@@ -120,8 +121,9 @@ impl FeeRateGovernor {
                             / me.target_signatures_per_slot as u64,
                     ));
 
-            trace!(
-                "desired_lamports_per_signature: {}",
+            info!(
+                "Slot {}: desired_lamports_per_signature: {}",
+                slot,
                 desired_lamports_per_signature
             );
 
@@ -136,8 +138,9 @@ impl FeeRateGovernor {
                 let gap_adjust =
                     std::cmp::max(1, me.target_lamports_per_signature / 20) as i64 * gap.signum();
 
-                trace!(
-                    "lamports_per_signature gap is {}, adjusting by {}",
+                info!(
+                    "Slot {}: lamports_per_signature gap is {}, adjusting by {}",
+                    slot,
                     gap,
                     gap_adjust
                 );
@@ -154,8 +157,9 @@ impl FeeRateGovernor {
             me.min_lamports_per_signature = me.target_lamports_per_signature;
             me.max_lamports_per_signature = me.target_lamports_per_signature;
         }
-        debug!(
-            "new_derived(): lamports_per_signature: {}",
+        info!(
+            "Slot {} new_derived(): lamports_per_signature: {}",
+            slot,
             me.lamports_per_signature
         );
         me
@@ -265,7 +269,7 @@ mod tests {
         );
         assert_eq!(f0.lamports_per_signature, 0);
 
-        let f1 = FeeRateGovernor::new_derived(&f0, DEFAULT_TARGET_SIGNATURES_PER_SLOT);
+        let f1 = FeeRateGovernor::new_derived(&f0, DEFAULT_TARGET_SIGNATURES_PER_SLOT, 0);
         assert_eq!(
             f1.target_signatures_per_slot,
             DEFAULT_TARGET_SIGNATURES_PER_SLOT
@@ -289,14 +293,14 @@ mod tests {
             target_signatures_per_slot: 100,
             ..FeeRateGovernor::default()
         };
-        f = FeeRateGovernor::new_derived(&f, 0);
+        f = FeeRateGovernor::new_derived(&f, 0, 0);
 
         // Ramp fees up
         let mut count = 0;
         loop {
             let last_lamports_per_signature = f.lamports_per_signature;
 
-            f = FeeRateGovernor::new_derived(&f, std::u64::MAX);
+            f = FeeRateGovernor::new_derived(&f, std::u64::MAX, 0);
             info!("[up] f.lamports_per_signature={}", f.lamports_per_signature);
 
             // some maximum target reached
@@ -312,7 +316,7 @@ mod tests {
         let mut count = 0;
         loop {
             let last_lamports_per_signature = f.lamports_per_signature;
-            f = FeeRateGovernor::new_derived(&f, 0);
+            f = FeeRateGovernor::new_derived(&f, 0, 0);
 
             info!(
                 "[down] f.lamports_per_signature={}",
@@ -332,7 +336,7 @@ mod tests {
         // Arrive at target rate
         let mut count = 0;
         while f.lamports_per_signature != f.target_lamports_per_signature {
-            f = FeeRateGovernor::new_derived(&f, f.target_signatures_per_slot);
+            f = FeeRateGovernor::new_derived(&f, f.target_signatures_per_slot, 0);
             info!(
                 "[target] f.lamports_per_signature={}",
                 f.lamports_per_signature

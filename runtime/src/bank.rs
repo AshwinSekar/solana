@@ -1563,6 +1563,7 @@ impl Bank {
                 let fee_rate_governor = FeeRateGovernor::new_derived(
                     &parent.fee_rate_governor,
                     parent.signature_count(),
+                    slot,
                 );
 
                 let fee_calculator = if parent.feature_set.is_active(&disable_fee_calculator::id())
