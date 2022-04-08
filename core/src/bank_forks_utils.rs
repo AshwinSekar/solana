@@ -9,7 +9,7 @@ use log::*;
 use solana_entry::entry::VerifyRecyclers;
 use solana_ledger::{blockstore::Blockstore, leader_schedule_cache::LeaderScheduleCache};
 use solana_runtime::{
-    bank_forks::BankForks, snapshot_archive_info::SnapshotArchiveInfoGetter,
+    bank_forks::BankForks,
     snapshot_config::SnapshotConfig, snapshot_package::AccountsPackageSender, snapshot_utils,
 };
 use solana_sdk::{clock::Slot, genesis_config::GenesisConfig, hash::Hash, pubkey::Pubkey};
