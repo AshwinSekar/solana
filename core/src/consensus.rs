@@ -108,7 +108,7 @@ pub struct Tower {
     pub(crate) node_pubkey: Pubkey,
     threshold_depth: usize,
     threshold_size: f64,
-    vote_state: VoteState,
+    pub vote_state: VoteState,
     last_vote: Vote,
     #[serde(skip)]
     // The blockhash used in the last vote transaction, may or may not equal the
@@ -149,6 +149,13 @@ impl Default for Tower {
 }
 
 impl Tower {
+    pub fn new_from_vote_state(vote_state: VoteState) -> Tower {
+        Tower {
+            vote_state,
+            ..Tower::default()
+        }
+    }
+
     pub fn new(
         node_pubkey: &Pubkey,
         vote_account_pubkey: &Pubkey,
@@ -214,6 +221,7 @@ impl Tower {
         // keyed by end of the range
         let mut lockout_intervals = LockoutIntervals::new();
         let mut my_latest_landed_vote = None;
+
         for (&key, (voted_stake, account)) in vote_accounts.iter() {
             let voted_stake = *voted_stake;
             if voted_stake == 0 {
@@ -241,7 +249,16 @@ impl Tower {
                     .push((vote.slot, key));
             }
 
-            if key == *vote_account_pubkey {
+            let node_pubkey = vote_state.node_pubkey;
+            println!(
+                "validator {} vote state root: {:?}, votes: {:#?}",
+                node_pubkey, vote_state.root_slot, vote_state.votes
+            );
+            if key == *vote_account_pubkey || key == node_pubkey {
+                println!(
+                    "my vote state root: {:?}, votes: {:#?}",
+                    vote_state.root_slot, vote_state.votes
+                );
                 my_latest_landed_vote = vote_state.nth_recent_vote(0).map(|v| v.slot);
                 debug!("vote state {:?}", vote_state);
                 debug!(
@@ -272,6 +289,10 @@ impl Tower {
             }
 
             vote_state.process_slot_vote_unchecked(bank_slot);
+            println!(
+                "validator {} vote state root: {:?}, votes: {:#?} after applying {}",
+                node_pubkey, vote_state.root_slot, vote_state.votes, bank_slot
+            );
 
             for vote in &vote_state.votes {
                 bank_weight += vote.lockout() as u128 * voted_stake as u128;
@@ -860,23 +881,34 @@ impl Tower {
         let mut vote_state = self.vote_state.clone();
         vote_state.process_slot_vote_unchecked(slot);
         let vote = vote_state.nth_recent_vote(self.threshold_depth);
+
         if let Some(vote) = vote {
             if let Some(fork_stake) = voted_stakes.get(&vote.slot) {
                 let lockout = *fork_stake as f64 / total_stake as f64;
-                trace!(
-                    "fork_stake slot: {}, vote slot: {}, lockout: {} fork_stake: {} total_stake: {}",
-                    slot, vote.slot, lockout, fork_stake, total_stake
-                );
-                if vote.confirmation_count as usize > self.threshold_depth {
-                    for old_vote in &self.vote_state.votes {
-                        if old_vote.slot == vote.slot
-                            && old_vote.confirmation_count == vote.confirmation_count
-                        {
-                            return true;
+
+                let res = {
+                    if vote.confirmation_count as usize > self.threshold_depth {
+                        for old_vote in &self.vote_state.votes {
+                            if old_vote.slot == vote.slot
+                                && old_vote.confirmation_count == vote.confirmation_count
+                            {
+                                return true;
+                            }
                         }
                     }
-                }
-                lockout > self.threshold_size
+                    lockout > self.threshold_size
+                };
+
+                println!(
+                    "fork_stake slot: {}, 
+                    threshold vote slot: {}, 
+                    lockout: {}
+                    cluster_voted_stake: {}
+                    total_stake: {},
+                    result: {}",
+                    slot, vote.slot, lockout, fork_stake, total_stake, res
+                );
+                res
             } else {
                 false
             }

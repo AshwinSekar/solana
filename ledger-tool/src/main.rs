@@ -695,6 +695,42 @@ fn load_bank_forks(
     process_options: ProcessOptions,
     snapshot_archive_path: Option<PathBuf>,
 ) -> bank_forks_utils::LoadResult {
+    do_load_bank_forks(
+        arg_matches,
+        genesis_config,
+        blockstore,
+        process_options,
+        snapshot_archive_path,
+        &mut None,
+    )
+}
+
+fn load_bank_forks_with_simulated_tower(
+    arg_matches: &ArgMatches,
+    genesis_config: &GenesisConfig,
+    blockstore: &Blockstore,
+    process_options: ProcessOptions,
+    snapshot_archive_path: Option<PathBuf>,
+    simulated_tower: &mut SimulatedTower,
+) -> bank_forks_utils::LoadResult {
+    do_load_bank_forks(
+        arg_matches,
+        genesis_config,
+        blockstore,
+        process_options,
+        snapshot_archive_path,
+        &mut Some(simulated_tower),
+    )
+}
+
+fn do_load_bank_forks(
+    arg_matches: &ArgMatches,
+    genesis_config: &GenesisConfig,
+    blockstore: &Blockstore,
+    process_options: ProcessOptions,
+    snapshot_archive_path: Option<PathBuf>,
+    simulated_tower: &mut Option<&mut SimulatedTower>,
+) -> bank_forks_utils::LoadResult {
     let bank_snapshots_dir = blockstore
         .ledger_path()
         .join(if blockstore.is_primary_access() {
@@ -746,6 +782,7 @@ fn load_bank_forks(
         None,
         accounts_package_sender,
         None,
+        simulated_tower,
     )
 }
 
@@ -1268,6 +1305,46 @@ fn main() {
                     .help("Output file"),
             )
         ).subcommand(
+            SubCommand::with_name("recreate-tower")
+            .about("Create a new ledger snapshot")
+            .arg(&no_snapshot_arg)
+            .arg(&account_paths_arg)
+            .arg(&halt_at_slot_arg)
+            .arg(&limit_load_slot_count_from_snapshot_arg)
+            .arg(&accounts_index_bins)
+            .arg(&verify_index_arg)
+            .arg(&hard_forks_arg)
+            .arg(&no_accounts_db_caching_arg)
+            .arg(&accounts_db_test_hash_calculation_arg)
+            .arg(&no_bpf_jit_arg)
+            .arg(&allow_dead_slots_arg)
+            .arg(&max_genesis_archive_unpacked_size_arg)
+            .arg(
+                Arg::with_name("log_path")
+                    .index(1)
+                    .value_name("PATH")
+                    .takes_value(true)
+                    .required(true)
+                    .help("path to the log to parse to recreate the tower"),
+            )
+            .arg(
+                Arg::with_name("start_vote")
+                    .index(2)
+                    .value_name("START")
+                    .takes_value(true)
+                    .required(true)
+                    .help("first vote slot after which to start printing the tower"),
+            )
+            .arg(
+                Arg::with_name("validator_pubkey")
+                    .index(3)
+                    .value_name("PUBKEY")
+                    .takes_value(true)
+                    .required(true)
+                    .help("pubkey of this validator"),
+            )
+        )
+        .subcommand(
             SubCommand::with_name("create-snapshot")
             .about("Create a new ledger snapshot")
             .arg(&no_snapshot_arg)
@@ -1520,6 +1597,17 @@ fn main() {
                     .required(false)
                     .takes_value(false)
                     .help("Limit purging to dead slots only")
+            )
+        )
+        .subcommand(
+            SubCommand::with_name("list-ancestors")
+            .about("Output all ancestors of given start slot")
+            .arg(
+                Arg::with_name("start_slot")
+                    .long("start-slot")
+                    .value_name("NUM")
+                    .takes_value(true)
+                    .help("Starting slot to get the ancestors of")
             )
         )
         .subcommand(
@@ -2054,6 +2142,154 @@ fn main() {
                 }
                 exit_signal.store(true, Ordering::Relaxed);
                 system_monitor_service.join().unwrap();
+                println!("Ok");
+            }
+
+            ("recreate-tower", Some(arg_matches)) => {
+                let log_path = value_t_or_exit!(arg_matches, "log_path", String);
+                let start_vote = value_t_or_exit!(arg_matches, "start_vote", Slot);
+                let validator_pubkey = pubkey_of(arg_matches, "validator_pubkey").unwrap();
+
+                let vote_regex = Regex::new(r"voting: (\d*)").unwrap();
+                let new_root_regex = Regex::new(r"new root (\d*)").unwrap();
+
+                let f = BufReader::new(File::open(&log_path).unwrap());
+                println!("Reading log file {}", log_path);
+
+                let mut current_vote_state = VoteState::default();
+                let mut pending_votes: VecDeque<Slot> = VecDeque::new();
+
+                let snapshot_root_slot =
+                    snapshot_utils::get_highest_full_snapshot_archive_slot(&ledger_path).unwrap();
+
+                // Tracks when the recreated vote state becomes consistent with the
+                // original vote state
+                let mut is_consistent = false;
+                for line in f.lines().flatten() {
+                    if let Some(vote_slot_string) = vote_regex.captures_iter(&line).next() {
+                        let vote_slot = vote_slot_string
+                            .get(1)
+                            .expect("Only one match group")
+                            .as_str()
+                            .parse::<u64>()
+                            .unwrap();
+
+                        if vote_slot > snapshot_root_slot {
+                            if !is_consistent {
+                                panic!(
+                                    "vote state was not consistent by vote {} > snapshot slot: {}",
+                                    vote_slot, snapshot_root_slot
+                                );
+                            }
+                            pending_votes.push_back(vote_slot);
+                        } else {
+                            current_vote_state.process_slot_vote_unchecked(vote_slot);
+                            if is_consistent && vote_slot >= start_vote {
+                                println!("Parsed vote for slot: {}", vote_slot);
+                                println!(
+                                    "root: {:?}, Local vote state: {:#?}",
+                                    current_vote_state.root_slot, current_vote_state.votes
+                                );
+                            }
+                        }
+                    } else if let Some(new_root_string) = new_root_regex.captures_iter(&line).next()
+                    {
+                        let root = new_root_string
+                            .get(1)
+                            .expect("Only one match group")
+                            .as_str()
+                            .parse::<u64>()
+                            .unwrap();
+                        if root >= start_vote {
+                            println!("Parsed new root: {}", root);
+                        }
+                        if Some(root) == current_vote_state.root_slot {
+                            if !is_consistent {
+                                println!("Current vote state is consistent as of root: {}", root);
+                                is_consistent = true;
+                            }
+                        }
+                        // If
+                        // 1) the root doesn't match AND
+                        // 2) we haven't stopped applying the votes
+                        // to the `current_vote_state` (we know we haven't stopped by checking if
+                        // the `pending_votes` has been added to) AND
+                        // 3) We were previously consistent, i.e. `is_consistent == true`
+                        //
+                        // Then we have become unexpectedly inconsistent.
+                        else if is_consistent && pending_votes.is_empty() {
+                            panic!(
+                                "Our tower was consistent and then became inconsistent, maybe
+                            the log is missing some votes!"
+                            );
+                        }
+                    }
+                }
+
+                let tower = Tower::new_from_vote_state(current_vote_state);
+
+                let mut simulated_tower = SimulatedTower {
+                    tower,
+                    pending_votes,
+                    validator_pubkey,
+                };
+
+                // TODO: Don't copy paste this from "verify", extract into separate function
+                let accounts_index_config = value_t!(arg_matches, "accounts_index_bins", usize)
+                    .ok()
+                    .map(|bins| AccountsIndexConfig { bins: Some(bins) });
+
+                let accounts_db_config = Some(AccountsDbConfig {
+                    index: accounts_index_config,
+                    accounts_hash_cache_path: Some(ledger_path.clone()),
+                });
+
+                let process_options = ProcessOptions {
+                    dev_halt_at_slot: value_t!(arg_matches, "halt_at_slot", Slot).ok(),
+                    new_hard_forks: hardforks_of(arg_matches, "hard_forks"),
+                    poh_verify: !arg_matches.is_present("skip_poh_verify"),
+                    bpf_jit: !matches.is_present("no_bpf_jit"),
+                    accounts_db_caching_enabled: !arg_matches.is_present("no_accounts_db_caching"),
+                    limit_load_slot_count_from_snapshot: value_t!(
+                        arg_matches,
+                        "limit_load_slot_count_from_snapshot",
+                        usize
+                    )
+                    .ok(),
+                    accounts_db_config,
+                    verify_index: arg_matches.is_present("verify_accounts_index"),
+                    allow_dead_slots: arg_matches.is_present("allow_dead_slots"),
+                    accounts_db_test_hash_calculation: arg_matches
+                        .is_present("accounts_db_test_hash_calculation"),
+                    ..ProcessOptions::default()
+                };
+                let print_accounts_stats = arg_matches.is_present("print_accounts_stats");
+                println!(
+                    "genesis hash: {}",
+                    open_genesis_config_by(&ledger_path, arg_matches).hash()
+                );
+
+                let blockstore = open_blockstore(
+                    &ledger_path,
+                    AccessType::TryPrimaryThenSecondary,
+                    wal_recovery_mode,
+                );
+                let (bank_forks, ..) = load_bank_forks_with_simulated_tower(
+                    arg_matches,
+                    &open_genesis_config_by(&ledger_path, arg_matches),
+                    &blockstore,
+                    process_options,
+                    snapshot_archive_path,
+                    &mut simulated_tower,
+                )
+                .unwrap_or_else(|err| {
+                    eprintln!("Ledger verification failed: {:?}", err);
+                    exit(1);
+                });
+                if print_accounts_stats {
+                    let working_bank = bank_forks.working_bank();
+                    working_bank.print_accounts_stats();
+                }
                 println!("Ok");
             }
             ("graph", Some(arg_matches)) => {
@@ -3101,6 +3337,19 @@ fn main() {
                         purge_from_blockstore(dead_slot, dead_slot);
                     }
                 }
+            }
+            ("list-ancestors", Some(arg_matches)) => {
+                let blockstore = open_blockstore(
+                    &ledger_path,
+                    AccessType::TryPrimaryThenSecondary,
+                    wal_recovery_mode,
+                );
+
+                let start_slot = Slot::from_str(arg_matches.value_of("start_slot").unwrap())
+                    .expect("Starting root must be a number");
+
+                let ancestors: Vec<Slot> = AncestorIterator::new(start_slot, &blockstore).collect();
+                println!("ancestors of {} are {:?}", start_slot, ancestors);
             }
             ("list-roots", Some(arg_matches)) => {
                 let blockstore = open_blockstore(
