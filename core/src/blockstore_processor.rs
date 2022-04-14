@@ -12,27 +12,30 @@ use solana_entry::entry::{
     self, create_ticks, Entry, EntrySlice, EntryType, EntryVerificationStatus, VerifyRecyclers,
 };
 use solana_ledger::{
-    block_cost_limits::*, block_error::BlockError, blockstore::Blockstore,
-    blockstore_db::BlockstoreError, blockstore_meta::SlotMeta,
-    leader_schedule_cache::LeaderScheduleCache,
+    block_error::BlockError, blockstore::Blockstore, blockstore_db::BlockstoreError,
+    blockstore_meta::SlotMeta, leader_schedule_cache::LeaderScheduleCache,
 };
 use solana_measure::measure::Measure;
 use solana_metrics::{datapoint_error, inc_new_counter_debug};
+use solana_program_runtime::timings::ExecuteTimings;
 use solana_rayon_threadlimit::get_thread_count;
 use solana_runtime::{
     accounts_db::{AccountShrinkThreshold, AccountsDbConfig},
+    accounts_update_notifier_interface::AccountsUpdateNotifier,
     accounts_index::AccountSecondaryIndexes,
     bank::{
-        Bank, ExecuteTimings, InnerInstructionsList, RentDebits, TransactionBalancesSet,
-        TransactionExecutionResult, TransactionLogMessages, TransactionResults,
+        Bank, RentDebits, TransactionBalancesSet,
+        TransactionExecutionResult, TransactionResults,
     },
     bank_forks::BankForks,
     bank_utils,
+    block_cost_limits::*,
     commitment::VOTE_THRESHOLD_SIZE,
     snapshot_config::SnapshotConfig,
     snapshot_package::{AccountsPackageSender, SnapshotType},
     snapshot_utils::{self, BankFromArchiveTimings},
     transaction_batch::TransactionBatch,
+    transaction_cost_metrics_sender::TransactionCostMetricsSender,
     vote_account::VoteAccount,
     vote_sender_types::ReplayVoteSender,
 };
@@ -44,7 +47,10 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signature},
     timing,
-    transaction::{Result, SanitizedTransaction, TransactionError, VersionedTransaction},
+    transaction::{
+        Result, SanitizedTransaction, TransactionError, TransactionVerificationMode,
+        VersionedTransaction,
+    },
 };
 use solana_transaction_status::token_balances::{
     collect_token_balances, TransactionTokenBalancesSet,
@@ -69,7 +75,7 @@ pub struct BlockCostCapacityMeter {
 
 impl Default for BlockCostCapacityMeter {
     fn default() -> Self {
-        BlockCostCapacityMeter::new(BLOCK_COST_MAX)
+        BlockCostCapacityMeter::new(MAX_BLOCK_UNITS)
     }
 }
 
@@ -172,15 +178,14 @@ fn execute_batch(
 
     let pre_process_units: u64 = aggregate_total_execution_units(timings);
 
-    let (tx_results, balances, inner_instructions, transaction_logs) =
-        batch.bank().load_execute_and_commit_transactions(
-            batch,
-            MAX_PROCESSING_AGE,
-            transaction_status_sender.is_some(),
-            transaction_status_sender.is_some(),
-            transaction_status_sender.is_some(),
-            timings,
-        );
+    let (tx_results, balances) = batch.bank().load_execute_and_commit_transactions(
+        batch,
+        MAX_PROCESSING_AGE,
+        transaction_status_sender.is_some(),
+        transaction_status_sender.is_some(),
+        transaction_status_sender.is_some(),
+        timings,
+    );
 
     if bank
         .feature_set
@@ -235,8 +240,6 @@ fn execute_batch(
             execution_results,
             balances,
             token_balances,
-            inner_instructions,
-            transaction_logs,
             rent_debits,
         );
     }
@@ -303,7 +306,7 @@ pub fn process_entries(
     let verify_transaction = {
         let bank = bank.clone();
         move |versioned_tx: VersionedTransaction| -> Result<SanitizedTransaction> {
-            bank.verify_transaction(versioned_tx, false)
+            bank.verify_transaction(versioned_tx, TransactionVerificationMode::FullVerification)
         }
     };
 
@@ -316,6 +319,7 @@ pub fn process_entries(
         None,
         transaction_status_sender,
         replay_vote_sender,
+        None,
         &mut timings,
         Arc::new(RwLock::new(BlockCostCapacityMeter::default())),
     );
@@ -332,6 +336,7 @@ fn process_entries_with_callback(
     entry_callback: Option<&ProcessCallback>,
     transaction_status_sender: Option<&TransactionStatusSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
+    transaction_cost_metrics_sender: Option<&TransactionCostMetricsSender>,
     timings: &mut ExecuteTimings,
     cost_capacity_meter: Arc<RwLock<BlockCostCapacityMeter>>,
 ) -> Result<()> {
@@ -365,6 +370,10 @@ fn process_entries_with_callback(
                 }
             }
             EntryType::Transactions(transactions) => {
+                if let Some(transaction_cost_metrics_sender) = transaction_cost_metrics_sender {
+                    transaction_cost_metrics_sender
+                        .send_cost_details(bank.clone(), transactions.iter());
+                }
                 if randomize {
                     transactions.shuffle(&mut rng);
                 }
@@ -487,6 +496,7 @@ pub fn process_blockstore(
     cache_block_meta_sender: Option<&CacheBlockMetaSender>,
     snapshot_config: Option<&SnapshotConfig>,
     accounts_package_sender: AccountsPackageSender,
+    accounts_update_notifier: Option<AccountsUpdateNotifier>,
     simulated_tower: &mut Option<&mut SimulatedTower>,
 ) -> BlockstoreProcessorResult {
     if let Some(num_threads) = opts.override_num_threads {
@@ -502,7 +512,6 @@ pub fn process_blockstore(
     let bank0 = Bank::new_with_paths(
         genesis_config,
         account_paths,
-        &opts.frozen_accounts,
         opts.debug_keys.clone(),
         Some(&solana_ledger::builtins::get(opts.bpf_jit)),
         opts.account_indexes.clone(),
@@ -510,6 +519,7 @@ pub fn process_blockstore(
         opts.shrink_ratio,
         false,
         opts.accounts_db_config.clone(),
+        accounts_update_notifier,
     );
     let bank0 = Arc::new(bank0);
     info!("processing ledger for slot 0...");
@@ -796,6 +806,7 @@ fn confirm_full_slot(
         skip_verification,
         transaction_status_sender,
         replay_vote_sender,
+        None,
         opts.entry_callback.as_ref(),
         recyclers,
         opts.allow_dead_slots,
@@ -863,6 +874,7 @@ pub fn confirm_slot(
     skip_verification: bool,
     transaction_status_sender: Option<&TransactionStatusSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
+    transaction_cost_metrics_sender: Option<&TransactionCostMetricsSender>,
     entry_callback: Option<&ProcessCallback>,
     recyclers: &VerifyRecyclers,
     allow_dead_slots: bool,
@@ -927,54 +939,85 @@ pub fn confirm_slot(
 
     let verify_transaction = {
         let bank = bank.clone();
-        move |versioned_tx: VersionedTransaction| -> Result<SanitizedTransaction> {
-            bank.verify_transaction(versioned_tx, skip_verification)
+        move |versioned_tx: VersionedTransaction,
+        verification_mode: TransactionVerificationMode| -> Result<SanitizedTransaction> {
+            bank.verify_transaction(versioned_tx, verification_mode)
         }
     };
     let check_start = Instant::now();
-    let mut entries = entry::verify_transactions(entries, Arc::new(verify_transaction))?;
-    let transaction_duration_us = timing::duration_as_us(&check_start.elapsed());
+    let check_result = entry::start_verify_transactions(
+        entries,
+        skip_verification,
+        recyclers.clone(),
+        Arc::new(verify_transaction),
+    );
+    let transaction_cpu_duration_us = timing::duration_as_us(&check_start.elapsed());
 
-    let mut replay_elapsed = Measure::start("replay_elapsed");
-    let mut execute_timings = ExecuteTimings::default();
-    let cost_capacity_meter = Arc::new(RwLock::new(BlockCostCapacityMeter::default()));
-    // Note: This will shuffle entries' transactions in-place.
-    let process_result = process_entries_with_callback(
-        bank,
-        &mut entries,
-        true, // shuffle transactions.
-        entry_callback,
-        transaction_status_sender,
-        replay_vote_sender,
-        &mut execute_timings,
-        cost_capacity_meter,
-    )
-    .map_err(BlockstoreProcessorError::from);
-    replay_elapsed.stop();
-    timing.replay_elapsed += replay_elapsed.as_us();
+    match check_result {
+        Ok(mut check_result) => {
+            let entries = check_result.entries();
+            assert!(entries.is_some());
 
-    timing.execute_timings.accumulate(&execute_timings);
+            let mut replay_elapsed = Measure::start("replay_elapsed");
+            let mut execute_timings = ExecuteTimings::default();
+            let cost_capacity_meter = Arc::new(RwLock::new(BlockCostCapacityMeter::default()));
+            // Note: This will shuffle entries' transactions in-place.
+            let process_result = process_entries_with_callback(
+                bank,
+                &mut entries.unwrap(),
+                true, // shuffle transactions.
+                entry_callback,
+                transaction_status_sender,
+                replay_vote_sender,
+                transaction_cost_metrics_sender,
+                &mut execute_timings,
+                cost_capacity_meter,
+            )
+            .map_err(BlockstoreProcessorError::from);
+            replay_elapsed.stop();
+            timing.replay_elapsed += replay_elapsed.as_us();
 
-    if let Some(mut verifier) = verifier {
-        let verified = verifier.finish_verify();
-        timing.poh_verify_elapsed += verifier.poh_duration_us();
-        timing.transaction_verify_elapsed += transaction_duration_us;
-        if !verified {
+            timing.execute_timings.accumulate(&execute_timings);
+
+            // If running signature verification on the GPU, wait for that
+            // computation to finish, and get the result of it. If we did the
+            // signature verification on the CPU, this just returns the
+            // already-computed result produced in start_verify_transactions.
+            // Either way, check the result of the signature verification.
+            if !check_result.finish_verify() {
+                warn!("Ledger proof of history failed at slot: {}", bank.slot());
+                return Err(TransactionError::SignatureFailure.into());
+            }
+
+            if let Some(mut verifier) = verifier {
+                let verified = verifier.finish_verify();
+                timing.poh_verify_elapsed += verifier.poh_duration_us();
+                // The GPU Entry verification (if any) is kicked off right when the CPU-side
+                // Entry verification finishes, so these times should be disjoint
+                timing.transaction_verify_elapsed +=
+                    transaction_cpu_duration_us + check_result.gpu_verify_duration();
+                if !verified {
+                    warn!("Ledger proof of history failed at slot: {}", bank.slot());
+                    return Err(BlockError::InvalidEntryHash.into());
+                }
+            }
+
+            process_result?;
+
+            progress.num_shreds += num_shreds;
+            progress.num_entries += num_entries;
+            progress.num_txs += num_txs;
+            if let Some(last_entry_hash) = last_entry_hash {
+                progress.last_entry = last_entry_hash;
+            }
+
+            Ok(())
+        }
+        Err(err) => {
             warn!("Ledger proof of history failed at slot: {}", bank.slot());
-            return Err(BlockError::InvalidEntryHash.into());
+            Err(err.into())
         }
     }
-
-    process_result?;
-
-    progress.num_shreds += num_shreds;
-    progress.num_entries += num_entries;
-    progress.num_txs += num_txs;
-    if let Some(last_entry_hash) = last_entry_hash {
-        progress.last_entry = last_entry_hash;
-    }
-
-    Ok(())
 }
 
 // Special handling required for processing the entries in slot 0
@@ -1185,6 +1228,7 @@ fn load_frozen_forks(
                             snapshot_config.accounts_hash_use_index,
                             snapshot_config.accounts_hash_debug_verify,
                             Some(new_root_bank.epoch_schedule().slots_per_epoch),
+                            false,
                         );
                         snapshot_utils::snapshot_bank(
                             new_root_bank,
@@ -1400,8 +1444,6 @@ pub struct TransactionStatusBatch {
     pub statuses: Vec<TransactionExecutionResult>,
     pub balances: TransactionBalancesSet,
     pub token_balances: TransactionTokenBalancesSet,
-    pub inner_instructions: Option<Vec<Option<InnerInstructionsList>>>,
-    pub transaction_logs: Option<Vec<Option<TransactionLogMessages>>>,
     pub rent_debits: Vec<RentDebits>,
 }
 
@@ -1419,16 +1461,9 @@ impl TransactionStatusSender {
         statuses: Vec<TransactionExecutionResult>,
         balances: TransactionBalancesSet,
         token_balances: TransactionTokenBalancesSet,
-        inner_instructions: Vec<Option<InnerInstructionsList>>,
-        transaction_logs: Vec<Option<TransactionLogMessages>>,
         rent_debits: Vec<RentDebits>,
     ) {
         let slot = bank.slot();
-        let (inner_instructions, transaction_logs) = if !self.enable_cpi_and_log_storage {
-            (None, None)
-        } else {
-            (Some(inner_instructions), Some(transaction_logs))
-        };
         if let Err(e) = self
             .sender
             .send(TransactionStatusMessage::Batch(TransactionStatusBatch {
@@ -1437,8 +1472,6 @@ impl TransactionStatusSender {
                 statuses,
                 balances,
                 token_balances,
-                inner_instructions,
-                transaction_logs,
                 rent_debits,
             }))
         {

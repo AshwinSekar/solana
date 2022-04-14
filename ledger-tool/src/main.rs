@@ -16,14 +16,16 @@ use {
             is_parsable, is_pow2, is_pubkey, is_pubkey_or_keypair, is_slot, is_valid_percentage,
         },
     },
+    solana_core::bank_forks_utils,
+    solana_core::bank_forks_utils::SimulatedTower,
+    solana_core::blockstore_processor::ProcessOptions,
+    solana_core::consensus::Tower,
     solana_core::system_monitor_service::SystemMonitorService,
     solana_entry::entry::Entry,
     solana_ledger::{
         ancestor_iterator::AncestorIterator,
-        bank_forks_utils,
         blockstore::{create_new_ledger, Blockstore, PurgeType},
         blockstore_db::{self, AccessType, BlockstoreRecoveryMode, Database},
-        blockstore_processor::ProcessOptions,
         shred::Shred,
     },
     solana_measure::measure::Measure,
@@ -63,7 +65,7 @@ use {
         vote_state::{self, VoteState},
     },
     std::{
-        collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+        collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
         ffi::OsStr,
         fs::File,
         io::{self, stdout, BufRead, BufReader, Write},
@@ -2237,11 +2239,15 @@ fn main() {
                 // TODO: Don't copy paste this from "verify", extract into separate function
                 let accounts_index_config = value_t!(arg_matches, "accounts_index_bins", usize)
                     .ok()
-                    .map(|bins| AccountsIndexConfig { bins: Some(bins) });
+                    .map(|bins| AccountsIndexConfig {
+                        bins: Some(bins),
+                        ..AccountsIndexConfig::default()
+                    });
 
                 let accounts_db_config = Some(AccountsDbConfig {
                     index: accounts_index_config,
                     accounts_hash_cache_path: Some(ledger_path.clone()),
+                    ..AccountsDbConfig::default()
                 });
 
                 let process_options = ProcessOptions {
@@ -2645,7 +2651,7 @@ fn main() {
                                 eprintln!("Unable to create incremental snapshot without a base full snapshot");
                                 exit(1);
                             }
-                            let full_snapshot_slot = starting_snapshot_hashes.unwrap().full.hash.0;
+                            let full_snapshot_slot = starting_snapshot_hashes.unwrap().0;
                             if bank.slot() <= full_snapshot_slot {
                                 eprintln!("Unable to create incremental snapshot: Slot must be greater than full snapshot slot. slot: {}, full snapshot slot: {}",
                                 bank.slot(),
