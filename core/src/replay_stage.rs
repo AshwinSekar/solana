@@ -2535,6 +2535,7 @@ impl ReplayStage {
             let (is_locked_out, vote_threshold, is_leader_slot, fork_weight) = {
                 let fork_stats = progress.get_fork_stats(bank.slot()).unwrap();
                 let propagated_stats = &progress.get_propagated_stats(bank.slot()).unwrap();
+                println!("{:?}", fork_stats);
                 (
                     fork_stats.is_locked_out,
                     fork_stats.vote_threshold,

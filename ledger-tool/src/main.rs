@@ -2176,7 +2176,7 @@ fn main() {
                             .parse::<u64>()
                             .unwrap();
 
-                        if vote_slot > snapshot_root_slot {
+                        if vote_slot > snapshot_root_slot + 300 {
                             if !is_consistent {
                                 panic!(
                                     "vote state was not consistent by vote {} > snapshot slot: {}",
