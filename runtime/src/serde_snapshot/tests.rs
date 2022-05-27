@@ -15,6 +15,7 @@ use {
         genesis_config::{create_genesis_config, ClusterType},
         pubkey::Pubkey,
         signature::{Keypair, Signer},
+        feature_set::{disable_fee_calculator},
     },
     std::{
         io::{BufReader, Cursor},
@@ -365,12 +366,13 @@ fn test_bank_serialize_newer() {
 fn test_extra_fields_eof() {
     solana_logger::setup();
     let (genesis_config, _) = create_genesis_config(500);
-    let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
-    let mut bank1 = Bank::new_from_parent(&bank0, &Pubkey::default(), 1);
-    bank0.squash();
+    let mut bank0 = Bank::new_for_tests(&genesis_config);
+    bank0.activate_feature(&disable_fee_calculator::id());
+    let bank0rc = Arc::new(bank0);
+    let mut bank1 = Bank::new_from_parent(&bank0rc, &Pubkey::default(), 1);
+    bank0rc.squash();
 
     // Set extra fields
-    bank1.fee_calculator.lamports_per_signature = 7000;
     bank1.fee_rate_governor.lamports_per_signature = 7000;
 
     // Serialize

@@ -2132,7 +2132,11 @@ impl Bank {
         fn new<T: Default>() -> T {
             T::default()
         }
-        let feature_set = new();
+        let feature_set = match &*bank_rc.parent.read().unwrap() {
+            Some(parent) => parent.feature_set.clone(),
+            None => new(),
+        };
+        println!("{:?}", feature_set);
         let mut bank = Self {
             rewrites_skipped_this_slot: Rewrites::default(),
             rc: bank_rc,
@@ -2206,6 +2210,7 @@ impl Bank {
             additional_builtins,
             debug_do_not_add_builtins,
         );
+        println!("{:?}", feature_set);
 
         // Sanity assertions between bank snapshot and genesis config
         // Consider removing from serializable bank state
@@ -2233,7 +2238,10 @@ impl Bank {
         );
         assert_eq!(bank.epoch_schedule, genesis_config.epoch_schedule);
         assert_eq!(bank.epoch, bank.epoch_schedule.get_epoch(bank.slot));
+        println!("wow {}", bank.fee_rate_governor.lamports_per_signature);
+        println!("wew {}", bank.fee_calculator.lamports_per_signature);
         if !bank.feature_set.is_active(&disable_fee_calculator::id()) {
+            println!("huh??");
             bank.fee_rate_governor.lamports_per_signature =
                 bank.fee_calculator.lamports_per_signature;
             assert_eq!(
