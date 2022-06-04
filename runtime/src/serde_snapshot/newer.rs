@@ -315,6 +315,7 @@ impl<'a> TypeContext<'a> for Context {
             Err(err) if err.to_string() == "io error: failed to fill whole buffer" => Ok(0),
             result => result,
         }?;
+        info!("restored lamps_per_sig {}", lamports_per_signature);
         bank_fields.fee_rate_governor = bank_fields
             .fee_rate_governor
             .clone_with_lamports_per_signature(lamports_per_signature);
