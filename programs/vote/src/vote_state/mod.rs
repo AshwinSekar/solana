@@ -748,6 +748,10 @@ impl VoteState {
                 );
                 vote_state_update.root = self.root_slot;
             }
+            info!(
+                "Proposed root is too old {} compared to earliest slot {}",
+                new_proposed_root, earliest_slot_hash_in_history
+            );
         }
 
         // index into the new proposed vote state's slots, starting with the root if it exists then
