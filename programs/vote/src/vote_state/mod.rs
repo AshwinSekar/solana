@@ -695,14 +695,14 @@ impl VoteState {
         slot_hashes: &[(Slot, Hash)],
     ) -> Result<(), VoteError> {
         if vote_state_update.lockouts.is_empty() {
-            info!("Empty slots {:#?}", vote_state_update);
+            info!("Vote failure: Empty slots {:#?}", vote_state_update);
             return Err(VoteError::EmptySlots);
         }
 
         // If the vote state update is not new enough, return
         if let Some(last_vote_slot) = self.votes.back().map(|lockout| lockout.slot) {
             if vote_state_update.lockouts.back().unwrap().slot <= last_vote_slot {
-            info!("Vote too old {} {:#?}", last_vote_slot, vote_state_update);
+            info!("Vote failure: Vote too old {} {:#?}", last_vote_slot, vote_state_update);
                 return Err(VoteError::VoteTooOld);
             }
         }
@@ -714,7 +714,7 @@ impl VoteState {
             .slot;
 
         if slot_hashes.is_empty() {
-            info!("Slot hashes are empty {:#?}", vote_state_update);
+            info!("Vote failure: Slot hashes are empty {:#?}", vote_state_update);
             return Err(VoteError::SlotsMismatch);
         }
         let earliest_slot_hash_in_history = slot_hashes.last().unwrap().0;
@@ -723,7 +723,7 @@ impl VoteState {
         if last_vote_state_update_slot < earliest_slot_hash_in_history {
             // If this is the last slot in the vote update, it must be in SlotHashes,
             // otherwise we have no way of confirming if the hash matches
-            info!("Vote too old {} {}", last_vote_state_update_slot, earliest_slot_hash_in_history);
+            info!("Vote failure: Vote too old {} {}", last_vote_state_update_slot, earliest_slot_hash_in_history);
             return Err(VoteError::VoteTooOld);
         }
 
@@ -735,7 +735,7 @@ impl VoteState {
             if earliest_slot_hash_in_history > new_proposed_root {
                 vote_state_update.root = self.root_slot;
             }
-            info!("Proposed root is too old {} compared to earliest slot {}", new_proposed_root, earliest_slot_hash_in_history);
+            info!("Vote failure: Proposed root is too old {} compared to earliest slot {}", new_proposed_root, earliest_slot_hash_in_history);
         }
 
         // index into the new proposed vote state's slots, starting with the root if it exists then
@@ -807,10 +807,10 @@ impl VoteState {
                         // but is not part of the slot history, then it must belong to another fork,
                         // which means this vote state update is invalid.
                         if check_root.is_some() {
-                            info!("Root on different fork {}", proposed_vote_slot);
+                            info!("Vote failure: Root on different fork {}", proposed_vote_slot);
                             return Err(VoteError::RootOnDifferentFork);
                         } else {
-                            info!("Slot mismatch {}", proposed_vote_slot);
+                            info!("Vote failure: Slot mismatch {}", proposed_vote_slot);
                             return Err(VoteError::SlotsMismatch);
                         }
                     }
@@ -871,7 +871,7 @@ impl VoteState {
             // doesn't match the expected hash for that slot on this
             // fork
             warn!(
-                "{} dropped vote {:?} failed to match hash {} {}",
+                "Vote failure: {} dropped vote {:?} failed to match hash {} {}",
                 self.node_pubkey,
                 vote_state_update,
                 vote_state_update.hash,
@@ -963,7 +963,7 @@ impl VoteState {
             // This means there existed some slot for which we couldn't find
             // a matching slot hash in step 2)
             info!(
-                "{} dropped vote slots {:?} failed to match slot hashes: {:?}",
+                "Vote failure: {} dropped vote slots {:?} failed to match slot hashes: {:?}",
                 self.node_pubkey, vote_slots, slot_hashes,
             );
             inc_new_counter_info!("dropped-vote-slot", 1);
@@ -974,7 +974,7 @@ impl VoteState {
             // doesn't match the expected hash for that slot on this
             // fork
             warn!(
-                "{} dropped vote slots {:?} failed to match hash {} {}",
+                "Vote failure: {} dropped vote slots {:?} failed to match hash {} {}",
                 self.node_pubkey, vote_slots, vote_hash, slot_hashes[j].1
             );
             inc_new_counter_info!("dropped-vote-hash", 1);
