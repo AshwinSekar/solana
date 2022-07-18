@@ -702,7 +702,10 @@ impl VoteState {
         // If the vote state update is not new enough, return
         if let Some(last_vote_slot) = self.votes.back().map(|lockout| lockout.slot) {
             if vote_state_update.lockouts.back().unwrap().slot <= last_vote_slot {
-            info!("Vote failure: Vote too old {} {:#?}", last_vote_slot, vote_state_update);
+                info!(
+                    "Vote failure: Vote too old {} {:#?}",
+                    last_vote_slot, vote_state_update
+                );
                 return Err(VoteError::VoteTooOld);
             }
         }
@@ -714,7 +717,10 @@ impl VoteState {
             .slot;
 
         if slot_hashes.is_empty() {
-            info!("Vote failure: Slot hashes are empty {:#?}", vote_state_update);
+            info!(
+                "Vote failure: Slot hashes are empty {:#?}",
+                vote_state_update
+            );
             return Err(VoteError::SlotsMismatch);
         }
         let earliest_slot_hash_in_history = slot_hashes.last().unwrap().0;
@@ -723,7 +729,10 @@ impl VoteState {
         if last_vote_state_update_slot < earliest_slot_hash_in_history {
             // If this is the last slot in the vote update, it must be in SlotHashes,
             // otherwise we have no way of confirming if the hash matches
-            info!("Vote failure: Vote too old {} {}", last_vote_state_update_slot, earliest_slot_hash_in_history);
+            info!(
+                "Vote failure: Vote too old {} {}",
+                last_vote_state_update_slot, earliest_slot_hash_in_history
+            );
             return Err(VoteError::VoteTooOld);
         }
 
@@ -733,9 +742,12 @@ impl VoteState {
             // cannot verify whether the slot was actually was on this fork, set the root
             // to the current vote state root for safety.
             if earliest_slot_hash_in_history > new_proposed_root {
+                info!(
+                    "Vote failure: Proposed root is too old {} compared to earliest slot {}",
+                    new_proposed_root, earliest_slot_hash_in_history
+                );
                 vote_state_update.root = self.root_slot;
             }
-            info!("Vote failure: Proposed root is too old {} compared to earliest slot {}", new_proposed_root, earliest_slot_hash_in_history);
         }
 
         // index into the new proposed vote state's slots, starting with the root if it exists then
@@ -807,7 +819,10 @@ impl VoteState {
                         // but is not part of the slot history, then it must belong to another fork,
                         // which means this vote state update is invalid.
                         if check_root.is_some() {
-                            info!("Vote failure: Root on different fork {}", proposed_vote_slot);
+                            info!(
+                                "Vote failure: Root on different fork {}",
+                                proposed_vote_slot
+                            );
                             return Err(VoteError::RootOnDifferentFork);
                         } else {
                             info!("Vote failure: Slot mismatch {}", proposed_vote_slot);
@@ -1123,7 +1138,11 @@ impl VoteState {
             match current_vote.slot.cmp(&new_vote.slot) {
                 Ordering::Less => {
                     if current_vote.last_locked_out_slot() >= new_vote.slot {
-                        info!("Lockout conflict {} {}", current_vote.last_locked_out_slot(), new_vote.slot);
+                        info!(
+                            "Lockout conflict {} {}",
+                            current_vote.last_locked_out_slot(),
+                            new_vote.slot
+                        );
                         return Err(VoteError::LockoutConflict);
                     }
                     current_vote_state_index += 1;
@@ -1132,7 +1151,10 @@ impl VoteState {
                     // The new vote state should never have less lockout than
                     // the previous vote state for the same slot
                     if new_vote.confirmation_count < current_vote.confirmation_count {
-                        info!("Confirmation rollback {} {}", new_vote.confirmation_count, current_vote.confirmation_count);
+                        info!(
+                            "Confirmation rollback {} {}",
+                            new_vote.confirmation_count, current_vote.confirmation_count
+                        );
                         return Err(VoteError::ConfirmationRollBack);
                     }
 
@@ -1681,8 +1703,14 @@ pub fn process_vote_state_update<S: std::hash::BuildHasher>(
     feature_set: &FeatureSet,
 ) -> Result<(), InstructionError> {
     let mut vote_state = verify_and_get_vote_state(vote_account, clock, signers)?;
-    if let Err(e) = vote_state.check_update_vote_state_slots_are_valid(&mut vote_state_update, slot_hashes) {
-        warn!("{} check_update_vote_state_slots_are_valid failed {:#?}", vote_account.get_key(), e);
+    if let Err(e) =
+        vote_state.check_update_vote_state_slots_are_valid(&mut vote_state_update, slot_hashes)
+    {
+        warn!(
+            "{} check_update_vote_state_slots_are_valid failed {:#?}",
+            vote_account.get_key(),
+            e
+        );
         return Err(e.into());
     }
     if let Err(e) = vote_state.process_new_vote_state(
@@ -1692,7 +1720,11 @@ pub fn process_vote_state_update<S: std::hash::BuildHasher>(
         clock.epoch,
         Some(feature_set),
     ) {
-        warn!("{} process_new_vote_state_failed {:#?}", vote_account.get_key(), e);
+        warn!(
+            "{} process_new_vote_state_failed {:#?}",
+            vote_account.get_key(),
+            e
+        );
         return Err(e.into());
     }
     vote_account.set_state(&VoteStateVersions::new_current(vote_state))
