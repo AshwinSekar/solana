@@ -555,10 +555,22 @@ impl Blockstore {
 
         let mut next_slots: VecDeque<_> = match self.meta(starting_slot) {
             Ok(Some(starting_slot_meta)) => starting_slot_meta.next_slots.into(),
-            _ => return false,
+            _ => {
+                eprintln!("slot {} does not exist in blockstore", starting_slot);
+                return false;
+            }
         };
+
+        eprintln!(
+            "children of starting slot: {:?} are: {:?}",
+            starting_slot, next_slots
+        );
         while let Some(slot) = next_slots.pop_front() {
             if let Ok(Some(slot_meta)) = self.meta(slot) {
+                eprintln!(
+                    "children of slot: {:?} are: {:?}",
+                    starting_slot, slot_meta.next_slots
+                );
                 if slot_meta.is_full() {
                     match slot.cmp(&ending_slot) {
                         cmp::Ordering::Less => next_slots.extend(slot_meta.next_slots),

@@ -867,6 +867,10 @@ fn load_bank_forks(
                     full_snapshot_slot,
                 )
                 .unwrap_or_default();
+            eprintln!(
+                "full snapshot slot: {:?}, incremental snapshot slot: {:?}",
+                full_snapshot_slot, incremental_snapshot_slot
+            );
             starting_slot = std::cmp::max(full_snapshot_slot, incremental_snapshot_slot);
         }
 
@@ -881,12 +885,19 @@ fn load_bank_forks(
     };
 
     if let Some(halt_slot) = process_options.halt_at_slot {
+        let all_slots: Vec<Slot> = blockstore
+            .slot_meta_iterator(0)
+            .unwrap()
+            .map(|x| x.0)
+            .collect();
+        println!("all_slots: {:?}", all_slots);
         // Check if we have the slot data necessary to replay from starting_slot to halt_slot.
         //  - This will not catch the case when loading from genesis without a full slot 0.
         if !blockstore.slots_connected(starting_slot, halt_slot) {
             eprintln!(
-                "Unable to load bank forks at slot {} due to disconnected blocks.",
+                "Unable to load bank forks at slot {}, starting_slot: {} due to disconnected blocks.",
                 halt_slot,
+                starting_slot,
             );
             exit(1);
         }
