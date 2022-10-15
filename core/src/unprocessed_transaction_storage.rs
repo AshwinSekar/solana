@@ -277,6 +277,7 @@ impl VoteStorage {
         if matches!(self.vote_source, VoteSource::Gossip) {
             panic!("Gossip vote thread should not be processing transactions");
         }
+        info!("processing packets");
 
         // Insert the retryable votes back in
         self.latest_unprocessed_votes.insert_batch(

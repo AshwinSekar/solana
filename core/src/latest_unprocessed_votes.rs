@@ -199,6 +199,10 @@ impl LatestUnprocessedVotes {
                 let mut latest_vote = latest_vote.write().unwrap();
                 let latest_slot = latest_vote.slot();
                 if slot > latest_slot {
+                    info!(
+                        "Replacing vote for slot {} with {} for {}",
+                        slot, latest_slot, pubkey
+                    );
                     let old_vote = std::mem::replace(latest_vote.deref_mut(), vote);
                     if old_vote.is_vote_taken() {
                         return None;
@@ -284,6 +288,7 @@ impl LatestUnprocessedVotes {
             self.latest_votes_per_pubkey.read().unwrap().keys(),
         )
         .collect_vec();
+        info!("the staked nodes are {:#?}", pubkeys_by_stake);
         pubkeys_by_stake
             .into_iter()
             .filter_map(|pubkey| {
