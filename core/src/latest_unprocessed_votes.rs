@@ -283,11 +283,17 @@ impl LatestUnprocessedVotes {
 
     /// Drains all votes yet to be processed sorted by a weighted random ordering by stake
     pub fn drain_unprocessed(&self, bank: Arc<Bank>) -> Vec<Arc<ImmutableDeserializedPacket>> {
-        let pubkeys_by_stake = weighted_random_order_by_stake(
+        let mut pubkeys_by_stake = weighted_random_order_by_stake(
             &bank,
             self.latest_votes_per_pubkey.read().unwrap().keys(),
         )
         .collect_vec();
+        if pubkeys_by_stake.is_empty() {
+            // This happens when starting a cluster from bootstrap
+            info!("no staked nodes processing all seen votes");
+            let latest_votes_per_pubkey = self.latest_votes_per_pubkey.read().unwrap();
+            pubkeys_by_stake = latest_votes_per_pubkey.keys().copied().collect_vec();
+        }
         info!("the staked nodes are {:#?}", pubkeys_by_stake);
         pubkeys_by_stake
             .into_iter()
