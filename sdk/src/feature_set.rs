@@ -644,6 +644,9 @@ pub mod native_programs_consume_cu {
 pub mod simplify_writable_program_account_check {
     solana_sdk::declare_id!("5ZCcFAzJ1zsFKe1KSZa9K92jhx7gkcKj97ci2DBo1vwj");
 }
+pub mod vote_state_add_vote_latency {
+    solana_sdk::declare_id!("AWDJhNJaDy5AqHzGyuR7xfXjRoYZXbfqe3QStyJFEcgP");
+}
 
 lazy_static! {
     /// Map of feature identifiers to user-visible description
@@ -801,6 +804,7 @@ lazy_static! {
         (include_loaded_accounts_data_size_in_fee_calculation::id(), "include transaction loaded accounts data size in base fee calculation #30657"),
         (native_programs_consume_cu::id(), "Native program should consume compute units #30620"),
         (simplify_writable_program_account_check::id(), "Simplify checks performed for writable upgradeable program accounts #30559"),
+        (vote_state_add_vote_latency::id(), "replace Lockout with LandedVote (including vote latency) in vote state"),
         /*************** ADD NEW FEATURES HERE ***************/
     ]
     .iter()
