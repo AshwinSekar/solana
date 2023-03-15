@@ -645,7 +645,7 @@ pub mod simplify_writable_program_account_check {
     solana_sdk::declare_id!("5ZCcFAzJ1zsFKe1KSZa9K92jhx7gkcKj97ci2DBo1vwj");
 }
 pub mod vote_state_add_vote_latency {
-    solana_sdk::declare_id!("AWDJhNJaDy5AqHzGyuR7xfXjRoYZXbfqe3QStyJFEcgP");
+    solana_sdk::declare_id!("7axKe5BTYBDD87ftzWbk5DfzWMGyRvqmWTduuo22Yaqy");
 }
 
 lazy_static! {
