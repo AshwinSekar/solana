@@ -152,9 +152,12 @@ fn set_vote_account_state(
     if feature_set.is_active(&feature_set::vote_state_add_vote_latency::id()) {
         // If the account is not large enough to store the vote state, then attempt a realloc to make it large enough.
         // The realloc can only proceed if the vote account has balance sufficient for rent exemption at the new size.
-        if (vote_account.get_data().len() < VoteState::size_of())
-            && (!vote_account.is_rent_exempt_at_data_length(VoteState::size_of())
-                || vote_account.set_data_length(VoteState::size_of()).is_err())
+        if (vote_account.get_data().len() < VoteStateVersions::vote_state_size_of(true))
+            && (!vote_account
+                .is_rent_exempt_at_data_length(VoteStateVersions::vote_state_size_of(true))
+                || vote_account
+                    .set_data_length(VoteStateVersions::vote_state_size_of(true))
+                    .is_err())
         {
             // Account cannot be resized to the size of a vote state as it will not be rent exempt, or failed to be
             // resized for other reasons.  So store the V1_14_11 version.
@@ -166,8 +169,10 @@ fn set_vote_account_state(
         vote_account.set_state(&VoteStateVersions::new_current(vote_state))
     // Else when the vote_state_add_vote_latency feature is not enabled, then the V1_14_11 version is stored
     } else {
+        let vote_state_1_14_11 = VoteState1_14_11::from(vote_state);
+        println!("Setting vote_state: {:#?}", vote_state_1_14_11);
         vote_account.set_state(&VoteStateVersions::V1_14_11(Box::new(
-            VoteState1_14_11::from(vote_state),
+            vote_state_1_14_11,
         )))
     }
 }
@@ -971,7 +976,11 @@ pub fn initialize_account<S: std::hash::BuildHasher>(
     clock: &Clock,
     feature_set: &FeatureSet,
 ) -> Result<(), InstructionError> {
-    if vote_account.get_data().len() != VoteState::size_of() {
+    if vote_account.get_data().len()
+        != VoteStateVersions::vote_state_size_of(
+            feature_set.is_active(&feature_set::vote_state_add_vote_latency::id()),
+        )
+    {
         return Err(InstructionError::InvalidAccountData);
     }
     let versioned = vote_account.get_state::<VoteStateVersions>()?;
@@ -1086,7 +1095,7 @@ pub fn create_account_with_authorized(
     commission: u8,
     lamports: u64,
 ) -> AccountSharedData {
-    let mut vote_account = AccountSharedData::new(lamports, VoteState::size_of(), &id());
+    let mut vote_account = AccountSharedData::new(lamports, VoteState1_14_11::size_of(), &id());
 
     let vote_state = VoteState::new(
         &VoteInit {

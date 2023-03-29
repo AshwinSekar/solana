@@ -1,5 +1,7 @@
 use super::*;
 
+const DEFAULT_PRIOR_VOTERS_OFFSET: usize = 82;
+
 #[frozen_abi(digest = "CZTgLymuevXjAx6tM8X8T5J3MCx9AkEsFSmu4FJrEpkG")]
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq, Clone, AbiExample)]
 pub struct VoteState1_14_11 {
@@ -32,6 +34,25 @@ pub struct VoteState1_14_11 {
 
     /// most recent timestamp submitted with a vote
     pub last_timestamp: BlockTimestamp,
+}
+
+impl VoteState1_14_11 {
+    pub fn get_rent_exempt_reserve(rent: &Rent) -> u64 {
+        rent.minimum_balance(VoteState1_14_11::size_of())
+    }
+
+    /// Upper limit on the size of the Vote State
+    /// when votes.len() is MAX_LOCKOUT_HISTORY.
+    pub const fn size_of() -> usize {
+        3731 // see test_vote_state_size_of.
+    }
+
+    pub fn is_correct_size_and_initialized(data: &[u8]) -> bool {
+        const VERSION_OFFSET: usize = 4;
+        const DEFAULT_PRIOR_VOTERS_END: usize = VERSION_OFFSET + DEFAULT_PRIOR_VOTERS_OFFSET;
+        data.len() == VoteState1_14_11::size_of()
+            && data[VERSION_OFFSET..DEFAULT_PRIOR_VOTERS_END] != [0; DEFAULT_PRIOR_VOTERS_OFFSET]
+    }
 }
 
 impl From<VoteState> for VoteState1_14_11 {

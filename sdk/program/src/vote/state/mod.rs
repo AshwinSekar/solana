@@ -33,7 +33,7 @@ pub const INITIAL_LOCKOUT: usize = 2;
 pub const MAX_EPOCH_CREDITS_HISTORY: usize = 64;
 
 // Offset of VoteState::prior_voters, for determining initialization status without deserialization
-const DEFAULT_PRIOR_VOTERS_OFFSET: usize = 82;
+const DEFAULT_PRIOR_VOTERS_OFFSET: usize = 114;
 
 #[frozen_abi(digest = "Ch2vVEwos2EjAVqSHCyJjnN2MNX1yrpapZTGhMSCjWUH")]
 #[derive(Serialize, Default, Deserialize, Debug, PartialEq, Eq, Clone, AbiExample)]
