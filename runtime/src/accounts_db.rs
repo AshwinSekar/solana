@@ -6119,6 +6119,8 @@ impl AccountsDb {
 
         hasher.update(&rent_epoch.to_le_bytes());
 
+        let pre_data_hash = Hash::new_from_array(hasher.clone().finalize().into());
+
         hasher.update(data);
 
         if executable {
@@ -6130,7 +6132,11 @@ impl AccountsDb {
         hasher.update(owner.as_ref());
         hasher.update(pubkey.as_ref());
 
-        Hash::new_from_array(hasher.finalize().into())
+        let hash = Hash::new_from_array(hasher.finalize().into());
+        if *pubkey == Pubkey::from_str("13HNYUVBVHgJSfNKvgXgKia3bywzXabGzQjFyMQxLMjS").unwrap() {
+            println!("For {slot}, and pubkey 13HNYUVBVHgJSfNKvgXgKia3bywzXabGzQjFyMQxLMjS, we have lamports {lamports} owner {owner} executable {executable} rent_epoch {rent_epoch} data {:?} pubkey {pubkey} include_slot {:?} and a pre data hash {pre_data_hash} and final hash {hash}", data, include_slot);
+        }
+        hash
     }
 
     fn bulk_assign_write_version(&self, count: usize) -> StoredMetaWriteVersion {
@@ -7820,6 +7826,9 @@ impl AccountsDb {
             .scan_account_storage(
                 slot,
                 |loaded_account: LoadedAccount| {
+                    if *loaded_account.pubkey() == Pubkey::from_str("13HNYUVBVHgJSfNKvgXgKia3bywzXabGzQjFyMQxLMjS").unwrap() {
+                        println!("For {slot}, and pubkey 13HNYUVBVHgJSfNKvgXgKia3bywzXabGzQjFyMQxLMjS, we have the loaded hash {}", loaded_account.loaded_hash());
+                    }
                     // Cache only has one version per key, don't need to worry about versioning
                     Some((*loaded_account.pubkey(), loaded_account.loaded_hash()))
                 },
@@ -7852,7 +7861,7 @@ impl AccountsDb {
         }
 
         let accounts_delta_hash =
-            AccountsDeltaHash(AccountsHasher::accumulate_account_hashes(hashes));
+            AccountsDeltaHash(AccountsHasher::accumulate_account_hashes(slot, hashes));
         accumulate.stop();
         let mut uncleaned_time = Measure::start("uncleaned_index");
         self.uncleaned_pubkeys.insert(slot, dirty_keys);

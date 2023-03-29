@@ -171,9 +171,7 @@ fn set_vote_account_state(
     } else {
         let vote_state_1_14_11 = VoteState1_14_11::from(vote_state);
         println!("Setting vote_state: {:#?}", vote_state_1_14_11);
-        vote_account.set_state(&VoteStateVersions::V1_14_11(Box::new(
-            vote_state_1_14_11,
-        )))
+        vote_account.set_state(&VoteStateVersions::V1_14_11(Box::new(vote_state_1_14_11)))
     }
 }
 

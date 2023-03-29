@@ -131,7 +131,7 @@ use {
         fee_calculator::{FeeCalculator, FeeRateGovernor},
         genesis_config::{ClusterType, GenesisConfig},
         hard_forks::HardForks,
-        hash::{extend_and_hash, hashv, Hash},
+        hash::{extend_and_hash, hash, hashv, Hash},
         incinerator,
         inflation::Inflation,
         instruction::{CompiledInstruction, TRANSACTION_LEVEL_STACK_HEIGHT},
@@ -173,6 +173,7 @@ use {
         ops::{Deref, RangeInclusive},
         path::PathBuf,
         rc::Rc,
+        str::FromStr,
         sync::{
             atomic::{
                 AtomicBool, AtomicI64, AtomicU64, AtomicUsize,
@@ -4236,7 +4237,7 @@ impl Bank {
         let pre_account_state_info =
             self.get_transaction_account_state_info(&transaction_context, tx.message());
 
-        let log_collector = if enable_log_recording {
+        let log_collector = if true {
             match log_messages_bytes_limit {
                 None => Some(LogCollector::new_ref()),
                 Some(log_messages_bytes_limit) => Some(LogCollector::new_ref_with_limit(Some(
@@ -4322,6 +4323,10 @@ impl Bank {
                     .map(|log_collector| log_collector.into_inner().into())
                     .ok()
             });
+        if format!("{:?}", tx.signature()).contains("23CQ17hKX9Mnij5cf1MYR8qsgiQa2P6n6zgLnYjUttZ77HfHUcYqemfNaWXBMR6GWv5uGsnNfdxdfzKw94jqXcBZ") {
+            println!("Found it");
+            println!("{}", log_messages.as_ref().unwrap().join("\n"));
+        }
 
         let inner_instructions = if enable_cpi_recording {
             Some(inner_instructions_list_from_instruction_trace(
@@ -6917,6 +6922,14 @@ impl Bank {
     ///  of the delta of the ledger since the last vote and up to now
     fn hash_internal_state(&self) -> Hash {
         let slot = self.slot();
+        if slot == 183801345 {
+            println!(
+                "Account details: {:?}",
+                self.get_account_with_fixed_root(
+                    &Pubkey::from_str("13HNYUVBVHgJSfNKvgXgKia3bywzXabGzQjFyMQxLMjS").unwrap()
+                )
+            );
+        }
         let accounts_delta_hash = self
             .rc
             .accounts
@@ -6925,6 +6938,16 @@ impl Bank {
 
         let mut signature_count_buf = [0u8; 8];
         LittleEndian::write_u64(&mut signature_count_buf[..], self.signature_count());
+
+        if slot == 183801345 {
+            println!(
+                "Hash components {} {} {} {}",
+                hash(self.parent_hash.as_ref()),
+                hash(accounts_delta_hash.0.as_ref()),
+                hash(&signature_count_buf),
+                hash(self.last_blockhash().as_ref()),
+            );
+        }
 
         let mut hash = hashv(&[
             self.parent_hash.as_ref(),

@@ -789,9 +789,14 @@ impl AccountsHasher {
         )
     }
 
-    pub fn accumulate_account_hashes(mut hashes: Vec<(Pubkey, Hash)>) -> Hash {
+    pub fn accumulate_account_hashes(slot: Slot, mut hashes: Vec<(Pubkey, Hash)>) -> Hash {
         Self::sort_hashes_by_pubkey(&mut hashes);
 
+        if slot == 183801345 {
+            for hash in hashes.iter() {
+                warn!("Updated Account: {:?}", hash);
+            }
+        }
         Self::compute_merkle_root_loop(hashes, MERKLE_FANOUT, |i| &i.1)
     }
 
