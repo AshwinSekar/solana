@@ -5011,3 +5011,154 @@ fn test_boot_from_local_state() {
         info!("Checking if validator{i} has the same snapshots as validator3... DONE");
     }
 }
+
+/// Test rotating the validator set on epoch boundary
+#[test]
+#[serial]
+fn test_rotating_validator_set_epoch_boundary() {
+    solana_logger::setup_with("info,solana_metrics=off");
+    solana_core::repair::duplicate_repair_status::set_ancestor_hash_repair_sample_size_for_tests_only(3);
+
+    let majority_stake = 33_000 * DEFAULT_NODE_STAKE;
+    let minority_stake = 33_000 * DEFAULT_NODE_STAKE;
+    let new_stake = 34_000 * DEFAULT_NODE_STAKE;
+
+    let slots_per_epoch = 200;
+
+    let node_stakes = vec![majority_stake, minority_stake];
+    let num_nodes = node_stakes.len();
+
+    let validator_keys = vec![
+        "28bN3xyvrP4E8LwEgtLjhnkb7cY4amQb6DrYAbAYjgRV4GAGgkVM2K7wnxnAS7WDneuavza7x21MiafLu1HkwQt4",
+        "2saHBBoTkLMmttmPQP8KfBkcCw45S5cwtV3wTdGCscRC8uxdgvHxpHiWXKx4LvJjNJtnNcbSv5NdheokFFqnNDt8",
+    ]
+    .iter()
+    .map(|s| (Arc::new(Keypair::from_base58_string(s)), true))
+    .chain(std::iter::repeat_with(|| (Arc::new(Keypair::new()), true)))
+    .take(node_stakes.len())
+    .collect::<Vec<_>>();
+    let validators = validator_keys
+        .iter()
+        .map(|(kp, _)| kp.pubkey())
+        .collect::<Vec<_>>();
+    let (majority_pubkey, minority_pubkey) = (validators[0], validators[1]);
+
+    let default_config = ValidatorConfig::default_for_test();
+    let validator_configs = make_identical_validator_configs(&default_config, num_nodes);
+    let mut config = ClusterConfig {
+        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS + node_stakes.iter().sum::<u64>(),
+        node_stakes,
+        validator_configs,
+        validator_keys: Some(validator_keys),
+        slots_per_epoch,
+        stakers_slot_offset: slots_per_epoch,
+        skip_warmup_slots: true,
+        ..ClusterConfig::default()
+    };
+    let cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+
+    let majority_vote_pubkey = &cluster
+        .validators
+        .get(&majority_pubkey)
+        .unwrap()
+        .info
+        .voting_keypair
+        .pubkey();
+
+    let minority_vote_pubkey = &cluster
+        .validators
+        .get(&minority_pubkey)
+        .unwrap()
+        .info
+        .voting_keypair
+        .pubkey();
+
+    let client = cluster
+        .get_validator_client(cluster.entry_point_info.pubkey())
+        .unwrap();
+
+    let log_stake = || {
+        let rpc_client = client.rpc_client();
+        let vote_accounts = rpc_client
+            .get_vote_accounts_with_commitment(CommitmentConfig::processed())
+            .unwrap();
+        let epoch = client.get_epoch_info().unwrap().epoch;
+        info!("Epoch {}", epoch);
+        for account in vote_accounts.current {
+            info!("{}: {}", account.node_pubkey, account.activated_stake);
+        }
+        epoch
+    };
+
+    let get_epoch = || client.get_epoch_info().unwrap().epoch;
+
+    // Wait until at least one epoch has passed
+    while get_epoch() < 1 {
+        sleep(Duration::from_millis(100));
+    }
+
+    let majority_stake_account_keypair = Keypair::new();
+    LocalCluster::create_account_and_delegate_stake_with_client(
+        &client,
+        &cluster.funding_keypair,
+        &majority_vote_pubkey,
+        &majority_stake_account_keypair,
+        new_stake,
+    );
+    client
+        .wait_for_balance_with_commitment(
+            &majority_stake_account_keypair.pubkey(),
+            Some(new_stake),
+            CommitmentConfig::processed(),
+        )
+        .expect("get balance");
+    let epoch = log_stake();
+
+    // Next epoch, partial activation up to 25% limit
+    while get_epoch() < epoch + 1 {
+        sleep(Duration::from_millis(100));
+    }
+    let epoch = log_stake();
+
+    // Epoch 3, majority fork is active, should now be 67 - 33
+    // Deactivate 34 from majority, and activate 34 from minority
+    while get_epoch() < epoch + 1 {
+        sleep(Duration::from_millis(100));
+    }
+
+    let minority_stake_account_keypair = Keypair::new();
+    LocalCluster::create_account_and_delegate_stake_with_client(
+        &client,
+        &cluster.funding_keypair,
+        &minority_vote_pubkey,
+        &minority_stake_account_keypair,
+        new_stake,
+    );
+    client
+        .wait_for_balance_with_commitment(
+            &minority_stake_account_keypair.pubkey(),
+            Some(new_stake),
+            CommitmentConfig::processed(),
+        )
+        .expect("get balance");
+
+    LocalCluster::deactivate_stake_with_client(
+        &client,
+        &cluster.funding_keypair,
+        &majority_stake_account_keypair,
+    );
+    let epoch = log_stake();
+
+    // Epoch 4, forks should now be flipped, with partial activation/deactivation leading to
+    // 42 - 58
+    while get_epoch() < epoch + 1 {
+        sleep(Duration::from_millis(100));
+    }
+    let epoch = log_stake();
+
+    // Epoch 5, forks should be fully flipped, 33 - 67
+    while get_epoch() < epoch + 1 {
+        sleep(Duration::from_millis(100));
+    }
+    log_stake();
+}

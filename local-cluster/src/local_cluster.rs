@@ -268,16 +268,16 @@ impl LocalCluster {
             .extend_from_slice(&config.native_instruction_processors);
 
         // Replace staking config
-        genesis_config.add_account(
-            stake_config::id(),
-            create_stake_config_account(
-                1,
-                &stake_config::Config {
-                    warmup_cooldown_rate: std::f64::MAX,
-                    slash_penalty: std::u8::MAX,
-                },
-            ),
-        );
+        // genesis_config.add_account(
+        //     stake_config::id(),
+        //     create_stake_config_account(
+        //         1,
+        //         &stake_config::Config {
+        //             warmup_cooldown_rate: stake_config::DEFAULT_WARMUP_COOLDOWN_RATE,
+        //             slash_penalty: std::u8::MAX,
+        //         },
+        //     ),
+        // );
 
         let (leader_ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
         let leader_contact_info = leader_node.info.clone();
@@ -563,6 +563,69 @@ impl LocalCluster {
         Self::transfer_with_client(&client, source_keypair, dest_pubkey, lamports)
     }
 
+    pub fn deactivate_stake_with_client(
+        client: &ThinClient,
+        from_account: &Keypair,
+        stake_account_keypair: &Keypair,
+    ) {
+        let stake_account_pubkey = stake_account_keypair.pubkey();
+        let instruction =
+            stake_instruction::deactivate_stake(&stake_account_pubkey, &stake_account_pubkey);
+        let mut transaction = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&from_account.pubkey()),
+            &[from_account, stake_account_keypair],
+            client
+                .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
+                .unwrap()
+                .0,
+        );
+
+        client
+            .send_and_confirm_transaction(
+                &[from_account, &stake_account_keypair],
+                &mut transaction,
+                5,
+                0,
+            )
+            .expect("deactivate stake");
+    }
+
+    pub fn create_account_and_delegate_stake_with_client(
+        client: &ThinClient,
+        from_account: &Keypair,
+        vote_account_pubkey: &Pubkey,
+        stake_account_keypair: &Keypair,
+        amount: u64,
+    ) {
+        let instructions = stake_instruction::create_account_and_delegate_stake(
+            &from_account.pubkey(),
+            &stake_account_keypair.pubkey(),
+            &vote_account_pubkey,
+            &Authorized::auto(&stake_account_keypair.pubkey()),
+            &Lockup::default(),
+            amount,
+        );
+        let message = Message::new(&instructions, Some(&from_account.pubkey()));
+        let mut transaction = Transaction::new(
+            &[from_account, &stake_account_keypair],
+            message,
+            client
+                .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
+                .unwrap()
+                .0,
+        );
+
+        client
+            .send_and_confirm_transaction(
+                &[from_account, &stake_account_keypair],
+                &mut transaction,
+                5,
+                0,
+            )
+            .expect("delegate stake");
+    }
+
     pub fn check_for_new_roots(
         &self,
         num_new_roots: usize,
@@ -725,32 +788,13 @@ impl LocalCluster {
                 )
                 .expect("get balance");
 
-            let instructions = stake_instruction::create_account_and_delegate_stake(
-                &from_account.pubkey(),
-                &stake_account_pubkey,
+            Self::create_account_and_delegate_stake_with_client(
+                client,
+                from_account,
                 &vote_account_pubkey,
-                &Authorized::auto(&stake_account_pubkey),
-                &Lockup::default(),
+                &stake_account_keypair,
                 amount,
             );
-            let message = Message::new(&instructions, Some(&from_account.pubkey()));
-            let mut transaction = Transaction::new(
-                &[from_account.as_ref(), &stake_account_keypair],
-                message,
-                client
-                    .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
-                    .unwrap()
-                    .0,
-            );
-
-            client
-                .send_and_confirm_transaction(
-                    &[from_account.as_ref(), &stake_account_keypair],
-                    &mut transaction,
-                    5,
-                    0,
-                )
-                .expect("delegate stake");
             client
                 .wait_for_balance_with_commitment(
                     &stake_account_pubkey,
