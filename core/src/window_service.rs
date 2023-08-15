@@ -141,10 +141,24 @@ fn run_check_duplicate(
 ) -> Result<()> {
     let check_duplicate = |shred: Shred| -> Result<()> {
         let shred_slot = shred.slot();
+        info!(
+            "{} Checking potential duplicate shred: slot {} shred type {:?} index {} fec index {}",
+            cluster_info.id(),
+            shred.slot(),
+            shred.shred_type(),
+            shred.index(),
+            shred.fec_set_index()
+        );
         if !blockstore.has_duplicate_shreds_in_slot(shred_slot) {
             if let Some(existing_shred_payload) =
                 blockstore.is_shred_duplicate(shred.id(), shred.payload().clone())
             {
+                info!(
+                    "{} shred {} {} is duplicate, creating duplicate proof",
+                    cluster_info.id(),
+                    shred.slot(),
+                    shred.index()
+                );
                 cluster_info.push_duplicate_shred(&shred, &existing_shred_payload)?;
                 blockstore.store_duplicate_slot(
                     shred_slot,

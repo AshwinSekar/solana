@@ -1188,7 +1188,12 @@ impl Blockstore {
 
         // This gives the index of first coding shred in this FEC block
         // So, all coding shreds in a given FEC block will have the same set index
-
+        info!(
+            "Received coding shred slot {} index {} trusted {}",
+            shred.slot(),
+            shred.index(),
+            is_trusted
+        );
         if !is_trusted {
             if index_meta.coding().contains(shred_index) {
                 metrics.num_coding_shreds_exists += 1;
@@ -1367,7 +1372,12 @@ impl Blockstore {
         );
 
         let slot_meta = &mut slot_meta_entry.new_slot_meta.borrow_mut();
-
+        info!(
+            "Received data shred slot {} index {}, trusted {}",
+            shred.slot(),
+            shred.index(),
+            is_trusted,
+        );
         if !is_trusted {
             if Self::is_data_shred_present(&shred, slot_meta, index_meta.data()) {
                 duplicate_shreds.push(shred);
