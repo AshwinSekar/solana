@@ -19,7 +19,7 @@ use {
         collections::{HashMap, HashSet, VecDeque},
         iter::{repeat, repeat_with},
         str::FromStr,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -91,19 +91,29 @@ fn sample_dead_nodes<R: Rng>(rng: &mut R, config: &Config, stakes: &[u64]) -> Ha
     let cluster_stake = stakes.iter().sum::<u64>();
     let mut faulty_stake = cluster_stake as f64 * config.node_fault_rate;
     let mut out = HashSet::new();
-    let mut reps = 0;
-    while faulty_stake > 0.0 && reps < 10 {
-        let index = rng.gen_range(0, num_nodes);
-        if index == config.node_index && out.contains(&index) {
-            continue;
-        } else if stakes[index] as f64 <= faulty_stake {
-            out.insert(index);
-            faulty_stake -= stakes[index] as f64;
-        } else {
-            reps += 1;
+    while faulty_stake > 0.0 {
+        let candidates: Vec<_> = stakes
+            .iter()
+            .enumerate()
+            .filter(|(i, stake)| {
+                !out.contains(i) && **stake <= faulty_stake as u64 && *i != config.node_index
+            })
+            .collect();
+        if candidates.len() == 0 {
+            break;
         }
+        let (index, stake) = candidates[rng.gen_range(0usize, candidates.len())];
+        out.insert(index);
+        faulty_stake -= *stake as f64;
     }
-    trace!("number of dead nodes: {}/{}", out.len(), num_nodes);
+    trace!(
+        "number of dead nodes: {}/{} faulty stake {} % vs requested {} %",
+        out.len(),
+        num_nodes,
+        100 as f64 * ((cluster_stake as f64 * config.node_fault_rate - faulty_stake) as f64)
+            / (cluster_stake as f64),
+        100 as f64 * config.node_fault_rate
+    );
     out
 }
 
@@ -122,6 +132,13 @@ fn run_turbine(
     let size = config.batch_size + 1;
     // Number of times our node received k shreds from the batch.
     let counts: Vec<_> = repeat_with(|| AtomicUsize::default()).take(size).collect();
+    // Amount of stake that was able to recover the block
+    let recovered_stake: Vec<_> = repeat_with(|| AtomicU64::default())
+        .take(config.num_reps)
+        .collect();
+    let recovered_count: Vec<_> = repeat_with(|| AtomicUsize::default())
+        .take(config.num_reps)
+        .collect();
     // arr[i][j] number of times config.stake_threshold of the cluster received
     // the at least j shreds from the batch when our node received i shreds
     // from the batch.
@@ -132,11 +149,15 @@ fn run_turbine(
     thread_pool.install(|| {
         (0..config.num_reps)
             .into_par_iter()
-            .for_each_init(rand::thread_rng, |rng, _| {
+            .for_each_init(rand::thread_rng, |rng, trial| {
                 // nodes_stake[k] is the total amount of stake that received at least
                 // k shreds from the batch.
-                let (num_shreds, nodes_stake) = run_batch(rng, config.clone(), stakes.clone());
+                // nodes_count[k] is the # of nodes that received at least k shreds from the batch
+                let (num_shreds, nodes_stake, nodes_count) =
+                    run_batch(rng, config.clone(), stakes.clone());
                 counts[num_shreds].fetch_add(1, Ordering::Relaxed);
+                recovered_stake[trial].fetch_add(nodes_stake[32], Ordering::Relaxed);
+                recovered_count[trial].fetch_add(nodes_count[32], Ordering::Relaxed);
                 for i in 0..size {
                     if nodes_stake[i] as f64 / cluster_stake > config.stake_threshold {
                         arr[num_shreds][i].fetch_add(1, Ordering::Relaxed);
@@ -167,6 +188,21 @@ fn run_turbine(
             }
         }
     }
+    let mut recovered: Vec<_> = recovered_stake
+        .into_iter()
+        .map(AtomicU64::into_inner)
+        .collect();
+    let mut recovered_count: Vec<_> = recovered_count
+        .into_iter()
+        .map(AtomicUsize::into_inner)
+        .collect();
+    recovered.sort();
+    recovered_count.sort();
+    println!(
+        "Median recovery stake % {} node count % {}",
+        100f64 * recovered[config.num_reps / 2] as f64 / cluster_stake,
+        100f64 * recovered_count[config.num_reps / 2] as f64 / stakes.len() as f64
+    );
     (rows, out)
 }
 
@@ -181,6 +217,7 @@ fn run_batch<R: Rng>(
 ) -> (
     usize,               // Number of shreds received at our node.
     Vec</*stake:*/ u64>, // Total stake that received at least k shreds.
+    Vec<usize>,          // Total # of nodes that received at least k shreds.
 ) {
     // Randomly select a node as the leader.
     let leader_node_index = {
@@ -210,13 +247,16 @@ fn run_batch<R: Rng>(
     }
     // TODO should also include leader nodes' stake.
     let mut out = vec![0u64; config.batch_size + 1];
+    let mut count = vec![0usize; config.batch_size + 1];
     for (index, shreds) in shred_count.iter().enumerate() {
         out[*shreds] += stakes[index];
+        count[*shreds] += 1;
     }
     for i in (0..config.batch_size).rev() {
         out[i] += out[i + 1];
+        count[i] += count[i + 1];
     }
-    (shred_count[config.node_index], out)
+    (shred_count[config.node_index], out, count)
 }
 
 // Simulates a single shred broadcast.
