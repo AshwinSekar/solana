@@ -38,6 +38,7 @@ struct Config {
     disable_first_node_link: bool,
     stake_threshold: f64,
     num_threads: usize,
+    malicious_rate: f64,
 }
 
 // Obtains nodes stakes distribution from mainnet cluster.
@@ -52,9 +53,9 @@ fn get_staked_nodes(rpc_client: &RpcClient) -> Vec<(/*node:*/ Pubkey, /*stake:*/
     };
     let current_stake: u64 = sum_activated_stake(&vote_accounts.current);
     let delinquent_stake: u64 = sum_activated_stake(&vote_accounts.delinquent);
-    info!("current    stake: {:19}", current_stake);
-    info!("delinquent stake: {:19}", delinquent_stake);
-    info!(
+    println!("current    stake: {:19}", current_stake);
+    println!("delinquent stake: {:19}", delinquent_stake);
+    println!(
         "delinquent: {:.2}%",
         delinquent_stake as f64 / ((current_stake + delinquent_stake) as f64) * 100.0
     );
@@ -71,7 +72,7 @@ fn get_staked_nodes(rpc_client: &RpcClient) -> Vec<(/*node:*/ Pubkey, /*stake:*/
         .filter(|(_, stake)| *stake != 0)
         .collect();
     stakes.sort_unstable_by_key(|(pubkey, stake)| (Reverse(*stake), *pubkey));
-    info!("number of staked nodes: {}", stakes.len());
+    println!("number of staked nodes: {}", stakes.len());
     {
         let (node, stake) = stakes.first().unwrap();
         trace!("node: {}, stake: {}", node, stake);
@@ -113,6 +114,45 @@ fn sample_dead_nodes<R: Rng>(rng: &mut R, config: &Config, stakes: &[u64]) -> Ha
         100 as f64 * ((cluster_stake as f64 * config.node_fault_rate - faulty_stake) as f64)
             / (cluster_stake as f64),
         100 as f64 * config.node_fault_rate
+    );
+    out
+}
+
+// Returns a sample of nodes which will be marked as malicious and together will
+// have ~malicious_rate of total stake.
+// Excludes node_index and dead nodes from set of malicious nodes.
+fn sample_malicious_nodes<R: Rng>(
+    rng: &mut R,
+    config: &Config,
+    stakes: &[u64],
+    dead_nodes: &HashSet<usize>,
+) -> HashSet<usize> {
+    let num_nodes = stakes.len();
+    let cluster_stake = stakes.iter().sum::<u64>();
+    let mut malicious_stake = cluster_stake as f64 * config.malicious_rate;
+    let mut out = HashSet::new();
+    while malicious_stake > 0.0 {
+        let candidates: Vec<_> = stakes
+            .iter()
+            .enumerate()
+            .filter(|(i, stake)| {
+                !out.contains(i) && !dead_nodes.contains(i) && **stake <= malicious_stake as u64 && *i != config.node_index
+            })
+            .collect();
+        if candidates.len() == 0 {
+            break;
+        }
+        let (index, stake) = candidates[rng.gen_range(0usize, candidates.len())];
+        out.insert(index);
+        malicious_stake -= *stake as f64;
+    }
+    trace!(
+        "number of malicious nodes: {}/{} malicious stake {} % vs requested {} %",
+        out.len(),
+        num_nodes,
+        100 as f64 * ((cluster_stake as f64 * config.malicious_rate - malicious_stake) as f64)
+            / (cluster_stake as f64),
+        100 as f64 * config.malicious_rate
     );
     out
 }
@@ -235,11 +275,20 @@ fn run_batch<R: Rng>(
     // Randomly mark node_fault_rate of stake as dead.
     // Same set of nodes are dead for the entire batch.
     let dead_nodes = sample_dead_nodes(rng, &config, &stakes);
+    // Randomly mark malicious_rate of stake as malicious
+    // Only selected from online nodes
+    let malicious_nodes = sample_malicious_nodes(rng, &config, &stakes, &dead_nodes);
     let weighted_shuffle = WeightedShuffle::new(&stakes).unwrap();
     // Number of shreds reached at each node.
     let mut shred_count = vec![0usize; stakes.len()];
     for _ in 0..config.batch_size {
-        let nodes = run_shred(rng, &config, &dead_nodes, weighted_shuffle.clone());
+        let nodes = run_shred(
+            rng,
+            &config,
+            &dead_nodes,
+            &malicious_nodes,
+            weighted_shuffle.clone(),
+        );
         for node in nodes {
             assert!(!dead_nodes.contains(&node));
             shred_count[node] += 1;
@@ -265,6 +314,7 @@ fn run_shred<R: Rng>(
     rng: &mut R,
     config: &Config,
     dead_nodes: &HashSet<usize>,
+    malicious_nodes: &HashSet<usize>,
     weighted_shuffle: WeightedShuffle<u64>,
 ) -> HashSet<usize> {
     let nodes: Vec<_> = weighted_shuffle.shuffle(rng).collect();
@@ -275,13 +325,15 @@ fn run_shred<R: Rng>(
     // receive the shreds.
     let root = nodes.first().copied().unwrap();
     assert_eq!(index[&root], 0);
-    if dead_nodes.contains(&root) {
-        return HashSet::default();
-    }
     let mut out = HashSet::new();
     let mut queue = VecDeque::<usize>::new();
-    out.insert(root);
-    queue.push_back(root);
+    if !dead_nodes.contains(&root) {
+        out.insert(root);
+        queue.push_back(root);
+    }
+    // Malicious nodes *always* propagate to children
+    out.extend(malicious_nodes.iter());
+    queue.extend(malicious_nodes.iter());
     while !queue.is_empty() {
         let node = queue.pop_front().unwrap();
         let node_index = index[&node];
@@ -376,6 +428,13 @@ fn main() {
                 .help("fraction of stake which is dead."),
         )
         .arg(
+            Arg::with_name("malicious_rate")
+                .long("malicious-rate")
+                .takes_value(true)
+                .default_value("0")
+                .help("fraction of stake which is malicious"),
+        )
+        .arg(
             Arg::with_name("edge_fault_rate")
                 .long("edge-fault-rate")
                 .takes_value(true)
@@ -437,6 +496,7 @@ fn main() {
         disable_first_node_link: matches.is_present("disable_first_node_link"),
         stake_threshold: value_t_or_exit!(matches.value_of("stake_threshold"), f64),
         num_threads: value_t_or_exit!(matches.value_of("num_threads"), usize),
+        malicious_rate: value_t_or_exit!(matches.value_of("malicious_rate"), f64),
     };
     let thread_pool = ThreadPoolBuilder::new()
         .num_threads(config.num_threads)
