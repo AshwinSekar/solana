@@ -3,7 +3,7 @@ use {
     solana_sdk::{
         account::{Account, AccountSharedData},
         feature::{self, Feature},
-        feature_set::FeatureSet,
+        feature_set::{self, FeatureSet},
         fee_calculator::FeeRateGovernor,
         genesis_config::{ClusterType, GenesisConfig},
         native_token::sol_to_lamports,
@@ -199,6 +199,11 @@ pub fn create_genesis_config_with_leader(
 pub fn activate_all_features(genesis_config: &mut GenesisConfig) {
     // Activate all features at genesis in development mode
     for feature_id in FeatureSet::default().inactive {
+        if feature_id == feature_set::vote_state_add_vote_latency::id()
+            || feature_id == feature_set::timely_vote_credits::id()
+        {
+            continue;
+        }
         activate_feature(genesis_config, feature_id);
     }
 }
