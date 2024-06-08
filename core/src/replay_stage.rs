@@ -2683,6 +2683,10 @@ impl ReplayStage {
             });
 
             let tower_slots = tower.tower_slots();
+            if let Some(slot) = tower.last_vote().last_voted_slot() {
+                let hash_string = format!("{}", tower.last_vote().hash());
+                datapoint_info!("vote", ("slot", slot, i64), ("hash", hash_string, String));
+            }
             voting_sender
                 .send(VoteOp::PushVote {
                     tx: vote_tx,
