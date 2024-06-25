@@ -19,6 +19,7 @@ use {
             Tower, TowerError, VotedStakes, SWITCH_FORK_THRESHOLD,
         },
         cost_update_service::CostUpdate,
+        next_leader::next_leader_and_slot,
         repair::{
             ancestor_hashes_service::AncestorHashesReplayUpdateSender,
             cluster_slot_state_verifier::*,
@@ -36,7 +37,7 @@ use {
     rayon::{prelude::*, ThreadPool},
     solana_entry::entry::VerifyRecyclers,
     solana_geyser_plugin_manager::block_metadata_notifier_interface::BlockMetadataNotifierArc,
-    solana_gossip::cluster_info::ClusterInfo,
+    solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_ledger::{
         block_error::BlockError,
         blockstore::Blockstore,
@@ -1003,6 +1004,8 @@ impl ReplayStage {
                         &mut epoch_slots_frozen_slots,
                         &drop_bank_sender,
                         wait_to_vote_slot,
+                        &*cluster_info,
+                        &*poh_recorder,
                     ) {
                         error!("Unable to set root: {e}");
                         return;
@@ -2328,6 +2331,8 @@ impl ReplayStage {
         epoch_slots_frozen_slots: &mut EpochSlotsFrozenSlots,
         drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
         wait_to_vote_slot: Option<Slot>,
+        cluster_info: &ClusterInfo,
+        poh_recorder: &RwLock<PohRecorder>,
     ) -> Result<(), SetRootError> {
         if bank.is_empty() {
             datapoint_info!("replay_stage-voted_empty_bank", ("slot", bank.slot(), i64));
@@ -2427,6 +2432,8 @@ impl ReplayStage {
             replay_timing,
             voting_sender,
             wait_to_vote_slot,
+            cluster_info,
+            poh_recorder,
         );
         Ok(())
     }
@@ -2659,6 +2666,8 @@ impl ReplayStage {
         replay_timing: &mut ReplayLoopTiming,
         voting_sender: &Sender<VoteOp>,
         wait_to_vote_slot: Option<Slot>,
+        cluster_info: &ClusterInfo,
+        poh_recorder: &RwLock<PohRecorder>,
     ) {
         let mut generate_time = Measure::start("generate_vote");
         let vote_tx_result = Self::generate_vote_tx(
@@ -2691,6 +2700,16 @@ impl ReplayStage {
                 })
                 .unwrap_or_else(|err| warn!("Error: {:?}", err));
         } else if vote_tx_result.is_non_voting() {
+            let leader_and_slot =
+                next_leader_and_slot(cluster_info, poh_recorder, ContactInfo::tpu_vote);
+            leader_and_slot.map(|(_pubkey, slot, target_addr)| {
+                info!(
+                    ">>>> Sending vote for {} to leader at slot {}",
+                    bank.slot(),
+                    slot,
+                );
+                target_addr
+            });
             tower.mark_last_vote_tx_blockhash_non_voting();
         }
     }
