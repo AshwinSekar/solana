@@ -1,7 +1,10 @@
 use {
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_poh::poh_recorder::PohRecorder,
-    solana_sdk::{clock::FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET, pubkey::Pubkey},
+    solana_sdk::{
+        clock::{Slot, FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET},
+        pubkey::Pubkey,
+    },
     std::{net::SocketAddr, sync::RwLock},
 };
 
@@ -27,5 +30,23 @@ where
     cluster_info
         .lookup_contact_info(&leader_pubkey, port_selector)?
         .map(|addr| (leader_pubkey, addr))
+        .ok()
+}
+
+pub(crate) fn next_leader_and_slot<F, E>(
+    cluster_info: &ClusterInfo,
+    poh_recorder: &RwLock<PohRecorder>,
+    port_selector: F,
+) -> Option<(Pubkey, Slot, SocketAddr)>
+where
+    F: FnOnce(&ContactInfo) -> Result<SocketAddr, E>,
+{
+    let (leader_pubkey, slot) = poh_recorder
+        .read()
+        .unwrap()
+        .leader_and_slot_after_n_slots(FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET)?;
+    cluster_info
+        .lookup_contact_info(&leader_pubkey, port_selector)?
+        .map(|addr| (leader_pubkey, slot, addr))
         .ok()
 }

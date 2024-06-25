@@ -1,10 +1,10 @@
 use {
     crate::{
         consensus::tower_storage::{SavedTowerVersions, TowerStorage},
-        next_leader::next_leader_tpu_vote,
+        next_leader::next_leader_and_slot,
     },
     crossbeam_channel::Receiver,
-    solana_gossip::cluster_info::ClusterInfo,
+    solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_measure::measure::Measure,
     solana_poh::poh_recorder::PohRecorder,
     solana_sdk::{clock::Slot, transaction::Transaction},
@@ -31,6 +31,15 @@ impl VoteOp {
         match self {
             VoteOp::PushVote { tx, .. } => tx,
             VoteOp::RefreshVote { tx, .. } => tx,
+        }
+    }
+
+    fn last_voted_slot(&self) -> Option<Slot> {
+        match self {
+            VoteOp::PushVote { tower_slots, .. } => tower_slots.last().copied(),
+            VoteOp::RefreshVote {
+                last_voted_slot, ..
+            } => Some(*last_voted_slot),
         }
     }
 }
@@ -78,11 +87,29 @@ impl VotingService {
             inc_new_counter_info!("tower_save-ms", measure.as_ms() as usize);
         }
 
-        let _ = cluster_info.send_transaction(
+        let leader_and_slot =
+            next_leader_and_slot(cluster_info, poh_recorder, ContactInfo::tpu_vote);
+        if let Err(e) = cluster_info.send_transaction(
             vote_op.tx(),
-            next_leader_tpu_vote(cluster_info, poh_recorder)
-                .map(|(_pubkey, target_addr)| target_addr),
-        );
+            leader_and_slot.map(|(_pubkey, slot, target_addr)| {
+                info!(
+                    ">>>> Sending vote for {} to leader at slot {}",
+                    vote_op.last_voted_slot().unwrap(),
+                    slot,
+                );
+                target_addr
+            }),
+        ) {
+            warn!(
+                "Failed to send vote tx for {:?}: {}",
+                vote_op.last_voted_slot(),
+                e
+            );
+            datapoint_warn!(
+                "voting-service-send-failure",
+                ("vote_slot", vote_op.last_voted_slot(), Option<i64>),
+            );
+        }
 
         match vote_op {
             VoteOp::PushVote {
