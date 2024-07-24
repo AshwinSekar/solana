@@ -631,8 +631,6 @@ impl ReplayStage {
             let mut skipped_slots_info = SkippedSlotsInfo::default();
             let mut replay_timing = ReplayLoopTiming::default();
             let mut duplicate_slots_tracker = DuplicateSlotsTracker::default();
-            let mut duplicate_confirmed_slots: DuplicateConfirmedSlots =
-                DuplicateConfirmedSlots::default();
             let mut epoch_slots_frozen_slots: EpochSlotsFrozenSlots =
                 EpochSlotsFrozenSlots::default();
             let mut duplicate_slots_to_repair = DuplicateSlotsToRepair::default();
@@ -722,7 +720,6 @@ impl ReplayStage {
                     &rewards_recorder_sender,
                     &rpc_subscriptions,
                     &mut duplicate_slots_tracker,
-                    &duplicate_confirmed_slots,
                     &mut epoch_slots_frozen_slots,
                     &mut unfrozen_gossip_verified_vote_hashes,
                     &mut latest_validator_votes_for_frozen_banks,
@@ -752,7 +749,6 @@ impl ReplayStage {
                     &blockstore,
                     &ancestor_duplicate_slots_receiver,
                     &mut duplicate_slots_tracker,
-                    &duplicate_confirmed_slots,
                     &mut epoch_slots_frozen_slots,
                     &progress,
                     &mut heaviest_subtree_fork_choice,
@@ -772,10 +768,9 @@ impl ReplayStage {
                     &duplicate_confirmed_slots_receiver,
                     &blockstore,
                     &mut duplicate_slots_tracker,
-                    &mut duplicate_confirmed_slots,
                     &mut epoch_slots_frozen_slots,
                     &bank_forks,
-                    &progress,
+                    &mut progress,
                     &mut heaviest_subtree_fork_choice,
                     &mut duplicate_slots_to_repair,
                     &ancestor_hashes_replay_update_sender,
@@ -823,7 +818,6 @@ impl ReplayStage {
                         &blockstore,
                         &duplicate_slots_receiver,
                         &mut duplicate_slots_tracker,
-                        &duplicate_confirmed_slots,
                         &mut epoch_slots_frozen_slots,
                         &bank_forks,
                         &progress,
@@ -883,7 +877,6 @@ impl ReplayStage {
                         &mut duplicate_slots_to_repair,
                         &ancestor_hashes_replay_update_sender,
                         &mut purge_repair_slot_counter,
-                        &mut duplicate_confirmed_slots,
                     );
                 }
                 compute_slot_stats_time.stop();
@@ -994,7 +987,6 @@ impl ReplayStage {
                         &mut heaviest_subtree_fork_choice,
                         &bank_notification_sender,
                         &mut duplicate_slots_tracker,
-                        &mut duplicate_confirmed_slots,
                         &mut unfrozen_gossip_verified_vote_hashes,
                         &mut voted_signatures,
                         &mut has_new_vote_been_rooted,
@@ -1596,7 +1588,6 @@ impl ReplayStage {
         blockstore: &Blockstore,
         ancestor_duplicate_slots_receiver: &AncestorDuplicateSlotsReceiver,
         duplicate_slots_tracker: &mut DuplicateSlotsTracker,
-        duplicate_confirmed_slots: &DuplicateConfirmedSlots,
         epoch_slots_frozen_slots: &mut EpochSlotsFrozenSlots,
         progress: &ProgressMap,
         fork_choice: &mut HeaviestSubtreeForkChoice,
@@ -1618,7 +1609,7 @@ impl ReplayStage {
             let epoch_slots_frozen_state = EpochSlotsFrozenState::new_from_state(
                 epoch_slots_frozen_slot,
                 epoch_slots_frozen_hash,
-                duplicate_confirmed_slots,
+                progress,
                 fork_choice,
                 || progress.is_dead(epoch_slots_frozen_slot).unwrap_or(false),
                 || {
@@ -1835,10 +1826,9 @@ impl ReplayStage {
         duplicate_confirmed_slots_receiver: &DuplicateConfirmedSlotsReceiver,
         blockstore: &Blockstore,
         duplicate_slots_tracker: &mut DuplicateSlotsTracker,
-        duplicate_confirmed_slots: &mut DuplicateConfirmedSlots,
         epoch_slots_frozen_slots: &mut EpochSlotsFrozenSlots,
         bank_forks: &RwLock<BankForks>,
-        progress: &ProgressMap,
+        progress: &mut ProgressMap,
         fork_choice: &mut HeaviestSubtreeForkChoice,
         duplicate_slots_to_repair: &mut DuplicateSlotsToRepair,
         ancestor_hashes_replay_update_sender: &AncestorHashesReplayUpdateSender,
@@ -1850,7 +1840,7 @@ impl ReplayStage {
                 if confirmed_slot <= root {
                     continue;
                 } else if let Some(prev_hash) =
-                    duplicate_confirmed_slots.insert(confirmed_slot, duplicate_confirmed_hash)
+                    progress.set_duplicate_confirmed_hash(confirmed_slot, duplicate_confirmed_hash)
                 {
                     assert_eq!(prev_hash, duplicate_confirmed_hash);
                     // Already processed this signal
@@ -1903,7 +1893,6 @@ impl ReplayStage {
         blockstore: &Blockstore,
         duplicate_slots_receiver: &DuplicateSlotReceiver,
         duplicate_slots_tracker: &mut DuplicateSlotsTracker,
-        duplicate_confirmed_slots: &DuplicateConfirmedSlots,
         epoch_slots_frozen_slots: &mut EpochSlotsFrozenSlots,
         bank_forks: &RwLock<BankForks>,
         progress: &ProgressMap,
@@ -1928,7 +1917,7 @@ impl ReplayStage {
             // WindowService should only send the signal once per slot
             let duplicate_state = DuplicateState::new_from_state(
                 duplicate_slot,
-                duplicate_confirmed_slots,
+                progress,
                 fork_choice,
                 || progress.is_dead(duplicate_slot).unwrap_or(false),
                 || bank_hash,
@@ -2217,7 +2206,6 @@ impl ReplayStage {
         err: &BlockstoreProcessorError,
         rpc_subscriptions: &Arc<RpcSubscriptions>,
         duplicate_slots_tracker: &mut DuplicateSlotsTracker,
-        duplicate_confirmed_slots: &DuplicateConfirmedSlots,
         epoch_slots_frozen_slots: &mut EpochSlotsFrozenSlots,
         progress: &mut ProgressMap,
         heaviest_subtree_fork_choice: &mut HeaviestSubtreeForkChoice,
@@ -2264,7 +2252,7 @@ impl ReplayStage {
         let dead_state = DeadState::new_from_state(
             slot,
             duplicate_slots_tracker,
-            duplicate_confirmed_slots,
+            progress,
             heaviest_subtree_fork_choice,
             epoch_slots_frozen_slots,
         );
@@ -2286,7 +2274,7 @@ impl ReplayStage {
         {
             let duplicate_state = DuplicateState::new_from_state(
                 slot,
-                duplicate_confirmed_slots,
+                progress,
                 heaviest_subtree_fork_choice,
                 || true,
                 || None,
@@ -2325,7 +2313,6 @@ impl ReplayStage {
         heaviest_subtree_fork_choice: &mut HeaviestSubtreeForkChoice,
         bank_notification_sender: &Option<BankNotificationSenderConfig>,
         duplicate_slots_tracker: &mut DuplicateSlotsTracker,
-        duplicate_confirmed_slots: &mut DuplicateConfirmedSlots,
         unfrozen_gossip_verified_vote_hashes: &mut UnfrozenGossipVerifiedVoteHashes,
         vote_signatures: &mut Vec<Signature>,
         has_new_vote_been_rooted: &mut bool,
@@ -2384,7 +2371,6 @@ impl ReplayStage {
                 highest_super_majority_root,
                 heaviest_subtree_fork_choice,
                 duplicate_slots_tracker,
-                duplicate_confirmed_slots,
                 unfrozen_gossip_verified_vote_hashes,
                 has_new_vote_been_rooted,
                 vote_signatures,
@@ -2975,7 +2961,6 @@ impl ReplayStage {
         rewards_recorder_sender: &Option<RewardsRecorderSender>,
         rpc_subscriptions: &Arc<RpcSubscriptions>,
         duplicate_slots_tracker: &mut DuplicateSlotsTracker,
-        duplicate_confirmed_slots: &DuplicateConfirmedSlots,
         epoch_slots_frozen_slots: &mut EpochSlotsFrozenSlots,
         unfrozen_gossip_verified_vote_hashes: &mut UnfrozenGossipVerifiedVoteHashes,
         latest_validator_votes_for_frozen_banks: &mut LatestValidatorVotesForFrozenBanks,
@@ -3015,7 +3000,6 @@ impl ReplayStage {
                             err,
                             rpc_subscriptions,
                             duplicate_slots_tracker,
-                            duplicate_confirmed_slots,
                             epoch_slots_frozen_slots,
                             progress,
                             heaviest_subtree_fork_choice,
@@ -3063,7 +3047,6 @@ impl ReplayStage {
                             &BlockstoreProcessorError::InvalidTransaction(err),
                             rpc_subscriptions,
                             duplicate_slots_tracker,
-                            duplicate_confirmed_slots,
                             epoch_slots_frozen_slots,
                             progress,
                             heaviest_subtree_fork_choice,
@@ -3094,7 +3077,6 @@ impl ReplayStage {
                                 &result_err,
                                 rpc_subscriptions,
                                 duplicate_slots_tracker,
-                                duplicate_confirmed_slots,
                                 epoch_slots_frozen_slots,
                                 progress,
                                 heaviest_subtree_fork_choice,
@@ -3151,7 +3133,7 @@ impl ReplayStage {
                     bank.slot(),
                     bank.hash(),
                     duplicate_slots_tracker,
-                    duplicate_confirmed_slots,
+                    progress,
                     heaviest_subtree_fork_choice,
                     epoch_slots_frozen_slots,
                 );
@@ -3173,7 +3155,7 @@ impl ReplayStage {
                 {
                     let duplicate_state = DuplicateState::new_from_state(
                         bank.slot(),
-                        duplicate_confirmed_slots,
+                        progress,
                         heaviest_subtree_fork_choice,
                         || false,
                         || Some(bank.hash()),
@@ -3271,7 +3253,6 @@ impl ReplayStage {
         rewards_recorder_sender: &Option<RewardsRecorderSender>,
         rpc_subscriptions: &Arc<RpcSubscriptions>,
         duplicate_slots_tracker: &mut DuplicateSlotsTracker,
-        duplicate_confirmed_slots: &DuplicateConfirmedSlots,
         epoch_slots_frozen_slots: &mut EpochSlotsFrozenSlots,
         unfrozen_gossip_verified_vote_hashes: &mut UnfrozenGossipVerifiedVoteHashes,
         latest_validator_votes_for_frozen_banks: &mut LatestValidatorVotesForFrozenBanks,
@@ -3353,7 +3334,6 @@ impl ReplayStage {
             rewards_recorder_sender,
             rpc_subscriptions,
             duplicate_slots_tracker,
-            duplicate_confirmed_slots,
             epoch_slots_frozen_slots,
             unfrozen_gossip_verified_vote_hashes,
             latest_validator_votes_for_frozen_banks,
@@ -4128,48 +4108,19 @@ impl ReplayStage {
         duplicate_slots_to_repair: &mut DuplicateSlotsToRepair,
         ancestor_hashes_replay_update_sender: &AncestorHashesReplayUpdateSender,
         purge_repair_slot_counter: &mut PurgeRepairSlotCounter,
-        duplicate_confirmed_slots: &mut DuplicateConfirmedSlots,
     ) {
         let root_slot = bank_forks.read().unwrap().root();
         for ConfirmedSlot {
-            slot,
-            frozen_hash,
-            confirmation_type,
+            slot, frozen_hash, ..
         } in confirmed_slots.iter()
         {
-            if *confirmation_type == ConfirmationType::SupermajorityVoted {
-                // This case should be guaranteed as false by confirm_forks()
-                if let Some(false) = progress.is_supermajority_confirmed(*slot) {
-                    // Because supermajority confirmation will iterate through and update the
-                    // subtree in fork choice, only incur this cost if the slot wasn't already
-                    // confirmed
-                    progress.set_supermajority_confirmed_slot(*slot);
-                    // If the slot was confirmed, then it must be frozen. Otherwise, we couldn't
-                    // have replayed any of its descendants and figured out it was confirmed.
-                    assert!(*frozen_hash != Hash::default());
-                }
-            }
-
-            if progress.is_duplicate_confirmed(*slot).unwrap_or(false) {
-                // Already duplicate confirmed, nothing left to do
-                continue;
-            }
-
-            progress.set_duplicate_confirmed_slot(*slot);
             assert!(*frozen_hash != Hash::default());
 
             if *slot <= root_slot {
                 continue;
             }
 
-            match confirmation_type {
-                ConfirmationType::SupermajorityVoted => (),
-                ConfirmationType::DuplicateConfirmed => (),
-                #[allow(unreachable_patterns)]
-                _ => panic!("programmer error"),
-            }
-
-            if let Some(prev_hash) = duplicate_confirmed_slots.insert(*slot, *frozen_hash) {
+            if let Some(prev_hash) = progress.set_duplicate_confirmed_hash(*slot, *frozen_hash) {
                 assert_eq!(prev_hash, *frozen_hash);
                 // Already processed this signal
                 return;
@@ -4204,7 +4155,7 @@ impl ReplayStage {
     ) -> Vec<ConfirmedSlot> {
         let mut confirmed_forks = vec![];
         for (slot, prog) in progress.iter() {
-            if !prog.fork_stats.is_supermajority_confirmed {
+            if prog.fork_stats.duplicate_confirmed_hash.is_none() {
                 let bank = bank_forks
                     .read()
                     .unwrap()
@@ -4223,8 +4174,7 @@ impl ReplayStage {
                     datapoint_info!("validator-confirmation", ("duration_ms", duration, i64));
                     confirmed_forks
                         .push(ConfirmedSlot::new_supermajority_voted(*slot, bank.hash()));
-                } else if !prog.fork_stats.is_duplicate_confirmed
-                    && bank.is_frozen()
+                } else if bank.is_frozen()
                     && tower.is_slot_duplicate_confirmed(*slot, voted_stakes, total_stake)
                 {
                     info!(
@@ -4261,7 +4211,6 @@ impl ReplayStage {
         highest_super_majority_root: Option<Slot>,
         heaviest_subtree_fork_choice: &mut HeaviestSubtreeForkChoice,
         duplicate_slots_tracker: &mut DuplicateSlotsTracker,
-        duplicate_confirmed_slots: &mut DuplicateConfirmedSlots,
         unfrozen_gossip_verified_vote_hashes: &mut UnfrozenGossipVerifiedVoteHashes,
         has_new_vote_been_rooted: &mut bool,
         voted_signatures: &mut Vec<Signature>,
@@ -4298,9 +4247,6 @@ impl ReplayStage {
         heaviest_subtree_fork_choice.set_tree_root((new_root, r_bank_forks.root_bank().hash()));
         *duplicate_slots_tracker = duplicate_slots_tracker.split_off(&new_root);
         // duplicate_slots_tracker now only contains entries >= `new_root`
-
-        *duplicate_confirmed_slots = duplicate_confirmed_slots.split_off(&new_root);
-        // gossip_confirmed_slots now only contains entries >= `new_root`
 
         unfrozen_gossip_verified_vote_hashes.set_root(new_root);
         *epoch_slots_frozen_slots = epoch_slots_frozen_slots.split_off(&new_root);
@@ -4856,10 +4802,9 @@ pub(crate) mod tests {
 
         let mut duplicate_slots_tracker: DuplicateSlotsTracker =
             vec![root - 1, root, root + 1].into_iter().collect();
-        let mut duplicate_confirmed_slots: DuplicateConfirmedSlots = vec![root - 1, root, root + 1]
-            .into_iter()
-            .map(|s| (s, Hash::default()))
-            .collect();
+        for s in [root - 1, root, root + 1] {
+            progress.set_duplicate_confirmed_hash(s, Hash::default());
+        }
         let mut unfrozen_gossip_verified_vote_hashes: UnfrozenGossipVerifiedVoteHashes =
             UnfrozenGossipVerifiedVoteHashes {
                 votes_per_slot: vec![root - 1, root, root + 1]
@@ -4880,7 +4825,6 @@ pub(crate) mod tests {
             None,
             &mut heaviest_subtree_fork_choice,
             &mut duplicate_slots_tracker,
-            &mut duplicate_confirmed_slots,
             &mut unfrozen_gossip_verified_vote_hashes,
             &mut true,
             &mut Vec::new(),
@@ -4897,10 +4841,7 @@ pub(crate) mod tests {
             vec![root, root + 1]
         );
         assert_eq!(
-            duplicate_confirmed_slots
-                .keys()
-                .cloned()
-                .collect::<Vec<Slot>>(),
+            progress.get_duplicate_confirmed_slots(),
             vec![root, root + 1]
         );
         assert_eq!(
@@ -4959,7 +4900,6 @@ pub(crate) mod tests {
             Some(confirmed_root),
             &mut heaviest_subtree_fork_choice,
             &mut DuplicateSlotsTracker::default(),
-            &mut DuplicateConfirmedSlots::default(),
             &mut UnfrozenGossipVerifiedVoteHashes::default(),
             &mut true,
             &mut Vec::new(),
@@ -5282,7 +5222,6 @@ pub(crate) mod tests {
                     err,
                     &rpc_subscriptions,
                     &mut DuplicateSlotsTracker::default(),
-                    &DuplicateConfirmedSlots::new(),
                     &mut EpochSlotsFrozenSlots::default(),
                     &mut progress,
                     &mut heaviest_subtree_fork_choice,
@@ -6954,13 +6893,12 @@ pub(crate) mod tests {
         blockstore.store_duplicate_slot(5, vec![], vec![]).unwrap();
         let mut duplicate_slots_tracker = DuplicateSlotsTracker::default();
         let mut purge_repair_slot_counter = PurgeRepairSlotCounter::default();
-        let mut duplicate_confirmed_slots = DuplicateConfirmedSlots::default();
         let mut epoch_slots_frozen_slots = EpochSlotsFrozenSlots::default();
         let bank5_hash = bank_forks.read().unwrap().bank_hash(5).unwrap();
         assert_ne!(bank5_hash, Hash::default());
         let duplicate_state = DuplicateState::new_from_state(
             5,
-            &duplicate_confirmed_slots,
+            &progress,
             &vote_simulator.heaviest_subtree_fork_choice,
             || progress.is_dead(5).unwrap_or(false),
             || Some(bank5_hash),
@@ -7030,7 +6968,7 @@ pub(crate) mod tests {
 
         // If slot 5 is marked as confirmed, it becomes the heaviest bank on same slot again
         let mut duplicate_slots_to_repair = DuplicateSlotsToRepair::default();
-        duplicate_confirmed_slots.insert(5, bank5_hash);
+        progress.set_duplicate_confirmed_hash(5, bank5_hash);
         let duplicate_confirmed_state = DuplicateConfirmedState::new_from_state(
             bank5_hash,
             || progress.is_dead(5).unwrap_or(false),
@@ -7159,13 +7097,12 @@ pub(crate) mod tests {
         // because of lockout
         blockstore.store_duplicate_slot(4, vec![], vec![]).unwrap();
         let mut duplicate_slots_tracker = DuplicateSlotsTracker::default();
-        let mut duplicate_confirmed_slots = DuplicateConfirmedSlots::default();
         let mut epoch_slots_frozen_slots = EpochSlotsFrozenSlots::default();
         let bank4_hash = bank_forks.read().unwrap().bank_hash(4).unwrap();
         assert_ne!(bank4_hash, Hash::default());
         let duplicate_state = DuplicateState::new_from_state(
             4,
-            &duplicate_confirmed_slots,
+            &progress,
             &vote_simulator.heaviest_subtree_fork_choice,
             || progress.is_dead(4).unwrap_or(false),
             || Some(bank4_hash),
@@ -7202,7 +7139,7 @@ pub(crate) mod tests {
         assert_ne!(bank2_hash, Hash::default());
         let duplicate_state = DuplicateState::new_from_state(
             2,
-            &duplicate_confirmed_slots,
+            &progress,
             &vote_simulator.heaviest_subtree_fork_choice,
             || progress.is_dead(2).unwrap_or(false),
             || Some(bank2_hash),
@@ -7237,7 +7174,7 @@ pub(crate) mod tests {
         // If slot 4 is marked as confirmed, then this confirms slot 2 and 4, and
         // then slot 4 is now the heaviest bank again
         let mut duplicate_slots_to_repair = DuplicateSlotsToRepair::default();
-        duplicate_confirmed_slots.insert(4, bank4_hash);
+        progress.set_duplicate_confirmed_hash(4, bank4_hash);
         let duplicate_confirmed_state = DuplicateConfirmedState::new_from_state(
             bank4_hash,
             || progress.is_dead(4).unwrap_or(false),
@@ -7392,8 +7329,7 @@ pub(crate) mod tests {
         // Simulate another version of slot 2 was duplicate confirmed
         let our_bank2_hash = bank_forks.read().unwrap().bank_hash(2).unwrap();
         let duplicate_confirmed_bank2_hash = Hash::new_unique();
-        let mut duplicate_confirmed_slots = DuplicateConfirmedSlots::default();
-        duplicate_confirmed_slots.insert(2, duplicate_confirmed_bank2_hash);
+        progress.set_duplicate_confirmed_hash(2, duplicate_confirmed_bank2_hash);
         let mut duplicate_slots_tracker = DuplicateSlotsTracker::default();
         let mut duplicate_slots_to_repair = DuplicateSlotsToRepair::default();
         let mut epoch_slots_frozen_slots = EpochSlotsFrozenSlots::default();

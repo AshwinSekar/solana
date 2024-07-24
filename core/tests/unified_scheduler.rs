@@ -8,9 +8,7 @@ use {
             progress_map::{ForkProgress, ProgressMap},
         },
         drop_bank_service::DropBankService,
-        repair::cluster_slot_state_verifier::{
-            DuplicateConfirmedSlots, DuplicateSlotsTracker, EpochSlotsFrozenSlots,
-        },
+        repair::cluster_slot_state_verifier::{DuplicateSlotsTracker, EpochSlotsFrozenSlots},
         replay_stage::ReplayStage,
         unfrozen_gossip_verified_vote_hashes::UnfrozenGossipVerifiedVoteHashes,
     },
@@ -131,10 +129,9 @@ fn test_scheduler_waited_by_drop_bank_service() {
 
         let mut duplicate_slots_tracker: DuplicateSlotsTracker =
             vec![root - 1, root, root + 1].into_iter().collect();
-        let mut duplicate_confirmed_slots: DuplicateConfirmedSlots = vec![root - 1, root, root + 1]
-            .into_iter()
-            .map(|s| (s, Hash::default()))
-            .collect();
+        for s in [root - 1, root, root + 1] {
+            progress.set_duplicate_confirmed_hash(s, Hash::default());
+        }
         let mut unfrozen_gossip_verified_vote_hashes: UnfrozenGossipVerifiedVoteHashes =
             UnfrozenGossipVerifiedVoteHashes {
                 votes_per_slot: vec![root - 1, root, root + 1]
@@ -154,7 +151,6 @@ fn test_scheduler_waited_by_drop_bank_service() {
             None,
             &mut heaviest_subtree_fork_choice,
             &mut duplicate_slots_tracker,
-            &mut duplicate_confirmed_slots,
             &mut unfrozen_gossip_verified_vote_hashes,
             &mut true,
             &mut Vec::new(),
