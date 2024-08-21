@@ -192,13 +192,14 @@ impl FromStr for GraphVoteAccountMode {
 struct GraphConfig {
     include_all_votes: bool,
     vote_account_mode: GraphVoteAccountMode,
+    include_all_stakes: bool,
 }
 
 #[allow(clippy::cognitive_complexity)]
 fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
     let frozen_banks = bank_forks.frozen_banks();
     let mut fork_slots: HashSet<_> = frozen_banks.keys().cloned().collect();
-    for (_, bank) in frozen_banks {
+    for (_, bank) in frozen_banks.clone() {
         for parent in bank.parents() {
             fork_slots.remove(&parent.slot());
         }
@@ -210,7 +211,7 @@ fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
     for fork_slot in &fork_slots {
         let bank = &bank_forks[*fork_slot];
 
-        let total_stake = bank
+        let total_stake: u64 = bank
             .vote_accounts()
             .iter()
             .map(|(_, (stake, _))| stake)
@@ -234,14 +235,48 @@ fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
 
     // Figure the stake distribution at all the nodes containing the last vote from each
     // validator
-    let mut slot_stake_and_vote_count = HashMap::new();
-    for (last_vote_slot, _, stake, total_stake) in last_votes.values() {
-        let entry = slot_stake_and_vote_count
-            .entry(last_vote_slot)
-            .or_insert((0, 0, *total_stake));
-        entry.0 += 1;
-        entry.1 += stake;
-        assert_eq!(entry.2, *total_stake)
+    let mut slot_pubkeys_stake_and_vote_count = HashMap::new();
+    if config.include_all_stakes {
+        for (_, bank) in frozen_banks {
+            let total_stake: u64 = bank
+                .vote_accounts()
+                .iter()
+                .map(|(_, (stake, _))| stake)
+                .sum();
+            for (stake, vote_account) in bank.vote_accounts().values() {
+                let vote_state = vote_account.vote_state();
+                let vote_state = vote_state.unwrap_or(&default_vote_state);
+                if let Some(last_vote) = vote_state.votes.iter().last() {
+                    let mut vote_slot = last_vote.slot();
+                    loop {
+                        let entry: &mut (HashSet<Pubkey>, i32, u64, u64) =
+                            slot_pubkeys_stake_and_vote_count
+                                .entry(vote_slot)
+                                .or_insert((HashSet::default(), 0, 0, total_stake));
+                        if !entry.0.contains(&vote_state.node_pubkey) {
+                            entry.0.insert(vote_state.node_pubkey);
+                            entry.1 += 1;
+                            entry.2 += stake;
+                            assert_eq!(entry.3, total_stake)
+                        }
+                        if bank_forks.get(vote_slot).is_none() {
+                            break;
+                        }
+                        vote_slot = *(&bank_forks[vote_slot].parent_slot());
+                    }
+                }
+            }
+        }
+    } else {
+        for (pubkey, (last_vote_slot, _, stake, total_stake)) in &last_votes {
+            let entry: &mut (HashSet<Pubkey>, i32, u64, u64) = slot_pubkeys_stake_and_vote_count
+                .entry(*last_vote_slot)
+                .or_insert((HashSet::default(), 0, 0, *total_stake));
+            entry.0.insert(*pubkey);
+            entry.1 += 1;
+            entry.2 += stake;
+            assert_eq!(entry.3, *total_stake)
+        }
     }
 
     let mut dot = vec!["digraph {".to_string()];
@@ -282,8 +317,8 @@ fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
                     } else {
                         "".to_string()
                     },
-                    if let Some((votes, stake, total_stake)) =
-                        slot_stake_and_vote_count.get(&bank.slot())
+                    if let Some((_, votes, stake, total_stake)) =
+                        slot_pubkeys_stake_and_vote_count.get(&bank.slot())
                     {
                         format!(
                             "\nvotes: {}, stake: {:.1} SOL ({:.1}%)",
@@ -1165,6 +1200,11 @@ fn main() {
                         .help("Include all votes in the graph"),
                 )
                 .arg(
+                    Arg::with_name("include_all_stakes")
+                        .long("include-all-stakes")
+                        .help("Include stake for all slots in graph (default only last votes)"),
+                )
+                .arg(
                     Arg::with_name("graph_filename")
                         .index(1)
                         .value_name("FILENAME")
@@ -1747,6 +1787,7 @@ fn main() {
                             "vote_account_mode",
                             GraphVoteAccountMode
                         ),
+                        include_all_stakes: arg_matches.is_present("include_all_stakes"),
                     };
 
                     let process_options = parse_process_options(&ledger_path, arg_matches);
