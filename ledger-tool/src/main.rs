@@ -44,6 +44,7 @@ use {
     },
     solana_measure::{measure::Measure, measure_time},
     solana_runtime::{
+        accounts_background_service::AbsRequestSender,
         bank::{
             bank_hash_details::{self, SlotDetails, TransactionDetails},
             Bank, RewardCalculationEvent,
@@ -193,6 +194,7 @@ struct GraphConfig {
     include_all_votes: bool,
     vote_account_mode: GraphVoteAccountMode,
     include_all_stakes: bool,
+    starting_slot: Slot,
 }
 
 #[allow(clippy::cognitive_complexity)]
@@ -1205,6 +1207,11 @@ fn main() {
                         .help("Include stake for all slots in graph (default only last votes)"),
                 )
                 .arg(
+                    Arg::with_name("starting_slot")
+                    .long("starting-slot")
+                    .help("Starting slot")
+                )
+                .arg(
                     Arg::with_name("graph_filename")
                         .index(1)
                         .value_name("FILENAME")
@@ -1788,6 +1795,7 @@ fn main() {
                             GraphVoteAccountMode
                         ),
                         include_all_stakes: arg_matches.is_present("include_all_stakes"),
+                        starting_slot: value_t_or_exit!(arg_matches, "starting_slot", u64),
                     };
 
                     let process_options = parse_process_options(&ledger_path, arg_matches);
@@ -1806,6 +1814,17 @@ fn main() {
                             None,
                         );
 
+                    {
+                        bank_forks
+                            .write()
+                            .unwrap()
+                            .set_root(
+                                graph_config.starting_slot,
+                                &AbsRequestSender::default(),
+                                None,
+                            )
+                            .unwrap();
+                    }
                     let dot = graph_forks(&bank_forks.read().unwrap(), &graph_config);
                     let extension = Path::new(&output_file).extension();
                     let result = if extension == Some(OsStr::new("pdf")) {
