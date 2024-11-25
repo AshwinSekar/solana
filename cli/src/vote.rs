@@ -1239,8 +1239,8 @@ pub fn process_show_vote_account(
         get_vote_account(rpc_client, vote_account_address, config.commitment)?;
 
     let epoch_schedule = rpc_client.get_epoch_schedule()?;
-    let tvc_activation_slot =
-        rpc_client.get_feature_activation_slot(&solana_feature_set::timely_vote_credits::id())?;
+    let tvc_activation_slot = rpc_client
+        .get_feature_activation_slot(&solana_sdk::feature_set::timely_vote_credits::id())?;
     let tvc_activation_epoch = tvc_activation_slot.map(|s| epoch_schedule.get_epoch(s));
 
     let mut votes: Vec<CliLandedVote> = vec![];
