@@ -18,6 +18,7 @@ use {
             },
         },
     },
+    agave_votor_messages::migration::MigrationStatus,
     crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender},
     lazy_lru::LruCache,
     rand::prelude::IndexedRandom as _,
@@ -65,7 +66,7 @@ const DEFER_REPAIR_THRESHOLD: Duration = Duration::from_millis(250);
 // This is the amount of time we will wait for a repair request to be fulfilled
 // before making another request. Value is based on reasonable upper bound of
 // expected network delays in requesting repairs and receiving shreds.
-const REPAIR_REQUEST_TIMEOUT_MS: u64 = 150;
+pub(crate) const REPAIR_REQUEST_TIMEOUT_MS: u64 = 150;
 
 // When requesting repair for a specific shred through the admin RPC, we will
 // request up to NUM_PEERS_TO_SAMPLE_FOR_REPAIRS in the event a specific, valid
@@ -166,19 +167,24 @@ pub struct RepairStats {
     pub shred: RepairStatsGroup,
     pub highest_shred: RepairStatsGroup,
     pub orphan: RepairStatsGroup,
+    pub shred_for_block_id: RepairStatsGroup,
     pub get_best_orphans_us: u64,
     pub get_best_shreds_us: u64,
 }
 
 impl RepairStats {
     fn report(&self) {
-        let repair_total = self.shred.count + self.highest_shred.count + self.orphan.count;
+        let repair_total = self.shred.count
+            + self.highest_shred.count
+            + self.orphan.count
+            + self.shred_for_block_id.count;
         let slot_to_count: Vec<_> = self
             .shred
             .slot_pubkeys
             .iter()
             .chain(self.highest_shred.slot_pubkeys.iter())
             .chain(self.orphan.slot_pubkeys.iter())
+            .chain(self.shred_for_block_id.slot_pubkeys.iter())
             .map(|(slot, slot_repairs)| (slot, slot_repairs.pubkey_repairs.values().sum::<u64>()))
             .collect();
         info!("repair_stats: {slot_to_count:?}");
@@ -190,6 +196,7 @@ impl RepairStats {
                 ("shred-count", self.shred.count, i64),
                 ("highest-shred-count", self.highest_shred.count, i64),
                 ("orphan-count", self.orphan.count, i64),
+                ("shred-for-block-id-count", self.shred_for_block_id.count, i64),
                 ("shred-slot-max", nonzero_num(self.shred.max), Option<i64>),
                 ("shred-slot-min", nonzero_num(self.shred.min), Option<i64>),
                 ("highest-shred-slot-max", nonzero_num(self.highest_shred.max), Option<i64>),
@@ -459,12 +466,14 @@ impl RepairService {
                 .unwrap()
         };
 
+        let migration_status = repair_info.bank_forks.read().unwrap().migration_status();
         let ancestor_hashes_service = AncestorHashesService::new(
             exit,
             blockstore,
             ancestor_hashes_socket,
             repair_service_channels.ancestors_hashes_channels,
             repair_info,
+            migration_status,
         );
 
         RepairService {
@@ -628,11 +637,10 @@ impl RepairService {
                 .filter_map(|repair_request| {
                     let (to, req) = serve_repair
                         .repair_request(
-                            &repair_info.cluster_slots,
+                            repair_info,
                             repair_request,
                             peers_cache,
                             &mut repair_metrics.stats,
-                            &repair_info.repair_validators,
                             &mut outstanding_requests,
                             &identity_keypair,
                         )
@@ -671,6 +679,7 @@ impl RepairService {
         repair_tracker: &mut RepairTracker,
         outstanding_requests: &RwLock<OutstandingShredRepairs>,
         repair_socket: &UdpSocket,
+        migration_status: &MigrationStatus,
     ) {
         let RepairChannels {
             verified_voter_slots_receiver,
@@ -712,13 +721,15 @@ impl RepairService {
             repair_metrics,
         );
 
-        Self::handle_popular_pruned_forks(
-            root_bank.clone(),
-            repair_weight,
-            popular_pruned_forks_requests,
-            popular_pruned_forks_sender,
-            repair_metrics,
-        );
+        if !migration_status.is_alpenglow_enabled() {
+            Self::handle_popular_pruned_forks(
+                root_bank.clone(),
+                repair_weight,
+                popular_pruned_forks_requests,
+                popular_pruned_forks_sender,
+                repair_metrics,
+            );
+        }
 
         Self::build_and_send_repair_batch(
             serve_repair,
@@ -756,7 +767,7 @@ impl RepairService {
                     sharable_banks,
                     repair_info.repair_whitelist.clone(),
                     Box::new(StandardRepairHandler::new(blockstore.clone())),
-                    migration_status,
+                    migration_status.clone(),
                 )
             },
             repair_metrics: RepairMetrics::default(),
@@ -773,6 +784,7 @@ impl RepairService {
                 &mut repair_tracker,
                 outstanding_requests,
                 repair_socket,
+                migration_status.as_ref(),
             );
             repair_tracker.repair_metrics.maybe_report();
             sleep(Duration::from_millis(REPAIR_MS));

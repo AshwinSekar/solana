@@ -7,6 +7,7 @@ use {
     },
     agave_feature_set::{FeatureSet, bls_pubkey_management_in_vote_account},
     agave_snapshots::{paths::BANK_SNAPSHOTS_DIR, snapshot_config::SnapshotConfig},
+    agave_votor::vote_history_storage::FileVoteHistoryStorage,
     itertools::izip,
     log::*,
     solana_account::{Account, AccountSharedData, ReadableAccount},
@@ -189,6 +190,8 @@ impl LocalCluster {
         ];
         config.tower_storage = Arc::new(FileTowerStorage::new(ledger_path.to_path_buf()));
         config.accounts_db_config.bank_hash_details_dir = ledger_path.to_path_buf();
+        config.vote_history_storage =
+            Arc::new(FileVoteHistoryStorage::new(ledger_path.to_path_buf()));
 
         let snapshot_config = &mut config.snapshot_config;
         let dummy: PathBuf = DUMMY_SNAPSHOT_CONFIG_PATH_MARKER.into();
@@ -256,6 +259,12 @@ impl LocalCluster {
                     .collect()
             }
         };
+
+        for core_program_account in &core_bpf_programs(&Rent::default(), |_| true) {
+            config
+                .additional_accounts
+                .push(core_program_account.clone());
+        }
 
         for core_program_account in &core_bpf_programs(&Rent::default(), |_| true) {
             config

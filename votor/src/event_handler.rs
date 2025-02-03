@@ -5,7 +5,10 @@ use {
     crate::{
         commitment::{CommitmentType, update_commitment_cache},
         consensus_metrics::ConsensusMetricsEvent,
-        event::{CompletedBlock, VotorEvent, VotorEventReceiver},
+        event::{
+            CompletedBlock, RepairEvent, RepairEventSender, SwitchBankEvent, SwitchBankEventSender,
+            VotorEvent, VotorEventReceiver,
+        },
         event_handler::stats::EventHandlerStats,
         root_utils::{self, RootContext},
         timer_manager::TimerManager,
@@ -15,7 +18,7 @@ use {
         votor::SharedContext,
     },
     agave_votor_messages::{consensus_message::Block, migration::MigrationStatus, vote::Vote},
-    crossbeam_channel::{RecvError, SendError, select},
+    crossbeam_channel::{RecvError, SendError, TrySendError, select},
     parking_lot::RwLock,
     solana_clock::Slot,
     solana_hash::Hash,
@@ -259,7 +262,7 @@ impl EventHandler {
                     // all slots except the first in the window would typically start when the block is seen so the recording would essentially record 0.
                     // hence we skip it.
                     consensus_metrics_events.push(ConsensusMetricsEvent::BlockHashSeen {
-                        leader: *bank.leader_id(),
+                        leader: bank.leader().id,
                         slot,
                     });
                 }
@@ -313,10 +316,12 @@ impl EventHandler {
                 info!("{my_pubkey}: Block Notarized {block:?}");
                 vctx.vote_history.add_block_notarized(block);
                 Self::try_final(my_pubkey, block, vctx, &mut votes)?;
+                request_repair(&ctx.repair_event_sender, *my_pubkey, block)?;
             }
 
-            VotorEvent::BlockNotarFallback(block) => {
-                info!("{my_pubkey}: Block notar-fallback {block:?}");
+            VotorEvent::BlockNotarizeFallback(block) => {
+                info!("{my_pubkey}: Block Notarize-Fallback {block:?}");
+                request_repair(&ctx.repair_event_sender, *my_pubkey, block)?;
             }
 
             VotorEvent::FirstShred(slot) => {
@@ -325,7 +330,20 @@ impl EventHandler {
             }
 
             // Received a parent ready notification for `slot`
-            VotorEvent::ParentReady { slot, parent_block } => {
+            VotorEvent::ParentReady {
+                slot,
+                parent_block: parent_block @ (parent_slot, _parent_block_id),
+            } => {
+                // Only send switch event if parent_slot is greater than the highest finalized slot
+                // (or root if no finalized blocks yet)
+                let highest_finalized_slot = finalized_blocks
+                    .last()
+                    .map(|(slot, _)| *slot)
+                    .unwrap_or_else(|| vctx.sharable_banks.root().slot());
+                if parent_slot > highest_finalized_slot {
+                    request_switch(&ctx.switch_bank_sender, *my_pubkey, parent_block)?;
+                }
+
                 vctx.consensus_metrics_sender
                     .send((
                         Instant::now(),
@@ -371,7 +389,6 @@ impl EventHandler {
             }
 
             // We have observed the safe to notar condition, and can send a notar fallback vote
-            // TODO: update cert pool to check parent block id for intra window slots
             VotorEvent::SafeToNotar(block @ (slot, block_id)) => {
                 info!("{my_pubkey}: SafeToNotar {block:?}");
                 Self::try_skip_window(my_pubkey, slot, vctx, &mut votes)?;
@@ -415,6 +432,24 @@ impl EventHandler {
             VotorEvent::Finalized(block, is_fast_finalization) => {
                 info!("{my_pubkey}: Finalized {block:?} fast: {is_fast_finalization}");
                 finalized_blocks.insert(block);
+
+                request_repair(&ctx.repair_event_sender, *my_pubkey, block)?;
+
+                if let Some(slot) = standstill_slot.take() {
+                    info!(
+                        "{my_pubkey}: Standstill initially detected at {slot} has ended at {}. \
+                         Ending timeout extension",
+                        block.0
+                    );
+                }
+
+                vctx.consensus_metrics_sender
+                    .send((
+                        Instant::now(),
+                        vec![ConsensusMetricsEvent::SlotFinalized { slot: block.0 }],
+                    ))
+                    .map_err(|_| SendError(()))?;
+
                 Self::check_rootable_blocks(
                     my_pubkey,
                     ctx,
@@ -447,12 +482,6 @@ impl EventHandler {
                         &mut votes,
                     )?;
                 }
-                vctx.consensus_metrics_sender
-                    .send((
-                        Instant::now(),
-                        vec![ConsensusMetricsEvent::SlotFinalized { slot: block.0 }],
-                    ))
-                    .map_err(|_| SendError(()))?;
             }
 
             // We have not observed a finalization certificate in a while, refresh our votes
@@ -570,7 +599,7 @@ impl EventHandler {
             *my_pubkey = new_pubkey;
             // The vote history file for the new identity must exist for set-identity to succeed
             vctx.vote_history = VoteHistory::restore(ctx.vote_history_storage.as_ref(), my_pubkey)?;
-            vctx.identity_keypair = new_identity;
+            vctx.identity_keypair = new_identity.clone();
             warn!("set-identity: from {my_old_pubkey} to {my_pubkey}");
         }
         Ok(())
@@ -820,6 +849,57 @@ impl EventHandler {
     }
 }
 
+/// Sends a repair event to the block ID repair service.
+/// Tries non-blocking send first; if the channel is full, logs an error and blocks.
+/// Returns an error if the channel is disconnected.
+fn request_repair(
+    sender: &RepairEventSender,
+    my_pubkey: Pubkey,
+    block: Block,
+) -> Result<(), EventLoopError> {
+    let (slot, block_id) = block;
+    let event = RepairEvent::FetchBlock { slot, block_id };
+    match sender.try_send(event) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(event)) => {
+            error!(
+                "{my_pubkey}: Repair event channel is full, this should not happen. Blocking to \
+                 send event for slot {slot}"
+            );
+            sender
+                .send(event)
+                .map_err(|_| EventLoopError::SenderDisconnected(SendError(())))
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            Err(EventLoopError::SenderDisconnected(SendError(())))
+        }
+    }
+}
+
+fn request_switch(
+    sender: &SwitchBankEventSender,
+    my_pubkey: Pubkey,
+    block: Block,
+) -> Result<(), EventLoopError> {
+    let (slot, block_id) = block;
+    let event = SwitchBankEvent::Switch { slot, block_id };
+    match sender.try_send(event) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(event)) => {
+            error!(
+                "{my_pubkey}: Switch bank event channel is full, this should not happen. Blocking \
+                 to send event for slot {slot}"
+            );
+            sender
+                .send(event)
+                .map_err(|_| EventLoopError::SenderDisconnected(SendError(())))
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            Err(EventLoopError::SenderDisconnected(SendError(())))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -827,7 +907,8 @@ mod tests {
         crate::{
             commitment::CommitmentAggregationData,
             consensus_metrics::ConsensusMetricsEventReceiver,
-            event::LeaderWindowInfo,
+            event::{LeaderWindowInfo, RepairEventReceiver, SwitchBankEventReceiver},
+            tests::get_cluster_info,
             vote_history_storage::{
                 FileVoteHistoryStorage, SavedVoteHistory, SavedVoteHistoryVersions,
                 VoteHistoryStorage,
@@ -843,13 +924,12 @@ mod tests {
         solana_bls_signatures::{
             keypair::Keypair as BLSKeypair, signature::Signature as BLSSignature,
         },
-        solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
+        solana_gossip::cluster_info::ClusterInfo,
         solana_keypair::Keypair,
         solana_ledger::{
             blockstore::Blockstore, blockstore_options::BlockstoreOptions, get_tmp_ledger_path,
             leader_schedule_cache::LeaderScheduleCache,
         },
-        solana_net_utils::SocketAddrSpace,
         solana_runtime::{
             bank::{Bank, SlotLeader},
             bank_forks::BankForks,
@@ -879,6 +959,10 @@ mod tests {
         drop_bank_receiver: Receiver<Vec<BankWithScheduler>>,
         cluster_info: Arc<ClusterInfo>,
         consensus_metrics_receiver: ConsensusMetricsEventReceiver,
+        #[allow(dead_code)] // Keep receiver alive to prevent SenderDisconnected errors
+        repair_event_receiver: RepairEventReceiver,
+        #[allow(dead_code)] // Keep receiver alive to prevent SenderDisconnected errors
+        switch_bank_receiver: SwitchBankEventReceiver,
         shared_context: SharedContext,
         voting_context: VotingContext,
         root_context: RootContext,
@@ -895,9 +979,11 @@ mod tests {
         let (event_sender, _event_receiver) = unbounded();
         let (consensus_metrics_sender, consensus_metrics_receiver) = unbounded();
         let (leader_window_info_sender, leader_window_info_receiver) = unbounded();
+        let (repair_event_sender, repair_event_receiver) = unbounded();
+        let (switch_bank_sender, switch_bank_receiver) = unbounded();
         let timer_manager = Arc::new(PlRwLock::new(TimerManager::new(
-            event_sender,
-            exit,
+            event_sender.clone(),
+            exit.clone(),
             Arc::new(MigrationStatus::default()),
         )));
 
@@ -921,12 +1007,7 @@ mod tests {
             BLSKeypair::derive_from_signer(&my_vote_keypair, BLS_KEYPAIR_DERIVE_SEED).unwrap();
         let bank0 = Bank::new_for_tests(&genesis.genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank0);
-        let contact_info = ContactInfo::new_localhost(&my_node_keypair.pubkey(), 0);
-        let cluster_info = Arc::new(ClusterInfo::new(
-            contact_info,
-            Arc::new(my_node_keypair.insecure_clone()),
-            SocketAddrSpace::Unspecified,
-        ));
+        let cluster_info = get_cluster_info(my_node_keypair.insecure_clone());
         let blockstore = Arc::new(
             Blockstore::open_with_options(
                 &get_tmp_ledger_path!(),
@@ -944,6 +1025,8 @@ mod tests {
             blockstore,
             rpc_subscriptions: None,
             highest_parent_ready: highest_parent_ready.clone(),
+            repair_event_sender,
+            switch_bank_sender,
         };
 
         let vote_history = VoteHistory::new(my_node_keypair.pubkey(), 0);
@@ -990,6 +1073,8 @@ mod tests {
             drop_bank_receiver,
             cluster_info,
             consensus_metrics_receiver,
+            repair_event_receiver,
+            switch_bank_receiver,
             highest_parent_ready,
             shared_context,
             voting_context,
@@ -1322,12 +1407,12 @@ mod tests {
         test_context.check_for_vote(&Vote::new_notarization_vote(slot, block_id_2));
         test_context.check_for_commitment(CommitmentType::Notarize, slot);
         // Slot 3 somehow links to block 1, should not trigger Notarize vote because it has a wrong parent (not 2)
-        let _ = test_context.create_block_and_send_block_event(3, bank1);
+        let _ = test_context.create_block_and_send_block_event(3, bank1.clone());
         test_context.check_no_vote_or_commitment();
 
         // Slot 4 completed replay without parent ready or parent notarized should not trigger Notarize vote
         let slot = 4;
-        let bank4 = test_context.create_block_and_send_block_event(slot, bank2);
+        let bank4 = test_context.create_block_and_send_block_event(slot, bank2.clone());
         let block_id_4 = bank4.block_id().unwrap();
 
         // Send parent ready for slot 4 should trigger Notarize vote for slot 4
@@ -1361,7 +1446,7 @@ mod tests {
         test_context.send_block_notarized_event((1, block_id_1));
         test_context.check_for_vote(&Vote::new_finalization_vote(1));
 
-        let bank2 = test_context.create_block_and_send_block_event(2, bank1);
+        let bank2 = test_context.create_block_and_send_block_event(2, bank1.clone());
         let block_id_2 = bank2.block_id().unwrap();
         // Both Notarize and Finalize votes should trigger for 2
         test_context.check_for_vote(&Vote::new_notarization_vote(2, block_id_2));
@@ -1371,7 +1456,7 @@ mod tests {
 
         // Create bank3 but do not Notarize, so Finalize vote should not trigger
         let slot = 3;
-        let bank3 = test_context.create_block_only(slot, bank2);
+        let bank3 = test_context.create_block_only(slot, bank2.clone());
         let block_id_3 = bank3.block_id().unwrap();
         // Check no notarization vote for 3
         test_context.check_no_vote_or_commitment();
@@ -1394,7 +1479,7 @@ mod tests {
 
         // Simulate that block 4 never arrives, we create block 4 but send timeout event
         let slot = 4;
-        let bank4 = test_context.create_block_only(slot, bank3);
+        let bank4 = test_context.create_block_only(slot, bank3.clone());
         test_context.send_timeout_event(slot);
         // We did eventually complete replay for 4
         test_context.send_block_event(slot, bank4.clone());
@@ -1407,8 +1492,8 @@ mod tests {
         // Now we get block 5, it's replayed and we get block_notarized, but since 4~7 is a bad
         // window already, we shouldn't have notarize or finalize vote for 5
         let slot = 5;
-        let bank5 = test_context.create_block_only(slot, bank4);
-        test_context.send_block_event(slot, bank5);
+        let bank5 = test_context.create_block_only(slot, bank4.clone());
+        test_context.send_block_event(slot, bank5.clone());
         test_context.check_no_vote_or_commitment();
     }
 
@@ -1537,6 +1622,7 @@ mod tests {
 
     #[test]
     fn test_received_finalized() {
+        agave_logger::setup();
         let mut test_context = setup();
 
         let root_bank = test_context
@@ -1577,7 +1663,7 @@ mod tests {
         let bank4 = test_context.create_block_and_send_block_event(4, root_bank);
         let block_id_4 = bank4.block_id().unwrap();
 
-        let bank5 = test_context.create_block_and_send_block_event(5, bank4);
+        let bank5 = test_context.create_block_and_send_block_event(5, bank4.clone());
         let block_id_5 = bank5.block_id().unwrap();
 
         test_context.send_finalized_event((5, block_id_5), true);
@@ -1587,11 +1673,11 @@ mod tests {
 
         // We are partitioned off from rest of the network, and suddenly received finalize for
         // slot 9 a little before we finished replay slot 9
-        let bank9 = test_context.create_block_only(9, bank5);
+        let bank9 = test_context.create_block_only(9, bank5.clone());
         let block_id_9 = bank9.block_id().unwrap();
         test_context.send_finalized_event((9, block_id_9), true);
 
-        test_context.send_block_event(9, bank9);
+        test_context.send_block_event(9, bank9.clone());
 
         // We should now have parent ready for slot 9
         test_context.check_parent_ready_slot((9, (5, block_id_5)));

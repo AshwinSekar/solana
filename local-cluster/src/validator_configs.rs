@@ -22,7 +22,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         max_ledger_shreds: config.max_ledger_shreds,
         blockstore_options: config.blockstore_options.clone(),
         broadcast_stage_type: config.broadcast_stage_type.clone(),
-        turbine_disabled: config.turbine_disabled.clone(),
+        turbine_mode: config.turbine_mode.clone(),
         fixed_leader_schedule: config.fixed_leader_schedule.clone(),
         wait_for_supermajority: config.wait_for_supermajority,
         new_hard_forks: config.new_hard_forks.clone(),
@@ -89,9 +89,7 @@ pub fn make_identical_validator_configs(
     config: &ValidatorConfig,
     num: usize,
 ) -> Vec<ValidatorConfig> {
-    let mut configs = vec![];
-    for _ in 0..num {
-        configs.push(safe_clone_config(config));
-    }
-    configs
+    std::iter::repeat_with(|| safe_clone_config(config))
+        .take(num)
+        .collect()
 }

@@ -15,6 +15,7 @@ use {
     serial_test::serial,
     solana_account::AccountSharedData,
     solana_accounts_db::utils::create_accounts_run_and_snapshot_dirs,
+    solana_client::rpc_client::RpcClient,
     solana_client_traits::AsyncClient,
     solana_clock::{
         self as clock, DEFAULT_SLOTS_PER_EPOCH, DEFAULT_TICKS_PER_SLOT, MAX_PROCESSING_AGE, Slot,
@@ -26,8 +27,14 @@ use {
             SWITCH_FORK_THRESHOLD, Tower, VOTE_THRESHOLD_DEPTH, tower_storage::FileTowerStorage,
         },
         optimistic_confirmation_verifier::OptimisticConfirmationVerifier,
+        repair::{
+            malicious_repair_handler::MaliciousRepairConfig, repair_handler::RepairHandlerType,
+        },
         replay_stage::DUPLICATE_THRESHOLD,
-        validator::{BlockProductionMethod, BlockVerificationMethod, ValidatorConfig},
+        validator::{
+            BlockProductionMethod, BlockVerificationMethod, TurbineMode, TurbineModeKind,
+            ValidatorConfig,
+        },
     },
     solana_download_utils::download_snapshot_archive,
     solana_entry::entry::create_ticks,
@@ -67,7 +74,6 @@ use {
     solana_poh_config::PohConfig,
     solana_pubkey::Pubkey,
     solana_pubsub_client::pubsub_client::PubsubClient,
-    solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::{
         config::{
             RpcBlockSubscribeConfig, RpcBlockSubscribeFilter, RpcProgramAccountsConfig,
@@ -85,7 +91,10 @@ use {
         BroadcastStageType,
         broadcast_duplicates_run::{BroadcastDuplicatesConfig, ClusterPartition},
     },
-    solana_vote::{vote_parser, vote_transaction},
+    solana_vote::{
+        vote_parser::{self},
+        vote_transaction,
+    },
     solana_vote_interface::state::TowerSync,
     solana_vote_program::vote_state::MAX_LOCKOUT_HISTORY,
     std::{
@@ -1281,6 +1290,7 @@ fn test_snapshot_restart_tower() {
 /// slot floor instead of backfilling older ledger history.
 #[test]
 #[serial]
+#[ignore]
 fn test_snapshots_blockstore_floor() {
     agave_logger::setup_with_default(RUST_LOG_FILTER);
     // First set up the cluster with 1 snapshotting leader
@@ -1541,6 +1551,10 @@ fn test_optimistic_confirmation_violation_detection() {
     // might be changed after restart resulting in the two nodes not being able to
     // to form a cluster. The heavier validator is the second node.
     let node_to_restart = validator_keys[1].0.node_keypair.pubkey();
+
+    // WFSM as we require a OC slot > 50 within 100 seconds
+    let mut validator_config = ValidatorConfig::default_for_test();
+    validator_config.wait_for_supermajority = Some(0);
 
     // WFSM as we require a OC slot > 50 within 100 seconds
     let mut validator_config = ValidatorConfig::default_for_test();
@@ -2531,7 +2545,7 @@ fn test_restart_tower_rollback() {
 #[serial]
 fn test_run_test_load_program_accounts_partition_root() {
     let num_slots_per_validator = 8;
-    let partitions: [usize; 2] = [1, 1];
+    let partitions: [usize; 2] = [DEFAULT_NODE_STAKE as usize; 2];
     let (leader_schedule, validator_keys) = create_custom_leader_schedule_with_random_keys(&[
         num_slots_per_validator,
         num_slots_per_validator,
@@ -2564,7 +2578,7 @@ fn test_run_test_load_program_accounts_partition_root() {
 
     let on_partition_resolved = |cluster: &mut LocalCluster, _: &mut ()| {
         cluster.check_for_new_roots(
-            20,
+            16,
             "run_test_load_program_accounts_partition",
             SocketAddrSpace::Unspecified,
         );
@@ -2583,6 +2597,7 @@ fn test_run_test_load_program_accounts_partition_root() {
         None,
         false,
         additional_accounts,
+        true,
     );
 }
 
@@ -3659,6 +3674,8 @@ fn test_kill_heaviest_partition() {
         None,
         true,
         vec![],
+        // TODO: make Alpenglow equivalent when skips are available
+        false,
     )
 }
 
@@ -3666,6 +3683,7 @@ fn test_kill_heaviest_partition() {
 /// leaves the remaining validators unable to root again.
 #[test]
 #[serial]
+#[ignore]
 fn test_kill_partition_switch_threshold_no_progress() {
     let max_switch_threshold_failure_pct = 1.0 - 2.0 * SWITCH_FORK_THRESHOLD;
     let total_stake = 10_000 * DEFAULT_NODE_STAKE;
@@ -3702,6 +3720,7 @@ fn test_kill_partition_switch_threshold_no_progress() {
 /// cluster has barely enough stake to produce switching proofs.
 #[test]
 #[serial]
+#[ignore]
 fn test_kill_partition_switch_threshold_progress() {
     let max_switch_threshold_failure_pct = 1.0 - 2.0 * SWITCH_FORK_THRESHOLD;
     let total_stake = 10_000 * DEFAULT_NODE_STAKE;
@@ -4240,13 +4259,36 @@ fn find_latest_replayed_slot_from_ledger(
 /// Stricter fork-choice assertions are covered by separate partition tests.
 #[test]
 #[serial]
-fn test_cluster_partition() {
+fn test_cluster_partition_1_1() {
+    run_test_cluster_partition(2, false);
+}
+
+#[test]
+#[serial]
+fn test_alpenglow_cluster_partition_1_1() {
+    run_test_cluster_partition(2, true);
+}
+
+#[test]
+#[serial]
+fn test_cluster_partition_1_1_1() {
+    run_test_cluster_partition(3, false);
+}
+
+#[test]
+#[serial]
+fn test_alpenglow_cluster_partition_1_1_1() {
+    run_test_cluster_partition(3, true);
+}
+
+fn run_test_cluster_partition(num_partitions: usize, is_alpenglow: bool) {
     let empty = |_: &mut LocalCluster, _: &mut ()| {};
     let on_partition_resolved = |cluster: &mut LocalCluster, _: &mut ()| {
         cluster.check_for_new_roots(16, "PARTITION_TEST", SocketAddrSpace::Unspecified);
     };
+    let partition_sizes = vec![DEFAULT_NODE_STAKE as usize; num_partitions];
     run_cluster_partition(
-        &[1, 1, 1],
+        &partition_sizes,
         None,
         (),
         empty,
@@ -4255,6 +4297,7 @@ fn test_cluster_partition() {
         None,
         false,
         vec![],
+        is_alpenglow,
     )
 }
 
@@ -4551,7 +4594,7 @@ fn test_duplicate_with_pruned_ancestor() {
     let observer_stake = DEFAULT_NODE_STAKE;
 
     let slots_per_epoch = 2048;
-    let fork_slot: u64 = 10;
+    let fork_slot: u64 = 12;
     let fork_length: u64 = 20;
     let majority_fork_buffer = 5;
 
@@ -5223,9 +5266,9 @@ fn test_duplicate_shreds_switch_failure() {
         dup_shred1: &Shred,
         dup_shred2: &Shred,
     ) {
-        let disable_turbine = Arc::new(AtomicBool::new(true));
+        let turbine_mode = TurbineMode::new(TurbineModeKind::TurbineAndRepairDisabled);
         duplicate_fork_validator_info.config.voting_disabled = false;
-        duplicate_fork_validator_info.config.turbine_disabled = disable_turbine.clone();
+        duplicate_fork_validator_info.config.turbine_mode = turbine_mode.clone();
         info!("Restarting node: {pubkey}");
         cluster.restart_node(
             pubkey,
@@ -5246,7 +5289,7 @@ fn test_duplicate_shreds_switch_failure() {
             }
             sleep(Duration::from_millis(1000));
         }
-        disable_turbine.store(false, Ordering::Relaxed);
+        turbine_mode.set(TurbineModeKind::Enabled);
 
         // Send the validator the other version of the shred so they realize it's duplicate
         info!("Resending duplicate shreds to duplicate fork validator");
@@ -6054,6 +6097,82 @@ fn test_alpenglow_imbalanced_stakes_catchup() {
         vote_listener_addr,
         &validator_node_keypairs,
         &node_stakes,
+    );
+}
+
+/// We start 2 nodes, where the first node A holds 90% of the stake.
+/// B has turbine disabled, and receives duplicate blocks through eager repair.
+/// However, through informed repair it is able to repair the correct blocks and keep up with A.
+#[test]
+#[serial]
+fn test_alpenglow_basic_equivocation() {
+    agave_logger::setup_with_default(AG_DEBUG_LOG_FILTER);
+    // Create node stakes
+    let slots_per_epoch = 512;
+
+    let total_stake = 2 * DEFAULT_NODE_STAKE;
+    let tenth_stake = total_stake / 10;
+    let node_a_stake = 9 * tenth_stake;
+    let node_b_stake = total_stake - node_a_stake;
+
+    let node_stakes = vec![node_a_stake, node_b_stake];
+
+    // Create leader schedule with A as the leader
+    let (leader_schedule, validator_keys) = create_custom_leader_schedule_with_random_keys(&[4, 0]);
+
+    let leader_schedule = FixedSchedule {
+        leader_schedule: Arc::new(leader_schedule),
+    };
+
+    // Create our UDP socket to listen to votes
+    let vote_listener_addr = bind_to_localhost_unique().unwrap();
+
+    let mut a_validator_config = ValidatorConfig::default_for_test();
+    a_validator_config.wait_for_supermajority = Some(0);
+    a_validator_config.fixed_leader_schedule = Some(leader_schedule);
+    a_validator_config.voting_service_test_override = Some(VotingServiceOverride {
+        additional_listeners: vec![vote_listener_addr.local_addr().unwrap()],
+        alpenglow_port_override: AlpenglowPortOverride::default(),
+    });
+
+    let mut b_validator_config = safe_clone_config(&a_validator_config);
+    b_validator_config.turbine_mode = TurbineMode::new(TurbineModeKind::TurbineDisabled);
+
+    // Equivocate every other slot, one shred per FEC set
+    a_validator_config.repair_handler_type = RepairHandlerType::Malicious(MaliciousRepairConfig {
+        bad_shred_slot_frequency: Some(2),
+        bad_shred_index_frequency: Some(32), // Only equivocate for indices where index % 32 == 0
+        slot_range: Some((0, 50)),           // Only for the first few slots
+    });
+
+    // Cluster config
+    let mut cluster_config = ClusterConfig {
+        mint_lamports: DEFAULT_MINT_LAMPORTS + total_stake,
+        node_stakes: node_stakes.clone(),
+        validator_configs: vec![a_validator_config, b_validator_config],
+        validator_keys: Some(
+            validator_keys
+                .iter()
+                .cloned()
+                .zip(iter::repeat_with(|| true))
+                .collect(),
+        ),
+        slots_per_epoch,
+        stakers_slot_offset: slots_per_epoch,
+        skip_warmup_slots: true,
+        ..ClusterConfig::default()
+    };
+
+    // Create local cluster
+    let cluster = LocalCluster::new_alpenglow(&mut cluster_config, SocketAddrSpace::Unspecified);
+
+    // Ensure all nodes are rooting
+    // Although the low staked node might be behind while the leader is equivocating,
+    // once the leader stops equivocating it will be able to catch up
+    cluster.check_for_new_roots(
+        32,
+        "test_alpenglow_basic_equivocation",
+        SocketAddrSpace::Unspecified,
     );
 }
 

@@ -2,6 +2,7 @@ use {
     agave_votor_messages::consensus_message::Block,
     crossbeam_channel::{Receiver, Sender},
     solana_clock::Slot,
+    solana_hash::Hash,
     solana_runtime::bank::Bank,
     std::{sync::Arc, time::Instant},
 };
@@ -35,8 +36,8 @@ pub enum VotorEvent {
     /// The block has received a notarization certificate
     BlockNotarized(Block),
 
-    /// The block has received a notar-fallback certificate
-    BlockNotarFallback(Block),
+    /// The block has received a notarize-fallback certificate
+    BlockNotarizeFallback(Block),
 
     /// Received the first shred for the slot.
     FirstShred(Slot),
@@ -61,7 +62,7 @@ pub enum VotorEvent {
     /// Produce the window
     ProduceWindow(LeaderWindowInfo),
 
-    /// The block has received a slow or fast finalization certificate and is eligible for rooting
+    /// The block has received a slow or fast finalization certificate and is eligble for rooting
     /// The second bool indicates whether the block is a fast finalization
     Finalized(Block, bool),
 
@@ -85,7 +86,7 @@ impl VotorEvent {
             | VotorEvent::SafeToNotar((s, _))
             | VotorEvent::Finalized((s, _), _)
             | VotorEvent::BlockNotarized((s, _))
-            | VotorEvent::BlockNotarFallback((s, _))
+            | VotorEvent::BlockNotarizeFallback((s, _))
             | VotorEvent::ParentReady {
                 slot: s,
                 parent_block: _,
@@ -93,6 +94,45 @@ impl VotorEvent {
             VotorEvent::ProduceWindow(_) => false,
             VotorEvent::Standstill(_) => false,
             VotorEvent::SetIdentity => false,
+        }
+    }
+}
+
+pub type RepairEventSender = Sender<RepairEvent>;
+pub type RepairEventReceiver = Receiver<RepairEvent>;
+
+/// Event sent by votor to the block id repair service for informed repair
+#[derive(Debug, Copy, Clone)]
+pub enum RepairEvent {
+    /// We require that this block be fetched. This can happen for the following reasons:
+    /// - The block has received a NotarizeFallback certificate or stronger
+    /// - TODO(ashwin): An intrawindow block has reached the SafeToNotar threshold, however we need
+    ///   to check that the parent has reached notarize-fallback requiring us to fetch this block
+    FetchBlock { slot: Slot, block_id: Hash },
+}
+
+impl RepairEvent {
+    pub fn slot(&self) -> Slot {
+        match self {
+            RepairEvent::FetchBlock { slot, .. } => *slot,
+        }
+    }
+}
+
+pub type SwitchBankEventSender = Sender<SwitchBankEvent>;
+pub type SwitchBankEventReceiver = Receiver<SwitchBankEvent>;
+
+/// Event sent to replay_stage when a bank needs to be switched as a result of a ParentReady
+#[derive(Debug, Copy, Clone)]
+pub enum SwitchBankEvent {
+    /// We need to switch any existing banks to this bank including ancestors
+    Switch { slot: Slot, block_id: Hash },
+}
+
+impl SwitchBankEvent {
+    pub fn block(&self) -> Block {
+        match self {
+            SwitchBankEvent::Switch { slot, block_id } => (*slot, *block_id),
         }
     }
 }

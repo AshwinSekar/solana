@@ -13,8 +13,8 @@ use {
             self, GenesisConfigInfo, ValidatorVoteKeypairs, activate_all_features,
             activate_feature, bootstrap_validator_stake_lamports,
             create_genesis_config_with_leader, create_genesis_config_with_vote_accounts,
-            create_lockup_stake_account, genesis_sysvar_and_builtin_program_lamports,
-            minimum_vote_account_balance_for_vat,
+            create_lockup_stake_account, deactivate_features,
+            genesis_sysvar_and_builtin_program_lamports, minimum_vote_account_balance_for_vat,
         },
         runtime_config::RuntimeConfig,
         serde_snapshot::fields_from_stream,
@@ -142,7 +142,7 @@ use {
         thread::Builder,
         time::{Duration, Instant},
     },
-    test_case::test_case,
+    test_case::{test_case, test_matrix},
 };
 
 fn create_genesis_config_no_tx_fee_no_rent(lamports: u64) -> (GenesisConfig, Keypair) {
@@ -816,10 +816,12 @@ where
     assert_ne!(bank2.capitalization(), bank0.capitalization());
 
     // verify the inflation is represented in validator_points
+    // and account for the additional created state.
     let paid_rewards = bank2.capitalization()
         - bank0.capitalization()
         - bank1_sysvar_delta()
         - bank2_sysvar_delta();
+    // TODO: this needed? - EpochInflationAccountState::rent_needed_for_account(&bank2);
 
     // this assumes that no new builtins or precompiles were activated in bank1 or bank2
     let validator_rewards_lamports =
@@ -11716,5 +11718,118 @@ fn test_calculate_and_set_block_id_for_dcou() {
 
         Bank::calculate_and_set_block_id_for_dcou(&bank);
         assert_eq!(bank.block_id(), Some(expected_block_id));
+    }
+}
+
+#[test]
+fn test_get_top_epoch_stakes() {
+    let num_of_nodes: u64 = 3000;
+    let stakes = (1..num_of_nodes.checked_add(1).expect("Shouldn't be big")).collect::<Vec<_>>();
+    let voting_keypairs = stakes
+        .iter()
+        .map(|_| ValidatorVoteKeypairs::new_rand())
+        .collect::<Vec<_>>();
+    let GenesisConfigInfo { genesis_config, .. } =
+        create_genesis_config_with_vote_accounts(1_000_000_000, &voting_keypairs, stakes.clone());
+    let create_test_bank = |bank_epoch: Epoch, feature_activation_slot: Option<Slot>| -> Bank {
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        bank.epoch = bank_epoch;
+        let mut feature_set = FeatureSet::default();
+        if let Some(feature_activation_slot) = feature_activation_slot {
+            let feature_activation_epoch = bank.epoch_schedule().get_epoch(feature_activation_slot);
+            assert!(feature_activation_epoch <= bank_epoch);
+            feature_set.activate(
+                &agave_feature_set::validator_admission_ticket::id(),
+                feature_activation_slot,
+            );
+        }
+        bank.feature_set = Arc::new(feature_set);
+        bank
+    };
+    // Feature deactivated at genesis, return all accounts
+    let test_bank = create_test_bank(0, None);
+    // assert feature is not activated at epoch 0
+    assert!(
+        !test_bank
+            .feature_set
+            .is_active(&agave_feature_set::validator_admission_ticket::id())
+    );
+    let stakes = test_bank.get_top_epoch_stakes();
+    assert_eq!(stakes.staked_nodes().len(), num_of_nodes as usize);
+
+    // Feature activated at epoch 2, return only 2000 accounts
+    let slot_in_prev_epoch = test_bank.epoch_schedule().get_first_slot_in_epoch(1);
+    let test_bank = create_test_bank(2, Some(slot_in_prev_epoch));
+    assert!(
+        test_bank
+            .feature_set
+            .is_active(&agave_feature_set::validator_admission_ticket::id())
+    );
+    let stakes = test_bank.get_top_epoch_stakes();
+    assert_eq!(stakes.staked_nodes().len(), MAX_ALPENGLOW_VOTE_ACCOUNTS);
+}
+
+#[test_matrix([false, true], [false, true])]
+fn test_bank_burn_vat(enable_alpenglow: bool, enable_vat: bool) {
+    // Create a bank with all features enabled expect for AG and VAT.
+    let bank_epoch_0 = {
+        let num_of_nodes: u64 = 100;
+        let voting_keypairs = (0..num_of_nodes)
+            .map(|_| ValidatorVoteKeypairs::new_rand())
+            .collect::<Vec<_>>();
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config_with_vote_accounts(
+            1_000_000_000,
+            &voting_keypairs,
+            (1..num_of_nodes.checked_add(1).expect("Shouldn't be big")).collect::<Vec<_>>(),
+        );
+        let features_to_deactivate = vec![
+            agave_feature_set::alpenglow::id(),
+            agave_feature_set::validator_admission_ticket::id(),
+        ];
+        deactivate_features(&mut genesis_config, &features_to_deactivate);
+        Bank::new_for_tests(&genesis_config)
+    };
+
+    // Now move to a bank in the next epoch.
+    let mut bank_epoch_1 = {
+        let first_slot_in_epoch_1 = bank_epoch_0.epoch_schedule().get_first_slot_in_epoch(1);
+        Bank::new_from_parent(
+            Arc::new(bank_epoch_0),
+            SlotLeader::new_unique(),
+            first_slot_in_epoch_1,
+        )
+    };
+    let capitalization_epoch_1 = bank_epoch_1.capitalization();
+
+    // Now move to a bank in the next epoch while enabling the features as per test inputs.
+    let bank_epoch_2 = {
+        let first_slot_in_epoch_2 = bank_epoch_1.epoch_schedule().get_first_slot_in_epoch(2);
+
+        let mut feature_set = FeatureSet::all_enabled();
+        if !enable_alpenglow {
+            feature_set.deactivate(&agave_feature_set::alpenglow::id());
+        }
+        if !enable_vat {
+            feature_set.deactivate(&agave_feature_set::validator_admission_ticket::id());
+        }
+        bank_epoch_1.feature_set = Arc::new(feature_set);
+        Bank::new_from_parent(
+            Arc::new(bank_epoch_1),
+            SlotLeader::new_unique(),
+            first_slot_in_epoch_2,
+        )
+    };
+
+    assert!(bank_epoch_2.epoch_stakes(3).is_some());
+    assert!(bank_epoch_2.epoch_stakes(4).is_none());
+    let capitalization_epoch_2 = bank_epoch_2.capitalization();
+    if enable_alpenglow && enable_vat {
+        // VAT should be burned
+        assert!(capitalization_epoch_2 < capitalization_epoch_1);
+    } else {
+        // VAT should not be burned
+        assert!(capitalization_epoch_2 >= capitalization_epoch_1);
     }
 }

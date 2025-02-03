@@ -304,6 +304,7 @@ startBootstrapLeader() {
   declare ipAddress=$1
   declare nodeIndex="$2"
   declare logFile="$3"
+  declare alpenglow="$4"
   echo "--- Starting bootstrap validator: $ipAddress"
   echo "start log: $logFile"
 
@@ -339,6 +340,7 @@ startBootstrapLeader() {
          \"$TMPFS_ACCOUNTS\" \
          \"$disableQuic\" \
          \"$enableUdp\" \
+         \"$alpenglow\" \
       "
 
   ) >> "$logFile" 2>&1 || {
@@ -352,6 +354,7 @@ startNode() {
   declare ipAddress=$1
   declare nodeType=$2
   declare nodeIndex="$3"
+  declare alpenglow="$4"
 
   initLogDir
   declare logFile="$netLogDir/validator-$ipAddress.log"
@@ -412,6 +415,7 @@ startNode() {
          \"$TMPFS_ACCOUNTS\" \
          \"$disableQuic\" \
          \"$enableUdp\" \
+         \"$alpenglow\" \
       "
   ) >> "$logFile" 2>&1 &
   declare pid=$!
@@ -623,7 +627,7 @@ deploy() {
     if $bootstrapLeader; then
       SECONDS=0
       declare bootstrapNodeDeployTime=
-      startBootstrapLeader "$nodeAddress" "$nodeIndex" "$netLogDir/bootstrap-validator-$ipAddress.log"
+      startBootstrapLeader "$nodeAddress" "$nodeIndex" "$netLogDir/bootstrap-validator-$ipAddress.log" "$alpenglow"
       bootstrapNodeDeployTime=$SECONDS
       $metricsWriteDatapoint "testnet-deploy net-bootnode-leader-started=1"
 
@@ -631,7 +635,7 @@ deploy() {
       SECONDS=0
       pids=()
     else
-      startNode "$ipAddress" "$nodeType" "$nodeIndex"
+      startNode "$ipAddress" "$nodeType" "$nodeIndex" "$alpenglow"
 
       # Stagger additional node start time. If too many nodes start simultaneously
       # the bootstrap node gets more rsync requests from the additional nodes than
@@ -828,6 +832,7 @@ disableQuic=false
 enableUdp=false
 clientType=tpu-client
 maybeUseUnstakedConnection=""
+alpenglow=false
 
 command=$1
 [[ -n $command ]] || usage
@@ -959,6 +964,9 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --use-unstaked-connection ]]; then
       maybeUseUnstakedConnection="$1"
       shift 1
+    elif [[ $1 = --alpenglow ]]; then
+      alpenglow=true
+      shift 1
     else
       usage "Unknown long option: $1"
     fi
@@ -1068,7 +1076,7 @@ if [[ "$numClientsRequested" -eq 0 ]]; then
   numClientsRequested=$numClients
 else
   if [[ "$numClientsRequested" -gt "$numClients" ]]; then
-    echo "Error: More clients requested ($numClientsRequested) then available ($numClients)"
+    echo "Error: More clients requested ($numClientsRequested) than available ($numClients)"
     exit 1
   fi
 fi

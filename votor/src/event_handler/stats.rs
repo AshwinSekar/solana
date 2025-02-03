@@ -94,7 +94,7 @@ impl Default for EventHandlerStats {
 pub enum StatsEvent {
     Block,
     BlockNotarized,
-    BlockNotarFallback,
+    BlockNotarizeFallback,
     FirstShred,
     ParentReady,
     TimeoutCrashedLeader,
@@ -112,7 +112,7 @@ impl StatsEvent {
         match event {
             VotorEvent::Block(_) => StatsEvent::Block,
             VotorEvent::BlockNotarized(_) => StatsEvent::BlockNotarized,
-            VotorEvent::BlockNotarFallback(_) => StatsEvent::BlockNotarFallback,
+            VotorEvent::BlockNotarizeFallback(_) => StatsEvent::BlockNotarizeFallback,
             VotorEvent::FirstShred(_) => StatsEvent::FirstShred,
             VotorEvent::ParentReady { .. } => StatsEvent::ParentReady,
             VotorEvent::TimeoutCrashedLeader(_) => StatsEvent::TimeoutCrashedLeader,

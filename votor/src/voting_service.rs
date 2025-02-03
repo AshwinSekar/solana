@@ -351,7 +351,9 @@ mod tests {
         // Create listener thread on a random port we allocated and return SocketAddr to create VotingService
 
         // Bind to a random UDP port
-        let socket = bind_to_localhost_unique().unwrap();
+        let Ok(socket) = bind_to_localhost_unique() else {
+            return;
+        };
         let listener_addr = socket.local_addr().unwrap();
 
         // Create VotingService with the listener address

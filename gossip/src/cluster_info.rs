@@ -2348,6 +2348,7 @@ pub struct Sockets {
     pub tpu_quic: Vec<UdpSocket>,            // quic read only
     pub tpu_forwards_quic: Vec<UdpSocket>,   // quic read only
     pub tpu_vote_quic: Vec<UdpSocket>,       // quic read only
+    pub block_id_repair: UdpSocket,
 
     /// Client-side socket for ForwardingStage vote transactions
     pub tpu_vote_forwarding_client: UdpSocket, // udp write only

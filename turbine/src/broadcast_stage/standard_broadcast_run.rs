@@ -643,12 +643,12 @@ mod test {
         )
     }
 
-    #[test]
-    fn test_interrupted_slot_last_shred() {
+    #[test_case(MigrationStatus::default(); "pre_migration")]
+    #[test_case(MigrationStatus::post_migration_status(); "post_migration")]
+    fn test_interrupted_slot_last_shred(migration_status: MigrationStatus) {
         let keypair = Arc::new(Keypair::new());
         let (votor_event_sender, _votor_event_receiver) = unbounded();
-        let mut run =
-            StandardBroadcastRun::new(0, Arc::new(MigrationStatus::default()), votor_event_sender);
+        let mut run = StandardBroadcastRun::new(0, Arc::new(migration_status), votor_event_sender);
         assert!(run.completed);
 
         // Set up the slot to be interrupted
@@ -834,8 +834,9 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_buffer_data_shreds() {
+    #[test_case(MigrationStatus::default(); "pre_migration")]
+    #[test_case(MigrationStatus::post_migration_status(); "post_migration")]
+    fn test_buffer_data_shreds(migration_status: MigrationStatus) {
         let num_shreds_per_slot = 2;
         let (blockstore, genesis_config, _cluster_info, bank, leader_keypair, _socket, _bank_forks) =
             setup(num_shreds_per_slot);
@@ -844,7 +845,7 @@ mod test {
         let (votor_event_sender, _votor_event_receiver) = unbounded();
         let mut last_tick_height = 0;
         let mut standard_broadcast_run =
-            StandardBroadcastRun::new(0, Arc::new(MigrationStatus::default()), votor_event_sender);
+            StandardBroadcastRun::new(0, Arc::new(migration_status), votor_event_sender);
         let mut process_ticks = |num_ticks| {
             let ticks = create_ticks(num_ticks, 0, genesis_config.hash());
             last_tick_height += (ticks.len() - 1) as u64;
@@ -888,8 +889,9 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_slot_finish() {
+    #[test_case(MigrationStatus::default(); "pre_migration")]
+    #[test_case(MigrationStatus::post_migration_status(); "post_migration")]
+    fn test_slot_finish(migration_status: MigrationStatus) {
         // Setup
         let num_shreds_per_slot = 2;
         let (blockstore, genesis_config, cluster_info, bank0, leader_keypair, socket, bank_forks) =
@@ -905,7 +907,7 @@ mod test {
 
         let (votor_event_sender, _votor_event_receiver) = unbounded();
         let mut standard_broadcast_run =
-            StandardBroadcastRun::new(0, Arc::new(MigrationStatus::default()), votor_event_sender);
+            StandardBroadcastRun::new(0, Arc::new(migration_status), votor_event_sender);
         standard_broadcast_run
             .test_process_receive_results(
                 &leader_keypair,
@@ -919,13 +921,13 @@ mod test {
         assert!(standard_broadcast_run.completed)
     }
 
-    #[test]
-    fn test_component_to_shreds_max() {
+    #[test_case(MigrationStatus::default(); "pre_migration")]
+    #[test_case(MigrationStatus::post_migration_status(); "post_migration")]
+    fn entries_to_shreds_max(migration_status: MigrationStatus) {
         agave_logger::setup();
         let keypair = Keypair::new();
         let (votor_event_sender, _votor_event_receiver) = unbounded();
-        let mut bs =
-            StandardBroadcastRun::new(0, Arc::new(MigrationStatus::default()), votor_event_sender);
+        let mut bs = StandardBroadcastRun::new(0, Arc::new(migration_status), votor_event_sender);
         bs.slot = 1;
         bs.parent = 0;
         bs.max_data_shreds_per_slot = 1000;

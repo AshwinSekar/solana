@@ -1,7 +1,6 @@
 //! The entrypoint into votor the module responsible for voting, rooting, and notifying
 //! the core to create a new block.
 //! ```text
-//!
 //!                                Votor
 //!   ┌────────────────────────────────────────────────────────────────────────────┐
 //!   │                                                                            │
@@ -18,20 +17,22 @@
 //!   │        │         │                              │ │                        │ │Voting Service│
 //!   │        │         │                              │ │                        │ └──────────────┘
 //!   │        │         │                              │ │                        │
-//!   │   ┌────┼─────────┼───────────────┐              │ │                        │
+//!   │   ┌────┼─────────┼───────────────┐              │ │    Switch Bank         │
 //!   │   │                              │              │ │      Block             │ ┌────────────────────┐
-//!   │   │   Consensus Pool Service     │              │ │  ┌─────────────────────│─┼ Replay / Broadcast │
+//!   │   │   Certificate Pool Service   │              │ │  ┌─────────────────────│─┼ Replay / Broadcast │
 //!   │   │                              │              │ │  │                     │ └────────────────────┘
 //!   │   │ ┌──────────────────────────┐ │              │ │  │                     │
 //!   │   │ │                          │ │              │ │  │                     │
-//!   │   │ │     Consensus Pool       │ │              │ │  │                     │
+//!   │   │ │     Certificate Pool     │ │              │ │  │                     │
 //!   │   │ │ ┌────────────────────┐   │ │         ┌────▼─┼──▼───────┐   Start     │
 //!   │   │ │ │Parent ready tracker│   │ │ Vote    │                 │ Leader window ┌──────────────────────┐
 //!   │   │ │ └────────────────────┘   │ ◄─────────┼  Event Handler  ┼─────────────│─►  Block creation loop │
 //!   │   │ └──────────────────────────┘ │         │                 │             │ └──────────────────────┘
 //!   │   │                              │         └─▲───────────┬───┘             │
-//!   │   └──────────────────────────────┘           │           │                 │
-//!   │                                     Timeout  │           │                 │
+//!   │   └──────────────────────────────┘           │           │ \               │
+//!   │                                     Timeout  │           │  \  RepairEvent │ ┌───────────────────────┐
+//!   │                                              │           │   \─────────────│─► BlockID Repair Service│
+//!   │                                              │           │                 │ └───────────────────────┘
 //!   │                                              │           │ Set Timeouts    │
 //!   │                                              │           │                 │
 //!   │                          ┌───────────────────┴┐     ┌────▼───────────────┐ │
@@ -49,7 +50,10 @@ use {
         },
         consensus_pool_service::{ConsensusPoolContext, ConsensusPoolService},
         consensus_rewards::ConsensusRewardsService,
-        event::{LeaderWindowInfo, VotorEventReceiver, VotorEventSender},
+        event::{
+            LeaderWindowInfo, RepairEventSender, SwitchBankEventSender, VotorEventReceiver,
+            VotorEventSender,
+        },
         event_handler::{EventHandler, EventHandlerContext},
         generated_cert_types::GeneratedCertTypes,
         root_utils::RootContext,
@@ -119,6 +123,8 @@ pub struct VotorConfig {
     pub event_sender: VotorEventSender,
     pub own_vote_sender: Sender<Vec<ConsensusMessage>>,
     pub reward_certs_sender: Sender<BuildRewardCertsResponse>,
+    pub repair_event_sender: RepairEventSender,
+    pub switch_bank_sender: SwitchBankEventSender,
 
     // Receivers
     pub event_receiver: VotorEventReceiver,
@@ -137,6 +143,8 @@ pub(crate) struct SharedContext {
     pub(crate) leader_window_info_sender: Sender<LeaderWindowInfo>,
     pub(crate) highest_parent_ready: Arc<RwLock<(Slot, (Slot, Hash))>>,
     pub(crate) vote_history_storage: Arc<dyn VoteHistoryStorage>,
+    pub(crate) repair_event_sender: RepairEventSender,
+    pub(crate) switch_bank_sender: SwitchBankEventSender,
 }
 
 pub struct Votor {
@@ -170,37 +178,41 @@ impl Votor {
             highest_parent_ready,
             event_sender,
             own_vote_sender,
+            repair_event_sender,
+            switch_bank_sender,
             event_receiver,
             consensus_message_receiver,
             consensus_metrics_sender,
             consensus_metrics_receiver,
             reward_votes_receiver,
-            build_reward_certs_receiver,
             reward_certs_sender,
+            build_reward_certs_receiver,
             generated_cert_types,
             highest_finalized,
         } = config;
 
-        let migration_status = bank_forks.read().unwrap().migration_status();
         let identity_keypair = cluster_info.keypair();
+        let migration_status = bank_forks.read().unwrap().migration_status();
 
         // Get the sharable root bank
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
 
         let shared_context = SharedContext {
             blockstore: blockstore.clone(),
-            bank_forks,
+            bank_forks: bank_forks.clone(),
             cluster_info: cluster_info.clone(),
             rpc_subscriptions,
             highest_parent_ready,
             leader_window_info_sender,
             vote_history_storage,
+            repair_event_sender: repair_event_sender.clone(),
+            switch_bank_sender,
         };
 
         let voting_context = VotingContext {
             vote_history,
             vote_account_pubkey: vote_account,
-            identity_keypair,
+            identity_keypair: identity_keypair.clone(),
             authorized_voter_keypairs,
             derived_bls_keypairs: HashMap::new(),
             own_vote_sender,
@@ -208,7 +220,7 @@ impl Votor {
             commitment_sender: commitment_sender.clone(),
             wait_to_vote_slot,
             sharable_banks: sharable_banks.clone(),
-            consensus_metrics_sender,
+            consensus_metrics_sender: consensus_metrics_sender.clone(),
         };
 
         let root_context = RootContext {
@@ -249,6 +261,7 @@ impl Votor {
             bls_sender,
             event_sender,
             commitment_sender,
+            repair_event_sender,
             highest_finalized,
         };
 
@@ -259,6 +272,7 @@ impl Votor {
         );
         let event_handler = EventHandler::new(event_handler_context);
         let consensus_pool_service = ConsensusPoolService::new(consensus_pool_context);
+
         let consensus_rewards_service = ConsensusRewardsService::new(
             cluster_info,
             leader_schedule_cache,
@@ -272,8 +286,8 @@ impl Votor {
         Self {
             event_handler,
             consensus_pool_service,
-            consensus_rewards_service,
             timer_manager,
+            consensus_rewards_service,
             metrics,
         }
     }

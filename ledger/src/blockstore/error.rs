@@ -77,14 +77,16 @@ pub enum BlockstoreError {
     },
     #[error(transparent)]
     ManualPurge(#[from] BlockstoreManualPurgeError),
-    #[error("update parent matches block header for slot {0}")]
+    #[error("Update parent matches block header slot {0}")]
     UpdateParentMatchesBlockHeader(Slot),
-    #[error("update parent slot greater than block header for slot {0}")]
+    #[error("Update parent slot greater than block header slot {0}")]
     UpdateParentSlotGreaterThanBlockHeader(Slot),
-    #[error("unexpected block component")]
+    #[error("Unexpected block component")]
     UnexpectedBlockComponent,
-    #[error("block component mismatch for slot {0}")]
+    #[error("Block component mismatch slot {0}")]
     BlockComponentMismatch(Slot),
+    #[error("Update parent on invalid slot {0}")]
+    UpdateParentOnInvalidSlot(Slot),
 }
 pub type Result<T> = std::result::Result<T, BlockstoreError>;
 

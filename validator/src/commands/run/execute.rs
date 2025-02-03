@@ -18,7 +18,7 @@ use {
     log::*,
     rand::{rng, seq::SliceRandom},
     solana_accounts_db::{
-        accounts_db::{AccountShrinkThreshold, AccountsDbConfig},
+        accounts_db::{AccountShrinkThreshold, AccountsDbConfig, MarkObsoleteAccounts},
         accounts_file::StorageAccess,
         accounts_index::{
             AccountSecondaryIndexes, AccountsIndexConfig, DEFAULT_NUM_ENTRIES_OVERHEAD,
@@ -44,8 +44,9 @@ use {
         system_monitor_service::SystemMonitorService,
         tpu::MAX_VOTES_PER_SECOND,
         validator::{
-            BlockProductionMethod, BlockVerificationMethod, SchedulerPacing, Validator,
-            ValidatorConfig, ValidatorStartProgress, ValidatorTpuConfig, is_snapshot_config_valid,
+            BlockProductionMethod, BlockVerificationMethod, SchedulerPacing, TurbineMode,
+            Validator, ValidatorConfig, ValidatorStartProgress, ValidatorTpuConfig,
+            is_snapshot_config_valid,
         },
     },
     solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
@@ -506,6 +507,12 @@ pub fn execute(
         }
     }
 
+    if bind_addresses.len() > 1 && matches.is_present("use_connection_cache") {
+        Err(String::from(
+            "Connection cache can not be used in a multihoming context",
+        ))?;
+    }
+
     let rpc_bind_address = if matches.is_present("rpc_bind_address") {
         solana_net_utils::parse_host(matches.value_of("rpc_bind_address").unwrap())
             .expect("invalid rpc_bind_address")
@@ -557,9 +564,15 @@ pub fn execute(
     let tower_storage: Arc<dyn tower_storage::TowerStorage> =
         Arc::new(tower_storage::FileTowerStorage::new(tower_path));
 
-    let vote_history_storage: Arc<dyn vote_history_storage::VoteHistoryStorage> = Arc::new(
-        vote_history_storage::FileVoteHistoryStorage::new(ledger_path.clone()),
-    );
+    let vote_history_storage: Arc<dyn vote_history_storage::VoteHistoryStorage> = {
+        let vote_history_path = value_t!(matches, "vote_history_path", PathBuf)
+            .ok()
+            .unwrap_or_else(|| ledger_path.clone());
+
+        Arc::new(vote_history_storage::FileVoteHistoryStorage::new(
+            vote_history_path,
+        ))
+    };
 
     let accounts_index_limit =
         value_t!(matches, "accounts_index_limit", String).unwrap_or_else(|err| err.exit());
@@ -694,6 +707,12 @@ pub fn execute(
             }
         })
         .unwrap_or_default();
+
+    let _mark_obsolete_accounts = if matches.is_present("accounts_db_mark_obsolete_accounts") {
+        MarkObsoleteAccounts::Enabled
+    } else {
+        MarkObsoleteAccounts::Disabled
+    };
 
     let accounts_db_config = AccountsDbConfig {
         index: Some(accounts_index_config),
@@ -857,7 +876,7 @@ pub fn execute(
         tvu_bls_sigverify_threads,
         delay_leader_block_for_pending_fork: matches
             .is_present("delay_leader_block_for_pending_fork"),
-        turbine_disabled: Arc::<AtomicBool>::default(),
+        turbine_mode: TurbineMode::default(),
         broadcast_stage_type: BroadcastStageType::Standard,
         block_verification_method: value_t_or_exit!(
             matches,

@@ -332,6 +332,8 @@ pub fn activate_all_features_alpenglow(genesis_config: &mut GenesisConfig) {
     genesis_config
         .accounts
         .insert(*GENESIS_CERTIFICATE_ACCOUNT, certificate_account);
+
+    // Similarly, also insert an epoch inflation account.
     EpochInflationAccountState::insert_into_genesis_config(genesis_config);
 }
 
@@ -339,7 +341,7 @@ pub fn activate_all_features(genesis_config: &mut GenesisConfig) {
     do_activate_all_features::<false>(genesis_config);
 }
 
-fn do_activate_all_features<const IS_ALPENGLOW: bool>(genesis_config: &mut GenesisConfig) {
+pub fn do_activate_all_features<const IS_ALPENGLOW: bool>(genesis_config: &mut GenesisConfig) {
     // Activate all features at genesis in development mode
     for feature_id in FeatureSet::default().inactive() {
         if IS_ALPENGLOW || *feature_id != agave_feature_set::alpenglow::id() {
