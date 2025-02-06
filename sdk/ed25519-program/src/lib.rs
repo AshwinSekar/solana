@@ -30,6 +30,29 @@ pub struct Ed25519SignatureOffsets {
     message_instruction_index: u16,    // index of instruction data to get message data
 }
 
+/// Convenience function to convert signature offsets into a single ed25519 instruction
+/// The caller can choose to extend the data buffer and write the verification data at
+/// `DATA_START` or store the verification data in a different instruction.
+pub fn offsets_to_ed25519_instruction(offsets: &[Ed25519SignatureOffsets]) -> Instruction {
+    let mut instruction_data = Vec::with_capacity(
+        SIGNATURE_OFFSETS_START
+            .saturating_add(SIGNATURE_OFFSETS_SERIALIZED_SIZE.saturating_mul(offsets.len())),
+    );
+
+    let num_signatures = offsets.len() as u16;
+    instruction_data.extend_from_slice(&num_signatures.to_le_bytes());
+
+    for offsets in offsets {
+        instruction_data.extend_from_slice(bytes_of(offsets));
+    }
+
+    Instruction {
+        program_id: solana_sdk_ids::ed25519_program::id(),
+        accounts: vec![],
+        data: instruction_data,
+    }
+}
+
 pub fn new_ed25519_instruction(keypair: &ed25519_dalek::Keypair, message: &[u8]) -> Instruction {
     let signature = keypair.sign(message).to_bytes();
     let pubkey = keypair.public.to_bytes();
@@ -37,20 +60,9 @@ pub fn new_ed25519_instruction(keypair: &ed25519_dalek::Keypair, message: &[u8])
     assert_eq!(pubkey.len(), PUBKEY_SERIALIZED_SIZE);
     assert_eq!(signature.len(), SIGNATURE_SERIALIZED_SIZE);
 
-    let mut instruction_data = Vec::with_capacity(
-        DATA_START
-            .saturating_add(SIGNATURE_SERIALIZED_SIZE)
-            .saturating_add(PUBKEY_SERIALIZED_SIZE)
-            .saturating_add(message.len()),
-    );
-
-    let num_signatures: u8 = 1;
     let public_key_offset = DATA_START;
     let signature_offset = public_key_offset.saturating_add(PUBKEY_SERIALIZED_SIZE);
     let message_data_offset = signature_offset.saturating_add(SIGNATURE_SERIALIZED_SIZE);
-
-    // add padding byte so that offset structure is aligned
-    instruction_data.extend_from_slice(bytes_of(&[num_signatures, 0]));
 
     let offsets = Ed25519SignatureOffsets {
         signature_offset: signature_offset as u16,
@@ -62,25 +74,72 @@ pub fn new_ed25519_instruction(keypair: &ed25519_dalek::Keypair, message: &[u8])
         message_instruction_index: u16::MAX,
     };
 
-    instruction_data.extend_from_slice(bytes_of(&offsets));
+    let mut instruction = offsets_to_ed25519_instruction(&[offsets]);
 
-    debug_assert_eq!(instruction_data.len(), public_key_offset);
+    debug_assert_eq!(instruction.data.len(), public_key_offset);
 
-    instruction_data.extend_from_slice(&pubkey);
+    instruction.data.extend_from_slice(&pubkey);
 
-    debug_assert_eq!(instruction_data.len(), signature_offset);
+    debug_assert_eq!(instruction.data.len(), signature_offset);
 
-    instruction_data.extend_from_slice(&signature);
+    instruction.data.extend_from_slice(&signature);
 
-    debug_assert_eq!(instruction_data.len(), message_data_offset);
+    debug_assert_eq!(instruction.data.len(), message_data_offset);
 
-    instruction_data.extend_from_slice(message);
+    instruction.data.extend_from_slice(message);
 
-    Instruction {
-        program_id: solana_sdk_ids::ed25519_program::id(),
-        accounts: vec![],
-        data: instruction_data,
+    instruction
+}
+
+/// Creates an ed25519 instruction for verifying multiple messages signed by `keypair`
+/// The verification is stored in the instruction data, so it is up to the caller to check
+/// that the messages will fit within the maximum transaction size.
+pub fn new_multi_ed25519_instruction(
+    keypair: &ed25519_dalek::Keypair,
+    messages: &[&[u8]],
+) -> Instruction {
+    let mut data_start = DATA_START;
+    let (offsets, signature_messages): (Vec<_>, Vec<_>) = messages
+        .iter()
+        .map(|message| {
+            let signature = keypair.sign(message).to_bytes();
+
+            assert_eq!(signature.len(), SIGNATURE_SERIALIZED_SIZE);
+
+            let public_key_offset = data_start;
+            let signature_offset = public_key_offset.saturating_add(PUBKEY_SERIALIZED_SIZE);
+            let message_data_offset = signature_offset.saturating_add(SIGNATURE_SERIALIZED_SIZE);
+            data_start = data_start
+                .saturating_add(PUBKEY_SERIALIZED_SIZE)
+                .saturating_add(SIGNATURE_SERIALIZED_SIZE)
+                .saturating_add(message.len());
+
+            let offsets = Ed25519SignatureOffsets {
+                signature_offset: signature_offset as u16,
+                signature_instruction_index: u16::MAX,
+                public_key_offset: public_key_offset as u16,
+                public_key_instruction_index: u16::MAX,
+                message_data_offset: message_data_offset as u16,
+                message_data_size: message.len() as u16,
+                message_instruction_index: u16::MAX,
+            };
+
+            (offsets, (signature, message))
+        })
+        .unzip();
+
+    let mut instruction = offsets_to_ed25519_instruction(&offsets);
+
+    let pubkey = keypair.public.to_bytes();
+    assert_eq!(pubkey.len(), PUBKEY_SERIALIZED_SIZE);
+
+    for (signature, message) in signature_messages {
+        instruction.data.extend_from_slice(&pubkey);
+        instruction.data.extend_from_slice(&signature);
+        instruction.data.extend_from_slice(message);
     }
+
+    instruction
 }
 
 pub fn verify(
@@ -251,18 +310,13 @@ pub mod test {
         }
     }
 
-    fn test_case(
-        num_signatures: u16,
-        offsets: &Ed25519SignatureOffsets,
-    ) -> Result<(), PrecompileError> {
+    fn test_case(offsets: &[Ed25519SignatureOffsets]) -> Result<(), PrecompileError> {
         assert_eq!(
-            bytemuck::bytes_of(offsets).len(),
+            bytemuck::bytes_of(&offsets[0]).len(),
             SIGNATURE_OFFSETS_SERIALIZED_SIZE
         );
 
-        let mut instruction_data = vec![0u8; DATA_START];
-        instruction_data[0..SIGNATURE_OFFSETS_START].copy_from_slice(bytes_of(&num_signatures));
-        instruction_data[SIGNATURE_OFFSETS_START..DATA_START].copy_from_slice(bytes_of(offsets));
+        let instruction_data = offsets_to_ed25519_instruction(offsets).data;
 
         verify(
             &instruction_data,
@@ -295,7 +349,7 @@ pub mod test {
             ..Ed25519SignatureOffsets::default()
         };
         assert_eq!(
-            test_case(1, &offsets),
+            test_case(&[offsets]),
             Err(PrecompileError::InvalidDataOffsets)
         );
 
@@ -304,7 +358,7 @@ pub mod test {
             ..Ed25519SignatureOffsets::default()
         };
         assert_eq!(
-            test_case(1, &offsets),
+            test_case(&[offsets]),
             Err(PrecompileError::InvalidDataOffsets)
         );
 
@@ -313,7 +367,7 @@ pub mod test {
             ..Ed25519SignatureOffsets::default()
         };
         assert_eq!(
-            test_case(1, &offsets),
+            test_case(&[offsets]),
             Err(PrecompileError::InvalidDataOffsets)
         );
     }
@@ -326,7 +380,7 @@ pub mod test {
             ..Ed25519SignatureOffsets::default()
         };
         assert_eq!(
-            test_case(1, &offsets),
+            test_case(&[offsets]),
             Err(PrecompileError::InvalidSignature)
         );
 
@@ -336,7 +390,7 @@ pub mod test {
             ..Ed25519SignatureOffsets::default()
         };
         assert_eq!(
-            test_case(1, &offsets),
+            test_case(&[offsets]),
             Err(PrecompileError::InvalidDataOffsets)
         );
 
@@ -346,7 +400,7 @@ pub mod test {
             ..Ed25519SignatureOffsets::default()
         };
         assert_eq!(
-            test_case(1, &offsets),
+            test_case(&[offsets]),
             Err(PrecompileError::InvalidDataOffsets)
         );
 
@@ -356,7 +410,7 @@ pub mod test {
             ..Ed25519SignatureOffsets::default()
         };
         assert_eq!(
-            test_case(1, &offsets),
+            test_case(&[offsets]),
             Err(PrecompileError::InvalidDataOffsets)
         );
     }
@@ -368,7 +422,7 @@ pub mod test {
             ..Ed25519SignatureOffsets::default()
         };
         assert_eq!(
-            test_case(1, &offsets),
+            test_case(&[offsets]),
             Err(PrecompileError::InvalidDataOffsets)
         );
 
@@ -377,7 +431,7 @@ pub mod test {
             ..Ed25519SignatureOffsets::default()
         };
         assert_eq!(
-            test_case(1, &offsets),
+            test_case(&[offsets]),
             Err(PrecompileError::InvalidDataOffsets)
         );
     }
@@ -389,7 +443,7 @@ pub mod test {
             ..Ed25519SignatureOffsets::default()
         };
         assert_eq!(
-            test_case(1, &offsets),
+            test_case(&[offsets]),
             Err(PrecompileError::InvalidDataOffsets)
         );
 
@@ -398,7 +452,7 @@ pub mod test {
             ..Ed25519SignatureOffsets::default()
         };
         assert_eq!(
-            test_case(1, &offsets),
+            test_case(&[offsets]),
             Err(PrecompileError::InvalidDataOffsets)
         );
     }
@@ -410,6 +464,43 @@ pub mod test {
         let privkey = ed25519_dalek::Keypair::generate(&mut thread_rng());
         let message_arr = b"hello";
         let mut instruction = new_ed25519_instruction(&privkey, message_arr);
+        let mint_keypair = Keypair::new();
+        let feature_set = FeatureSet::all_enabled();
+
+        let tx = Transaction::new_signed_with_payer(
+            &[instruction.clone()],
+            Some(&mint_keypair.pubkey()),
+            &[&mint_keypair],
+            Hash::default(),
+        );
+
+        assert!(tx.verify_precompiles(&feature_set).is_ok());
+
+        let index = loop {
+            let index = thread_rng().gen_range(0, instruction.data.len());
+            // byte 1 is not used, so this would not cause the verify to fail
+            if index != 1 {
+                break index;
+            }
+        };
+
+        instruction.data[index] = instruction.data[index].wrapping_add(12);
+        let tx = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&mint_keypair.pubkey()),
+            &[&mint_keypair],
+            Hash::default(),
+        );
+        assert!(tx.verify_precompiles(&feature_set).is_err());
+    }
+
+    #[test]
+    fn test_multi_ed25519() {
+        solana_logger::setup();
+
+        let privkey = ed25519_dalek::Keypair::generate(&mut thread_rng());
+        let messages : [&[u8]; 3] = [b"hello", b"IBRL", b"goodbye"];
+        let mut instruction = new_multi_ed25519_instruction(&privkey, &messages);
         let mint_keypair = Keypair::new();
         let feature_set = FeatureSet::all_enabled();
 
