@@ -50,6 +50,7 @@ use {
             Bound::{Included, Unbounded},
             Deref,
         },
+        sync::atomic::Ordering::Relaxed,
     },
     thiserror::Error,
 };
@@ -395,6 +396,10 @@ impl Tower {
         let mut vote_slots = HashSet::new();
         let mut voted_stakes = HashMap::new();
         let mut total_stake = 0;
+
+        if solana_runtime::bank::FF.load(Relaxed) {
+            println!("ff enabled");
+        }
 
         // Tree of intervals of lockouts of the form [slot, slot + slot.lockout],
         // keyed by end of the range

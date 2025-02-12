@@ -183,7 +183,7 @@ use {
         sync::{
             atomic::{
                 AtomicBool, AtomicI64, AtomicU64, AtomicUsize,
-                Ordering::{AcqRel, Acquire, Relaxed},
+                Ordering::{self, AcqRel, Acquire, Relaxed},
             },
             Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
         },
@@ -204,6 +204,8 @@ use {
     solana_sdk::nonce,
     solana_svm::program_loader::load_program_with_pubkey,
 };
+
+pub static FF: AtomicBool = AtomicBool::new(false);
 
 /// params to `verify_accounts_hash`
 struct VerifyAccountsHashConfig {
@@ -6539,6 +6541,10 @@ impl Bank {
                 block_cost_limit,
                 vote_cost_limit,
             );
+        }
+
+        if new_feature_activations.contains(&feature_set::drop_unchained_merkle_shreds::id()) {
+            FF.swap(true, Ordering::SeqCst);
         }
     }
 
