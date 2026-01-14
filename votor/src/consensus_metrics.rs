@@ -13,7 +13,7 @@ use {
             atomic::{AtomicBool, Ordering},
             Arc,
         },
-        thread::Builder,
+        thread::{Builder, JoinHandle},
         time::{Duration, Instant},
     },
 };
@@ -151,14 +151,14 @@ impl ConsensusMetrics {
         epoch: Epoch,
         receiver: ConsensusMetricsEventReceiver,
         exit: Arc<AtomicBool>,
-    ) {
+    ) -> JoinHandle<()> {
         Builder::new()
-            .name("consensus-metrics".into())
+            .name("solConsMetrics".into())
             .spawn(move || {
                 let mut metrics = Self::new(epoch, receiver);
                 metrics.run(exit);
             })
-            .expect("Failed to start consensus metrics thread");
+            .expect("Failed to start consensus metrics thread")
     }
 
     fn run(&mut self, exit: Arc<AtomicBool>) {

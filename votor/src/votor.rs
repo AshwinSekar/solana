@@ -77,7 +77,7 @@ use {
     std::{
         collections::HashMap,
         sync::{atomic::AtomicBool, Arc, RwLock},
-        thread,
+        thread::{self, JoinHandle},
         time::Duration,
     },
 };
@@ -134,6 +134,7 @@ pub struct Votor {
     event_handler: EventHandler,
     consensus_pool_service: ConsensusPoolService,
     timer_manager: Arc<PlRwLock<TimerManager>>,
+    metrics: JoinHandle<()>,
 }
 
 impl Votor {
@@ -237,7 +238,11 @@ impl Votor {
             commitment_sender,
         };
 
-        ConsensusMetrics::start_metrics_loop(root_epoch, consensus_metrics_receiver, exit.clone());
+        let metrics = ConsensusMetrics::start_metrics_loop(
+            root_epoch,
+            consensus_metrics_receiver,
+            exit.clone(),
+        );
         let event_handler = EventHandler::new(event_handler_context);
         let consensus_pool_service = ConsensusPoolService::new(consensus_pool_context);
 
@@ -245,6 +250,7 @@ impl Votor {
             event_handler,
             consensus_pool_service,
             timer_manager,
+            metrics,
         }
     }
 
@@ -265,6 +271,7 @@ impl Votor {
                 }
             }
         }
+        self.metrics.join()?;
         self.event_handler.join()
     }
 }

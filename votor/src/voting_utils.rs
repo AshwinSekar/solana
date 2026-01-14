@@ -128,7 +128,7 @@ pub struct VotingContext {
     pub consensus_metrics_sender: ConsensusMetricsEventSender,
 }
 
-fn get_bls_keypair(
+fn get_or_insert_bls_keypair(
     derived_bls_keypairs: &mut HashMap<Pubkey, Arc<BLSKeypair>>,
     authorized_voter_keypair: &Arc<Keypair>,
 ) -> Result<Arc<BLSKeypair>, BlsError> {
@@ -214,7 +214,7 @@ fn generate_vote_tx(
         authorized_voter_keypair = keypair.clone();
     }
 
-    let bls_keypair = get_bls_keypair(derived_bls_keypairs, &authorized_voter_keypair)
+    let bls_keypair = get_or_insert_bls_keypair(derived_bls_keypairs, &authorized_voter_keypair)
         .unwrap_or_else(|e| panic!("Failed to derive my own BLS keypair: {e:?}"));
     let my_bls_pubkey: BLSPubkey = bls_keypair.public;
     if my_bls_pubkey != bls_pubkey_in_vote_account {
