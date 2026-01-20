@@ -865,7 +865,7 @@ impl Validator {
         timer.stop();
         info!("Cleaning orphaned account snapshot directories done. {timer}");
 
-        // token used to cancel tpu-client-next and streamer.
+        // token used to cancel tpu-client-next, streamer and BLS streamer.
         let cancel = CancellationToken::new();
         {
             let exit = exit.clone();
@@ -1247,6 +1247,11 @@ impl Validator {
             )),
             Some((&staked_nodes, &identity_keypair.pubkey())),
         ));
+        let key_notifiers = Arc::new(RwLock::new(KeyUpdaters::default()));
+        key_notifiers.write().unwrap().add(
+            KeyUpdaterType::BlsConnectionCache,
+            bls_connection_cache.clone(),
+        );
 
         // test-validator crate may start the validator in a tokio runtime
         // context which forces us to use the same runtime because a nested
@@ -1635,7 +1640,6 @@ impl Validator {
             None
         };
 
-        let key_notifiers = Arc::new(RwLock::new(KeyUpdaters::default()));
         let tvu = Tvu::new(
             vote_account,
             authorized_voter_keypairs,
@@ -1707,6 +1711,7 @@ impl Validator {
             votor_event_sender.clone(),
             votor_event_receiver,
             staked_nodes.clone(),
+            cancel.clone(),
             key_notifiers.clone(),
         )
         .map_err(ValidatorError::Other)?;

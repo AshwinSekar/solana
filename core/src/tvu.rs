@@ -60,10 +60,7 @@ use {
     solana_streamer::{
         evicting_sender::EvictingSender,
         nonblocking::simple_qos::SimpleQosConfig,
-        quic::{
-            spawn_simple_qos_server, QuicStreamerConfig, SpawnServerResult,
-            DEFAULT_MAX_STREAMS_PER_MS,
-        },
+        quic::{spawn_simple_qos_server, QuicStreamerConfig, SpawnServerResult},
         streamer::StakedNodes,
     },
     solana_turbine::{retransmit_stage::RetransmitStage, xdp::XdpSender},
@@ -71,12 +68,8 @@ use {
         collections::HashSet,
         net::{SocketAddr, UdpSocket},
         num::NonZeroUsize,
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc, RwLock,
-        },
+        sync::{atomic::AtomicBool, Arc, RwLock},
         thread::{self, JoinHandle},
-        time::Duration,
     },
     tokio::sync::mpsc::Sender as AsyncSender,
     tokio_util::sync::CancellationToken,
@@ -215,6 +208,7 @@ impl Tvu {
         votor_event_sender: VotorEventSender,
         votor_event_receiver: VotorEventReceiver,
         staked_nodes: Arc<RwLock<StakedNodes>>,
+        cancel: CancellationToken,
         key_notifiers: Arc<RwLock<KeyUpdaters>>,
     ) -> Result<Self, String> {
         let in_wen_restart = wen_restart_repair_slots.is_some();
@@ -245,27 +239,15 @@ impl Tvu {
                 thread: bls_streamer_t,
                 key_updater: bls_key_updater,
             } = {
-                // 8 connections per min from an IP, 1 thread is enough
+                // quic server params, 8 connections per min from an IP, num_threads 1
                 let quic_server_params = QuicStreamerConfig::default();
                 let qos_config = SimpleQosConfig {
-                    max_streams_per_second: DEFAULT_MAX_STREAMS_PER_MS,
+                    max_streams_per_second: 30,
                     // Cap by # of active validators (some overhead for epoch boundaries)
                     max_staked_connections: MAX_ALPENGLOW_VOTE_ACCOUNTS * 2,
-                    // One staked connection per validator
-                    max_connections_per_peer: 1,
+                    // Two staked connection per validator to account for hotspares
+                    max_connections_per_peer: 2,
                 };
-                let cancel = CancellationToken::new();
-                thread::spawn({
-                    let cancel = cancel.clone();
-                    let exit = exit.clone();
-                    move || loop {
-                        if exit.load(Ordering::Relaxed) {
-                            cancel.cancel();
-                            break;
-                        }
-                        thread::sleep(Duration::from_secs(5));
-                    }
-                });
                 spawn_simple_qos_server(
                     "solQuicBLS",
                     "quic_streamer_bls",
@@ -283,6 +265,7 @@ impl Tvu {
             // sigverifier
             let banks = bank_forks.read().unwrap().sharable_banks();
             let bls_sigverify_t = bls_sigverifier::spawn_service(
+                exit.clone(),
                 bls_packet_receiver,
                 banks,
                 verified_voter_slots_sender,
@@ -627,7 +610,10 @@ pub mod tests {
         solana_runtime::bank::Bank,
         solana_signer::Signer,
         solana_tpu_client::tpu_client::{DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC},
-        std::sync::atomic::{AtomicU64, Ordering},
+        std::{
+            sync::atomic::{AtomicU64, Ordering},
+            time::Duration,
+        },
     };
 
     fn test_tvu_exit(enable_wen_restart: bool) {
@@ -708,6 +694,18 @@ pub mod tests {
             unbounded();
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
         let key_notifiers = Arc::new(RwLock::new(KeyUpdaters::default()));
+        let cancel = CancellationToken::new();
+        thread::spawn({
+            let cancel = cancel.clone();
+            let exit = exit.clone();
+            move || loop {
+                if exit.load(Ordering::Relaxed) {
+                    cancel.cancel();
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
 
         let tvu = Tvu::new(
             &vote_keypair.pubkey(),
@@ -776,6 +774,7 @@ pub mod tests {
             votor_event_sender,
             votor_event_receiver,
             staked_nodes,
+            cancel,
             key_notifiers,
         )
         .expect("assume success");

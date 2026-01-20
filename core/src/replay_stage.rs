@@ -1346,7 +1346,9 @@ impl ReplayStage {
                         select_forks_time.as_us(),
                         compute_slot_stats_time.as_us(),
                         heaviest_fork_failures_time.as_us(),
-                        u64::from(did_complete_bank),
+                        u64::try_from(new_frozen_slots.len()).expect(
+                            "something is very wrong, froze more than u64::MAX banks at once",
+                        ),
                         process_ancestor_hashes_duplicate_slots_time.as_us(),
                         process_duplicate_confirmed_slots_time.as_us(),
                         process_unfrozen_gossip_verified_vote_hashes_time.as_us(),
@@ -1417,9 +1419,9 @@ impl ReplayStage {
         let genesis_block @ (genesis_slot, block_id) = migration_status
             .genesis_block()
             .expect("Must be ready to enable");
-        warn!(
-            "{my_pubkey}: Alpenglow genesis vote has succeeded enabling alpenglow. Genesis block \
-             {genesis_block:?}"
+        info!(
+            "{my_pubkey} Alpenglow migration: Alpenglow genesis vote has succeeded enabling \
+             alpenglow. Genesis block {genesis_block:?}"
         );
 
         let genesis_bank = bank_forks.read().unwrap().get(genesis_slot).expect(
@@ -1460,7 +1462,7 @@ impl ReplayStage {
             .filter_map(|(slot, _)| (*slot > genesis_slot).then_some(*slot))
             .collect();
         for slot in slots_to_purge.into_iter() {
-            warn!("{my_pubkey}: Purging poh block in slot {slot}");
+            info!("{my_pubkey} Alpenglow migration: Purging poh block in slot {slot}");
             Self::purge_unconfirmed_slot(
                 slot,
                 ancestors,
@@ -1472,14 +1474,17 @@ impl ReplayStage {
             );
         }
 
-        // Purge any partial shreds greater than the genesis slot
+        // Purge any partial slots greater than the genesis slot
         let start_slot = genesis_slot + 1;
         let end_slot = blockstore
             .highest_slot()
             .unwrap()
             .expect("Highest slot must be present as blockstore is non-empty");
         if end_slot >= start_slot {
-            warn!("{my_pubkey}: Purging shreds {start_slot} to {end_slot} from blockstore");
+            info!(
+                "{my_pubkey} Alpenglow migration: Purging shreds {start_slot} to {end_slot} from \
+                 blockstore"
+            );
             blockstore.clear_unconfirmed_slots(start_slot, end_slot);
         }
 
@@ -1492,7 +1497,7 @@ impl ReplayStage {
         );
     }
 
-    /// If we have an eligble genesis block, send out a genesis vote
+    /// If we have an eligible genesis block, send out a genesis vote
     /// Returns false if no eligible block was found
     fn maybe_send_genesis_vote(
         migration_status: &MigrationStatus,
@@ -1521,7 +1526,7 @@ impl ReplayStage {
             GenerateVoteTxResult::ConsensusMessage(message) => {
                 // Send vote to ConsensusPool and rest of cluster
                 warn!(
-                    "{}: Casting genesis vote for ({slot}, {block_id})",
+                    "{} Alpenglow migration: Casting genesis vote for ({slot}, {block_id})",
                     identity_keypair.pubkey()
                 );
                 // If sending fails that means the channel is disconnected and we are shutting down
@@ -1537,7 +1542,8 @@ impl ReplayStage {
             }
             e => {
                 warn!(
-                    "{}: Unable to send genesis vote for {slot} {block_id}: {e:?}",
+                    "{} Alpenglow migration: Unable to send genesis vote for {slot} {block_id}: \
+                     {e:?}",
                     identity_keypair.pubkey()
                 );
             }

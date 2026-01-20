@@ -6,22 +6,22 @@ use {
     },
     crossbeam_channel::{Receiver, Sender, TrySendError},
     solana_clock::Slot,
-    solana_perf::{
-        deduper::{dedup_packets_and_count_discards, Deduper},
-        packet::PacketBatch,
-    },
+    solana_perf::packet::PacketBatch,
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::SharableBanks},
     solana_streamer::streamer,
     std::{
         collections::HashMap,
-        sync::Arc,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
         thread::{self, Builder},
-        time::Duration,
     },
 };
 
 pub fn spawn_service(
+    exit: Arc<AtomicBool>,
     packet_receiver: Receiver<PacketBatch>,
     banks: SharableBanks,
     vote_sender: VerifiedVoterSlotsSender,
@@ -32,7 +32,7 @@ pub fn spawn_service(
 
     Builder::new()
         .name("solSigVerBLS".to_string())
-        .spawn(move || verifier.run(packet_receiver))
+        .spawn(move || verifier.run(exit, packet_receiver))
         .unwrap()
 }
 
@@ -60,19 +60,11 @@ impl BLSSigVerifier {
         }
     }
 
-    fn run(mut self, receiver: Receiver<PacketBatch>) {
-        const DEDUPER_NUM_BITS: u64 = 63_999_979;
-        const DEDUPER_RESET_INTERVAL: Duration = Duration::from_secs(2);
-
-        let mut rng = rand::rng();
-        let mut deduper = Deduper::<2, [u8]>::new(&mut rng, DEDUPER_NUM_BITS);
-
-        loop {
-            deduper.maybe_reset(&mut rng, 0.001, DEDUPER_RESET_INTERVAL);
-
+    fn run(mut self, exit: Arc<AtomicBool>, receiver: Receiver<PacketBatch>) {
+        info!("BLSSigverifier starting");
+        while !exit.load(Ordering::Relaxed) {
             match streamer::recv_packet_batches(&receiver) {
-                Ok((mut batches, _, _)) => {
-                    dedup_packets_and_count_discards(&deduper, &mut batches);
+                Ok((batches, _, _)) => {
                     if self.process_batches(batches).is_err() {
                         break;
                     }
@@ -86,6 +78,7 @@ impl BLSSigVerifier {
                 Err(_) => continue,
             }
         }
+        info!("BLSSigverifier shutting down");
     }
 
     /// Extract votes and certs from the packet batch, verify and send the results

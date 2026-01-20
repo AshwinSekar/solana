@@ -1641,6 +1641,7 @@ mod tests {
                     KeyUpdaterType::Forward,
                     KeyUpdaterType::RpcService,
                     KeyUpdaterType::Bls,
+                    KeyUpdaterType::BlsConnectionCache,
                 ])
             );
             let mut io = MetaIoHandler::default();
