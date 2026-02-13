@@ -54,6 +54,64 @@ use {
     },
 };
 
+// Environment variable to enable parallel tracking of optimistic confirmation with and without
+// intermediate vote accumulation. When enabled, a second VoteTracker tracks only last vote slots
+// (no intermediate accumulation) to compare timing differences. This helps measure the impact
+// of removing the intermediate vote accumulation pathway.
+static ENABLE_PARALLEL_OC_TRACKING: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("SOLANA_ENABLE_PARALLEL_OC_TRACKING")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+});
+
+// Secondary vote tracker that only tracks last vote slots (no intermediate accumulation).
+// Used for comparing optimistic confirmation timing with vs without intermediate accumulation.
+static NO_INTERMEDIATE_VOTE_TRACKER: std::sync::LazyLock<VoteTracker> =
+    std::sync::LazyLock::new(VoteTracker::default);
+
+// Tracks when each slot reaches OC in both trackers to calculate timing difference.
+// Maps slot -> (with_intermediate_timestamp, no_intermediate_timestamp)
+static OC_TIMING_TRACKER: std::sync::LazyLock<std::sync::Mutex<HashMap<Slot, OcTimingEntry>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[derive(Default)]
+struct OcTimingEntry {
+    with_intermediate: Option<Instant>,
+    no_intermediate: Option<Instant>,
+}
+
+impl OcTimingEntry {
+    fn record_with_intermediate(&mut self) {
+        if self.with_intermediate.is_none() {
+            self.with_intermediate = Some(Instant::now());
+        }
+    }
+
+    fn record_no_intermediate(&mut self) {
+        if self.no_intermediate.is_none() {
+            self.no_intermediate = Some(Instant::now());
+        }
+    }
+
+    /// Returns the time difference in microseconds if both timestamps are recorded.
+    /// Positive means with_intermediate was faster (reached OC first).
+    /// Negative means no_intermediate was faster.
+    fn time_diff_us(&self) -> Option<i64> {
+        match (self.with_intermediate, self.no_intermediate) {
+            (Some(with), Some(without)) => {
+                if with <= without {
+                    // with_intermediate reached OC first (or same time)
+                    Some(without.duration_since(with).as_micros() as i64)
+                } else {
+                    // no_intermediate reached OC first (shouldn't happen normally)
+                    Some(-(with.duration_since(without).as_micros() as i64))
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
 // Map from a vote account to the authorized voter for an epoch
 pub type ThresholdConfirmedSlots = Vec<(Slot, Hash)>;
 pub type VerifiedVoteTransactionsSender = Sender<Vec<Transaction>>;
@@ -355,6 +413,16 @@ impl ClusterInfoVoteListener {
                     &unrooted_optimistic_slots,
                 );
                 vote_tracker.progress_with_new_root_bank(&root_bank);
+                // Also cleanup the secondary tracker and timing tracker used for parallel OC comparison
+                if *ENABLE_PARALLEL_OC_TRACKING {
+                    NO_INTERMEDIATE_VOTE_TRACKER.progress_with_new_root_bank(&root_bank);
+                    // Clean up old timing entries for slots that are now rooted
+                    let root_slot = root_bank.slot();
+                    OC_TIMING_TRACKER
+                        .lock()
+                        .unwrap()
+                        .retain(|slot, _| *slot > root_slot);
+                }
                 last_process_root = Instant::now();
             }
             let confirmed_slots = Self::listen_and_confirm_votes(
@@ -545,6 +613,40 @@ impl ClusterInfoVoteListener {
                     total_stake,
                 );
 
+                // Parallel tracking: also track in secondary tracker that only accumulates
+                // last vote slots (no intermediate slots). This allows comparing OC timing.
+                let is_last_vote_slot = slot == last_vote_slot;
+                if *ENABLE_PARALLEL_OC_TRACKING && is_last_vote_slot {
+                    let (no_intermediate_reached, _) = Self::track_optimistic_confirmation_vote(
+                        &NO_INTERMEDIATE_VOTE_TRACKER,
+                        slot,
+                        hash,
+                        *vote_pubkey,
+                        stake,
+                        total_stake,
+                    );
+                    // Record timestamp when no-intermediate tracker reaches OC threshold
+                    if no_intermediate_reached[1] {
+                        info!(
+                            "NO_INTERMEDIATE_OC: slot {slot} reached optimistic confirmation \
+                             (last_vote_slot only, no intermediate accumulation)"
+                        );
+                        let mut timing_tracker = OC_TIMING_TRACKER.lock().unwrap();
+                        let entry = timing_tracker.entry(slot).or_default();
+                        entry.record_no_intermediate();
+                        // Check if we can emit timing metric
+                        if let Some(diff_us) = entry.time_diff_us() {
+                            datapoint_info!(
+                                "optimistic_confirmation_timing",
+                                ("slot", slot, i64),
+                                ("intermediate_advantage_us", diff_us, i64),
+                            );
+                            // Remove entry after emitting metric
+                            timing_tracker.remove(&slot);
+                        }
+                    }
+                }
+
                 if is_gossip_vote && is_new && stake > 0 {
                     let _ = gossip_verified_vote_hash_sender.send((*vote_pubkey, slot, hash));
                 }
@@ -556,6 +658,26 @@ impl ClusterInfoVoteListener {
                 }
                 if reached_threshold_results[1] {
                     new_optimistic_confirmed_slots.push((slot, hash));
+                    // Record timestamp when main tracker reaches OC threshold
+                    if *ENABLE_PARALLEL_OC_TRACKING {
+                        info!(
+                            "WITH_INTERMEDIATE_OC: slot {slot} reached optimistic confirmation \
+                             (is_last_vote_slot={is_last_vote_slot}, with intermediate accumulation)"
+                        );
+                        let mut timing_tracker = OC_TIMING_TRACKER.lock().unwrap();
+                        let entry = timing_tracker.entry(slot).or_default();
+                        entry.record_with_intermediate();
+                        // Check if we can emit timing metric
+                        if let Some(diff_us) = entry.time_diff_us() {
+                            datapoint_info!(
+                                "optimistic_confirmation_timing",
+                                ("slot", slot, i64),
+                                ("intermediate_advantage_us", diff_us, i64),
+                            );
+                            // Remove entry after emitting metric
+                            timing_tracker.remove(&slot);
+                        }
+                    }
                     // Notify subscribers about new optimistic confirmation
                     if let Some(sender) = bank_notification_sender {
                         if migration_status.should_report_commitment_or_root(slot) {
