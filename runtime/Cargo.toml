@@ -160,6 +160,7 @@ solana-secp256k1-program = { workspace = true }
 solana-seed-derivable = { workspace = true }
 solana-serde = { workspace = true }
 solana-sha256-hasher = { workspace = true }
+solana-short-vec = { workspace = true }
 solana-signature = { workspace = true }
 solana-signer = { workspace = true }
 solana-slot-hashes = { workspace = true }

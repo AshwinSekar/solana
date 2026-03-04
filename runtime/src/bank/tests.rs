@@ -9228,6 +9228,52 @@ fn test_verify_transactions_packet_data_size() {
     }
 }
 
+#[test]
+fn test_serialized_transaction_size_matches_bincode() {
+    let recent_blockhash = Hash::new_unique();
+    let keypair = Keypair::new();
+    let mut tx: VersionedTransaction =
+        system_transaction::transfer(&keypair, &Pubkey::new_unique(), 1, recent_blockhash).into();
+
+    for num_sigs in [
+        0usize,
+        1,
+        2,
+        127,
+        128,
+        255,
+        256,
+        1024,
+        usize::from(u16::MAX),
+    ] {
+        tx.signatures = vec![Signature::default(); num_sigs];
+        let message_bytes = tx.message.serialize();
+        assert_eq!(
+            serialized_transaction_size(tx.signatures.len(), &message_bytes).unwrap(),
+            bincode::serialized_size(&tx).unwrap(),
+            "serialized size mismatch for num_sigs={num_sigs}",
+        );
+    }
+}
+
+#[test]
+fn test_serialized_transaction_size_max_signatures() {
+    let recent_blockhash = Hash::new_unique();
+    let keypair = Keypair::new();
+    let mut tx: VersionedTransaction =
+        system_transaction::transfer(&keypair, &Pubkey::new_unique(), 1, recent_blockhash).into();
+
+    let num_sigs = usize::from(u16::MAX).saturating_add(1);
+    tx.signatures = vec![Signature::default(); num_sigs];
+    let message_bytes = tx.message.serialize();
+
+    assert!(bincode::serialized_size(&tx).is_err());
+    assert_matches!(
+        serialized_transaction_size(tx.signatures.len(), &message_bytes),
+        Err(TransactionError::SanitizeFailure)
+    );
+}
+
 #[test_case(false; "pre_simd160_static_instruction_limit")]
 #[test_case(true; "simd160_static_instruction_limit")]
 fn test_verify_transactions_instruction_limit(simd_0160_enabled: bool) {

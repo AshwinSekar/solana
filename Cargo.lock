@@ -10270,6 +10270,7 @@ dependencies = [
  "solana-seed-derivable",
  "solana-serde",
  "solana-sha256-hasher",
+ "solana-short-vec",
  "solana-signature",
  "solana-signer",
  "solana-signer-store",
