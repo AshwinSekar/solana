@@ -197,9 +197,53 @@ impl VoteProcessingTiming {
     }
 }
 
-struct BufferedVote {
-    parsed_vote: Option<ParsedVote>,
-    sigverified: bool,
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
+enum BufferedVote {
+    Executed(ParsedVote),
+    Verified,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum ReplayVoteAction {
+    Executed(ParsedVote),
+    Verified,
+}
+
+impl From<ReplayVoteAction> for BufferedVote {
+    fn from(action: ReplayVoteAction) -> Self {
+        match action {
+            ReplayVoteAction::Executed(parsed_vote) => Self::Executed(parsed_vote),
+            ReplayVoteAction::Verified => Self::Verified,
+        }
+    }
+}
+
+impl BufferedVote {
+    fn apply(
+        self,
+        action: ReplayVoteAction,
+        ready_votes: &mut Vec<ParsedVote>,
+        replay_bank_id: BankId,
+        signature: Signature,
+    ) -> Option<Self> {
+        match (self, action) {
+            (Self::Executed(parsed_vote), ReplayVoteAction::Verified)
+            | (Self::Verified, ReplayVoteAction::Executed(parsed_vote)) => {
+                ready_votes.push(parsed_vote);
+                None
+            }
+            (Self::Verified, ReplayVoteAction::Verified) => Some(Self::Verified),
+            (Self::Executed(parsed_vote), ReplayVoteAction::Executed(_)) => {
+                debug_assert!(
+                    false,
+                    "duplicate Executed replay vote for same bank {replay_bank_id} signature \
+                     {signature}"
+                );
+                Some(Self::Executed(parsed_vote))
+            }
+        }
+    }
 }
 
 enum BankVoteBuffer {
@@ -240,6 +284,7 @@ impl VoteBuffer {
         for replay_vote in replay_votes {
             match replay_vote {
                 ReplayVoteMessage::VerifiedExecuted(parsed_vote) => ready_votes.push(parsed_vote),
+
                 ReplayVoteMessage::Executed {
                     replay_bank_id,
                     replay_slot,
@@ -248,65 +293,38 @@ impl VoteBuffer {
                     let signature = parsed_vote.3;
                     match self.bank_votes.entry(replay_bank_id) {
                         Entry::Vacant(entry) => {
-                            let mut votes = HashMap::new();
-                            votes.insert(
-                                signature,
-                                BufferedVote {
-                                    parsed_vote: Some(parsed_vote),
-                                    sigverified: false,
-                                },
-                            );
                             entry.insert(BankVoteBuffer::Active {
                                 slot: replay_slot,
-                                votes,
+                                votes: HashMap::from([(
+                                    signature,
+                                    BufferedVote::Executed(parsed_vote),
+                                )]),
                             });
                         }
                         Entry::Occupied(mut entry) => {
-                            let should_remove = {
-                                let (stored_replay_slot, votes) = match entry.get_mut() {
-                                    BankVoteBuffer::Active {
-                                        slot: stored_replay_slot,
-                                        votes,
-                                    } => (stored_replay_slot, votes),
-                                    BankVoteBuffer::Invalid { .. } => {
-                                        // the bank is invalid skip any votes for it
-                                        continue;
-                                    }
-                                };
-                                debug_assert_eq!(*stored_replay_slot, replay_slot);
-                                match votes.entry(signature) {
-                                    Entry::Vacant(vote_entry) => {
-                                        vote_entry.insert(BufferedVote {
-                                            parsed_vote: Some(parsed_vote),
-                                            sigverified: false,
-                                        });
-                                        false
-                                    }
-                                    Entry::Occupied(mut vote_entry) => {
-                                        let vote_state = vote_entry.get_mut();
-                                        debug_assert!(
-                                            vote_state.parsed_vote.is_none(),
-                                            "duplicate Executed replay vote for same bank \
-                                             {replay_bank_id} signature {signature}"
-                                        );
-                                        if vote_state.sigverified {
-                                            debug_assert!(vote_state.parsed_vote.is_none());
-                                            vote_entry.remove();
-                                            ready_votes.push(parsed_vote);
-                                            votes.is_empty()
-                                        } else {
-                                            vote_state.parsed_vote = Some(parsed_vote);
-                                            false
-                                        }
-                                    }
-                                }
+                            let BankVoteBuffer::Active {
+                                slot: stored_replay_slot,
+                                votes,
+                            } = entry.get_mut()
+                            else {
+                                // Skip votes for invalid banks
+                                continue;
                             };
-                            if should_remove {
+                            debug_assert_eq!(*stored_replay_slot, replay_slot);
+                            Self::apply_action_for_signature(
+                                votes,
+                                signature,
+                                ReplayVoteAction::Executed(parsed_vote),
+                                &mut ready_votes,
+                                replay_bank_id,
+                            );
+                            if votes.is_empty() {
                                 entry.remove();
                             }
                         }
                     }
                 }
+
                 ReplayVoteMessage::Verified {
                     replay_bank_id,
                     replay_slot,
@@ -323,52 +341,30 @@ impl VoteBuffer {
                                 slot: replay_slot,
                                 votes: verified_signatures
                                     .into_iter()
-                                    .map(|signature| {
-                                        (
-                                            signature,
-                                            BufferedVote {
-                                                parsed_vote: None,
-                                                sigverified: true,
-                                            },
-                                        )
-                                    })
+                                    .map(|signature| (signature, BufferedVote::Verified))
                                     .collect(),
                             });
                         }
                         Entry::Occupied(mut entry) => {
-                            let should_remove = {
-                                let BankVoteBuffer::Active {
-                                    slot: stored_replay_slot,
-                                    votes,
-                                } = entry.get_mut()
-                                else {
-                                    continue;
-                                };
-                                debug_assert_eq!(*stored_replay_slot, replay_slot);
-                                for signature in verified_signatures {
-                                    match votes.entry(signature) {
-                                        Entry::Vacant(vote_entry) => {
-                                            vote_entry.insert(BufferedVote {
-                                                parsed_vote: None,
-                                                sigverified: true,
-                                            });
-                                        }
-                                        Entry::Occupied(mut vote_entry) => {
-                                            let vote_state = vote_entry.get_mut();
-                                            if let Some(parsed_vote) = vote_state.parsed_vote.take()
-                                            {
-                                                ready_votes.push(parsed_vote);
-                                                vote_entry.remove();
-                                            } else {
-                                                // the same signature can be verified multiple times
-                                                vote_state.sigverified = true;
-                                            }
-                                        }
-                                    }
-                                }
-                                votes.is_empty()
+                            let BankVoteBuffer::Active {
+                                slot: stored_replay_slot,
+                                votes,
+                            } = entry.get_mut()
+                            else {
+                                // Skip votes for invalid banks
+                                continue;
                             };
-                            if should_remove {
+                            debug_assert_eq!(*stored_replay_slot, replay_slot);
+                            for signature in verified_signatures.into_iter() {
+                                Self::apply_action_for_signature(
+                                    votes,
+                                    signature,
+                                    ReplayVoteAction::Verified,
+                                    &mut ready_votes,
+                                    replay_bank_id,
+                                );
+                            }
+                            if votes.is_empty() {
                                 entry.remove();
                             }
                         }
@@ -390,6 +386,28 @@ impl VoteBuffer {
         }
 
         ready_votes
+    }
+
+    fn apply_action_for_signature(
+        votes: &mut HashMap<Signature, BufferedVote>,
+        signature: Signature,
+        action: ReplayVoteAction,
+        ready_votes: &mut Vec<ParsedVote>,
+        replay_bank_id: BankId,
+    ) {
+        match votes.entry(signature) {
+            Entry::Vacant(entry) => {
+                entry.insert(action.into());
+            }
+            Entry::Occupied(entry) => {
+                let (_signature, current_state) = entry.remove_entry();
+                if let Some(next_state) =
+                    current_state.apply(action, ready_votes, replay_bank_id, signature)
+                {
+                    votes.insert(signature, next_state);
+                }
+            }
+        }
     }
 
     fn prune_stale_slots(&mut self, root_slot: Slot) {
@@ -1697,6 +1715,74 @@ mod tests {
                 slot: invalid_slot
             }) if *invalid_slot == replay_slot
         ));
+    }
+
+    #[test]
+    fn test_replay_vote_buffer_bank_complete_clears_pending_state() {
+        let replay_bank_id = 5;
+        let replay_slot = 123;
+        let parsed_vote = sample_parsed_vote(replay_slot);
+        let mut replay_vote_buffer = VoteBuffer::new();
+
+        let ready_votes = replay_vote_buffer.receive_and_collect_ready_votes(
+            vec![ReplayVoteMessage::Executed {
+                replay_bank_id,
+                replay_slot,
+                parsed_vote,
+            }]
+            .into_iter(),
+        );
+        assert!(ready_votes.is_empty());
+        assert_eq!(replay_vote_buffer.bank_votes.len(), 1);
+        assert!(matches!(
+            replay_vote_buffer.bank_votes.get(&replay_bank_id),
+            Some(BankVoteBuffer::Active { .. })
+        ));
+
+        let ready_votes = replay_vote_buffer.receive_and_collect_ready_votes(
+            vec![ReplayVoteMessage::BankComplete {
+                replay_bank_id,
+                replay_slot,
+            }]
+            .into_iter(),
+        );
+        assert!(ready_votes.is_empty());
+        assert!(replay_vote_buffer.bank_votes.is_empty());
+    }
+
+    #[test]
+    fn test_replay_vote_buffer_processes_verified_signature() {
+        let replay_bank_id = 6;
+        let replay_slot = 124;
+        let parsed_vote = sample_parsed_vote(replay_slot);
+        let signature = parsed_vote.3;
+        let mut replay_vote_buffer = VoteBuffer::new();
+
+        let ready_votes = replay_vote_buffer.receive_and_collect_ready_votes(
+            vec![ReplayVoteMessage::Executed {
+                replay_bank_id,
+                replay_slot,
+                parsed_vote: parsed_vote.clone(),
+            }]
+            .into_iter(),
+        );
+        assert!(ready_votes.is_empty());
+        assert_eq!(replay_vote_buffer.bank_votes.len(), 1);
+        assert!(matches!(
+            replay_vote_buffer.bank_votes.get(&replay_bank_id),
+            Some(BankVoteBuffer::Active { .. })
+        ));
+
+        let ready_votes = replay_vote_buffer.receive_and_collect_ready_votes(
+            vec![ReplayVoteMessage::Verified {
+                replay_bank_id,
+                replay_slot,
+                verified_signatures: vec![signature],
+            }]
+            .into_iter(),
+        );
+        assert_eq!(ready_votes, vec![parsed_vote]);
+        assert!(replay_vote_buffer.bank_votes.is_empty());
     }
 
     #[test]
