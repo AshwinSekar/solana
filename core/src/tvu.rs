@@ -68,7 +68,9 @@ use {
         quic::{QuicStreamerConfig, SpawnServerResult, spawn_simple_qos_server},
         streamer::StakedNodes,
     },
-    solana_turbine::{XdpSender, retransmit_stage::RetransmitStage},
+    solana_turbine::{
+        XdpSender, retransmit_stage::RetransmitStage, sigverify_shreds::ShredFetchPacketBatch,
+    },
     std::{
         collections::HashSet,
         net::UdpSocket,
@@ -333,7 +335,10 @@ impl Tvu {
             None
         };
 
-        let (fetch_sender, fetch_receiver) = EvictingSender::new_bounded(SHRED_FETCH_CHANNEL_SIZE);
+        let (fetch_sender, fetch_receiver): (
+            EvictingSender<ShredFetchPacketBatch>,
+            Receiver<ShredFetchPacketBatch>,
+        ) = EvictingSender::new_bounded(SHRED_FETCH_CHANNEL_SIZE);
 
         let repair_socket = Arc::new(repair_socket);
         let ancestor_hashes_socket = Arc::new(ancestor_hashes_socket);

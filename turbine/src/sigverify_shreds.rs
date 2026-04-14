@@ -5,12 +5,12 @@ use {
     },
     agave_feature_set as feature_set,
     crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender},
-    itertools::{Either, Itertools},
     rayon::{ThreadPool, ThreadPoolBuilder, prelude::*},
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
     solana_ledger::{
+        blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
         shred::{
             self,
@@ -22,13 +22,14 @@ use {
     solana_perf::{
         self,
         deduper::Deduper,
-        packet::{PacketBatch, PacketRefMut},
+        packet::{PacketBatch, PacketRef, PacketRefMut},
     },
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_signer::Signer,
     solana_streamer::{evicting_sender::EvictingSender, streamer::ChannelSend},
     std::{
+        collections::HashMap,
         num::NonZeroUsize,
         sync::{
             Arc, RwLock,
@@ -73,13 +74,19 @@ enum ResignError {
     Shred(#[from] shred::Error),
 }
 
+#[derive(Clone)]
+pub struct ShredFetchPacketBatch {
+    pub packet_batch: PacketBatch,
+    pub repair_nonce_locations: HashMap<shred::Nonce, BlockLocation>,
+}
+
 pub fn spawn_shred_sigverify(
     cluster_info: Arc<ClusterInfo>,
     bank_forks: Arc<RwLock<BankForks>>,
     leader_schedule_cache: Arc<LeaderScheduleCache>,
-    shred_fetch_receiver: Receiver<PacketBatch>,
+    shred_fetch_receiver: Receiver<ShredFetchPacketBatch>,
     retransmit_sender: EvictingSender<Vec<shred::Payload>>,
-    verified_sender: Sender<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
+    verified_sender: Sender<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
     num_sigverify_threads: NonZeroUsize,
 ) -> JoinHandle<()> {
     let mut stats = ShredSigVerifyStats::new(Instant::now());
@@ -97,6 +104,7 @@ pub fn spawn_shred_sigverify(
         let mut rng = rand::rng();
         let mut deduper = Deduper::<2, [u8]>::new(&mut rng, DEDUPER_NUM_BITS);
         let mut shred_buffer = Vec::with_capacity(SIGVERIFY_SHRED_BATCH_SIZE);
+        let mut repair_nonce_locations_buffer = Vec::with_capacity(SIGVERIFY_SHRED_BATCH_SIZE);
         loop {
             if deduper.maybe_reset(&mut rng, DEDUPER_FALSE_POSITIVE_RATE, DEDUPER_RESET_CYCLE) {
                 stats.num_deduper_saturations += 1;
@@ -118,6 +126,7 @@ pub fn spawn_shred_sigverify(
                 &cache,
                 &mut stats,
                 &mut shred_buffer,
+                &mut repair_nonce_locations_buffer,
             ) {
                 Ok(()) => (),
                 Err(ShredSigverifyError::RecvTimeout) => (),
@@ -141,24 +150,27 @@ fn run_shred_sigverify<const K: usize>(
     bank_forks: &RwLock<BankForks>,
     leader_schedule_cache: &LeaderScheduleCache,
     deduper: &Deduper<K, [u8]>,
-    shred_fetch_receiver: &Receiver<PacketBatch>,
+    shred_fetch_receiver: &Receiver<ShredFetchPacketBatch>,
     retransmit_sender: &EvictingSender<Vec<shred::Payload>>,
-    verified_sender: &Sender<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
+    verified_sender: &Sender<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
     cluster_nodes_cache: &ClusterNodesCache<RetransmitStage>,
     cache: &RwLock<LruCache>,
     stats: &mut ShredSigVerifyStats,
     shred_buffer: &mut Vec<PacketBatch>,
+    repair_nonce_locations_buffer: &mut Vec<HashMap<shred::Nonce, BlockLocation>>,
 ) -> Result<(), ShredSigverifyError> {
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
-    let packets = shred_fetch_receiver.recv_timeout(RECV_TIMEOUT)?;
-    stats.num_packets += packets.len();
-    shred_buffer.push(packets);
-    for packets in shred_fetch_receiver
+    let shred_fetch_batch = shred_fetch_receiver.recv_timeout(RECV_TIMEOUT)?;
+    stats.num_packets += shred_fetch_batch.packet_batch.len();
+    shred_buffer.push(shred_fetch_batch.packet_batch);
+    repair_nonce_locations_buffer.push(shred_fetch_batch.repair_nonce_locations);
+    for shred_fetch_batch in shred_fetch_receiver
         .try_iter()
         .take(SIGVERIFY_SHRED_BATCH_SIZE - 1)
     {
-        stats.num_packets += packets.len();
-        shred_buffer.push(packets);
+        stats.num_packets += shred_fetch_batch.packet_batch.len();
+        shred_buffer.push(shred_fetch_batch.packet_batch);
+        repair_nonce_locations_buffer.push(shred_fetch_batch.repair_nonce_locations);
     }
 
     let now = Instant::now();
@@ -232,25 +244,32 @@ fn run_shred_sigverify<const K: usize>(
     });
     stats.resign_micros += resign_start.elapsed().as_micros() as u64;
     // Extract shred payload from packets, and separate out repaired shreds.
-    let (shreds, repairs): (Vec<_>, Vec<_>) = shred_buffer
-        .iter()
-        .flat_map(|batch| batch.iter())
-        .filter(|packet| !packet.meta().discard())
-        .filter_map(|packet| {
-            let shred = shred::layout::get_shred(packet)?.to_vec();
-            Some((shred, packet.meta().repair()))
-        })
-        .partition_map(|(shred, repair)| {
-            if repair {
+    let mut shreds = Vec::new();
+    let mut repairs = Vec::new();
+    for (batch, repair_nonce_locations) in
+        std::iter::zip(shred_buffer.iter(), repair_nonce_locations_buffer.iter())
+    {
+        for packet in batch.iter().filter(|packet| !packet.meta().discard()) {
+            let Some((shred, location)) =
+                extract_shred_and_location(packet, repair_nonce_locations, stats)
+            else {
+                continue;
+            };
+            if let Some(location) = location {
                 // No need for Arc overhead here because repaired shreds are
                 // not retranmitted.
-                Either::Right(shred::Payload::from(shred))
+                repairs.push((
+                    shred::Payload::from(shred),
+                    /* is_repaired */ true,
+                    location,
+                ));
             } else {
                 // Share the payload between the retransmit-stage and the
                 // window-service.
-                Either::Left(shred::Payload::from(shred))
+                shreds.push(shred::Payload::from(shred));
             }
-        });
+        }
+    }
     // Repaired shreds are not retransmitted.
     stats.num_retransmit_shreds += shreds.len();
     if let Err(send_err) = retransmit_sender.try_send(shreds.clone()) {
@@ -264,14 +283,37 @@ fn run_shred_sigverify<const K: usize>(
     // Send all shreds to window service to be inserted into blockstore.
     let shreds = shreds
         .into_iter()
-        .map(|shred| (shred, /*is_repaired:*/ false));
-    let repairs = repairs
-        .into_iter()
-        .map(|shred| (shred, /*is_repaired:*/ true));
+        .map(|shred| (shred, /*is_repaired:*/ false, BlockLocation::Original));
     verified_sender.send(shreds.chain(repairs).collect())?;
     stats.elapsed_micros += now.elapsed().as_micros() as u64;
     shred_buffer.clear();
+    repair_nonce_locations_buffer.clear();
     Ok(())
+}
+
+/// Extracts shred bytes and, for repaired shreds, the location where the shred
+/// should be inserted into blockstore.
+fn extract_shred_and_location(
+    packet: PacketRef,
+    repair_nonce_locations: &HashMap<shred::Nonce, BlockLocation>,
+    stats: &mut ShredSigVerifyStats,
+) -> Option<(Vec<u8>, Option<BlockLocation>)> {
+    let (shred, nonce) = shred::layout::get_shred_and_repair_nonce(packet)?;
+    let Some(nonce) = nonce else {
+        // Turbine shred.
+        return Some((shred.to_vec(), None));
+    };
+
+    // Repair shred.
+    if let Some(location) = repair_nonce_locations.get(&nonce).copied() {
+        Some((shred.to_vec(), Some(location)))
+    } else {
+        // The nonce was verified in shred-fetch-stage, so this indicates a
+        // mismatch between the packet and side-band location metadata.
+        error!("missing repair location for nonce {nonce}, discarding shred");
+        stats.num_unknown_block_location += 1;
+        None
+    }
 }
 
 /// Checks whether the shred in the given `packet` is of resigned variant. If
@@ -469,6 +511,7 @@ struct ShredSigVerifyStats {
     num_retransmit_shreds: usize,
     num_unknown_slot_leader: AtomicUsize,
     num_unknown_turbine_parent: AtomicUsize,
+    num_unknown_block_location: usize,
     elapsed_micros: u64,
     resign_micros: u64,
 }
@@ -493,6 +536,7 @@ impl ShredSigVerifyStats {
             num_retransmit_shreds: 0usize,
             num_unknown_slot_leader: AtomicUsize::default(),
             num_unknown_turbine_parent: AtomicUsize::default(),
+            num_unknown_block_location: 0usize,
             elapsed_micros: 0u64,
             resign_micros: 0u64,
         }
@@ -542,6 +586,11 @@ impl ShredSigVerifyStats {
             (
                 "num_unknown_turbine_parent",
                 self.num_unknown_turbine_parent.load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "num_unknown_block_location",
+                self.num_unknown_block_location,
                 i64
             ),
             ("elapsed_micros", self.elapsed_micros, i64),

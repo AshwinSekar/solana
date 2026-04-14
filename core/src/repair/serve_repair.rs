@@ -126,6 +126,15 @@ impl ShredRepairType {
             ShredRepairType::ShredForBlockId { slot, .. } => *slot,
         }
     }
+
+    pub fn block_id(&self) -> Option<Hash> {
+        match self {
+            ShredRepairType::ShredForBlockId { block_id, .. } => Some(*block_id),
+            ShredRepairType::Orphan(_)
+            | ShredRepairType::HighestShred(_, _)
+            | ShredRepairType::Shred(_, _) => None,
+        }
+    }
 }
 
 impl RequestResponse for ShredRepairType {

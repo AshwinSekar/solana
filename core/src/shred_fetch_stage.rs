@@ -7,8 +7,11 @@ use {
     solana_epoch_schedule::EpochSchedule,
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
-    solana_ledger::shred::{self, ShredFetchStats, should_discard_shred},
-    solana_perf::packet::{PacketBatch, PacketBatchRecycler, PacketFlags, PacketRef},
+    solana_ledger::{
+        blockstore_meta::BlockLocation,
+        shred::{self, ShredFetchStats, should_discard_shred},
+    },
+    solana_perf::packet::{PacketBatchRecycler, PacketFlags, PacketRef},
     solana_pubkey::Pubkey,
     solana_runtime::{
         bank::Bank,
@@ -18,7 +21,9 @@ use {
         evicting_sender::EvictingSender,
         streamer::{self, ChannelSend, PacketBatchReceiver, StreamerReceiveStats},
     },
+    solana_turbine::sigverify_shreds::ShredFetchPacketBatch,
     std::{
+        collections::HashMap,
         net::UdpSocket,
         sync::{
             Arc, RwLock,
@@ -92,7 +97,7 @@ impl ShredFetchStage {
     fn modify_packets(
         recvr: PacketBatchReceiver,
         recvr_stats: Option<Arc<StreamerReceiveStats>>,
-        sendr: EvictingSender<PacketBatch>,
+        sendr: EvictingSender<ShredFetchPacketBatch>,
         sharable_banks: &SharableBanks,
         shred_version: u16,
         name: &'static str,
@@ -112,6 +117,7 @@ impl ShredFetchStage {
         for mut packet_batch in recvr {
             shred_filter_ctx.maybe_update(sharable_banks.root(), repair_context);
             stats.shred_count += packet_batch.len();
+            let mut repair_nonce_locations = HashMap::new();
 
             if let Some(repair_context) = repair_context {
                 debug_assert_eq!(flags, PacketFlags::REPAIR);
@@ -135,11 +141,13 @@ impl ShredFetchStage {
                         // Have to set repair flag here so that the nonce is
                         // taken off the shred's payload.
                         packet.meta_mut().flags |= PacketFlags::REPAIR;
-                        if !verify_repair_nonce(
+                        if let Some((nonce, location)) = verify_repair_nonce(
                             packet.as_ref(),
                             now,
                             &mut outstanding_repair_requests,
                         ) {
+                            repair_nonce_locations.insert(nonce, location);
+                        } else {
                             packet.meta_mut().set_discard(true);
                         }
                     });
@@ -178,10 +186,13 @@ impl ShredFetchStage {
                     stats.report();
                 }
             }
-            if let Err(send_err) = sendr.try_send(packet_batch) {
+            if let Err(send_err) = sendr.try_send(ShredFetchPacketBatch {
+                packet_batch,
+                repair_nonce_locations,
+            }) {
                 match send_err {
                     crossbeam_channel::TrySendError::Full(v) => {
-                        stats.overflow_shreds += v.len();
+                        stats.overflow_shreds += v.packet_batch.len();
                     }
                     _ => unreachable!("EvictingSender holds on to both ends of the channel"),
                 }
@@ -195,7 +206,7 @@ impl ShredFetchStage {
         modifier_thread_name: &'static str,
         sockets: Vec<Arc<UdpSocket>>,
         exit: Arc<AtomicBool>,
-        sender: EvictingSender<PacketBatch>,
+        sender: EvictingSender<ShredFetchPacketBatch>,
         recycler: PacketBatchRecycler,
         bank_forks: Arc<RwLock<BankForks>>,
         shred_version: u16,
@@ -249,7 +260,7 @@ impl ShredFetchStage {
     pub(crate) fn new(
         sockets: Vec<Arc<UdpSocket>>,
         repair_socket: Arc<UdpSocket>,
-        sender: EvictingSender<PacketBatch>,
+        sender: EvictingSender<ShredFetchPacketBatch>,
         shred_version: u16,
         bank_forks: Arc<RwLock<BankForks>>,
         cluster_info: Arc<ClusterInfo>,
@@ -318,20 +329,27 @@ impl RepairContext {
     }
 }
 
-// Returns false if repair nonce is invalid and packet should be discarded.
+// Returns `None` if repair nonce is invalid and packet should be discarded.
+// Returns the verified repair nonce and storage location otherwise.
 #[must_use]
 fn verify_repair_nonce(
     packet: PacketRef,
     now: u64, // solana_time_utils::timestamp()
     outstanding_repair_requests: &mut OutstandingShredRepairs,
-) -> bool {
+) -> Option<(shred::Nonce, BlockLocation)> {
     debug_assert!(packet.meta().flags.contains(PacketFlags::REPAIR));
     let Some((shred, Some(nonce))) = shred::layout::get_shred_and_repair_nonce(packet) else {
-        return false;
+        return None;
     };
     outstanding_repair_requests
-        .register_response(nonce, shred, now, |_| ())
-        .is_some()
+        .register_response(nonce, shred, now, |request| {
+            request
+                .block_id()
+                .map_or(BlockLocation::Original, |block_id| {
+                    BlockLocation::Alternate { block_id }
+                })
+        })
+        .map(|location| (nonce, location))
 }
 
 // Returns true if the feature is effective for the shred slot.
