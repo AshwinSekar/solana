@@ -1808,13 +1808,6 @@ impl Bank {
             );
         }
 
-        EpochInflationAccountState::new_epoch_update_account(
-            self,
-            parent_epoch,
-            parent_capitalization,
-            epoch_validator_rewards,
-        );
-
         report_new_epoch_metrics(
             epoch,
             slot,

@@ -5062,12 +5062,12 @@ impl ReplayStage {
                         // Genesis doesn't have a block id
                         && parent_slot != 0
                     {
-                        error!(
-                            "We have the wrong block in {parent_slot}, expecting {:?} have {:?}. \
-                             Deferring replay",
-                            slot_meta.parent_block_id,
-                            parent_bank.block_id()
-                        );
+                        // error!(
+                        //     "We have the wrong block in {parent_slot}, expecting {:?} have {:?}. \
+                        //      Deferring replay",
+                        //     slot_meta.parent_block_id,
+                        //     parent_bank.block_id()
+                        // );
                         // There were duplicate blocks in this slot and we have the wrong one replayed
                         // Do not continue down this fork
                         // If this fork ends up being ParentReady, then votor will take care of repairing
