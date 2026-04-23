@@ -708,62 +708,30 @@ mod tests {
     #[test]
     fn test_receive_and_send_consensus_message() {
         agave_logger::setup();
-        let mut ctx = setup();
+        let ctx = setup();
 
         // validator 0 to 7 send Notarize on slot 2
         let block_id = Hash::new_unique();
         let target_slot = 2;
         let notarize_vote = Vote::new_notarization_vote(target_slot, block_id);
+        let messages_to_send = (0..8)
+            .map(|my_rank| {
+                let vote_keypair = &ctx.validator_keypairs[my_rank].vote_keypair;
+                let bls_keypair =
+                    BLSKeypair::derive_from_signer(vote_keypair, BLS_KEYPAIR_DERIVE_SEED).unwrap();
+                let vote_serialized = bincode::serialize(&notarize_vote).unwrap();
+                ConsensusMessage::Vote(VoteMessage {
+                    vote: notarize_vote,
+                    signature: bls_keypair.sign(&vote_serialized).into(),
+                    rank: my_rank as u16,
+                })
+            })
+            .collect();
 
-        let mut events = vec![];
-        let root_bank = ctx.sharable_banks.root();
-
-        // Process votes from validators 0-7
-        for my_rank in 0..8 {
-            let vote_keypair = &ctx.validator_keypairs[my_rank].vote_keypair;
-            let bls_keypair =
-                BLSKeypair::derive_from_signer(vote_keypair, BLS_KEYPAIR_DERIVE_SEED).unwrap();
-            let vote_serialized = bincode::serialize(&notarize_vote).unwrap();
-            let message = ConsensusMessage::Vote(VoteMessage {
-                vote: notarize_vote,
-                signature: bls_keypair.sign(&vote_serialized).into(),
-                rank: my_rank as u16,
-            });
-
-            let result = ConsensusPoolService::add_message_and_maybe_update_commitment(
-                &root_bank,
-                &Pubkey::new_unique(),
-                &ctx.my_vote_pubkey,
-                message,
-                &mut ctx.consensus_pool,
-                &mut events,
-                &ctx.commitment_sender,
-            );
-            assert!(result.is_ok());
-
-            let (new_finalized_slot, new_certificates_to_send) = result.unwrap();
-            let mut stats = ConsensusPoolServiceStats::new();
-            let mut standstill_timer = Instant::now();
-
-            // Send certificates if any were produced
-            if !new_certificates_to_send.is_empty() || new_finalized_slot.is_some() {
-                ConsensusPoolService::maybe_update_root_and_send_new_certificates(
-                    &mut ctx.consensus_pool,
-                    &ctx.sharable_banks,
-                    &ctx.bls_sender,
-                    new_finalized_slot,
-                    new_certificates_to_send,
-                    &mut standstill_timer,
-                    &mut stats,
-                    &ctx.highest_finalized,
-                )
-                .unwrap();
-            }
-        }
+        ctx.consensus_message_sender.send(messages_to_send).unwrap();
 
         // Verify that we received certificates via the bls channel
-        let mut found_certificate = false;
-        while let Ok(event) = ctx.bls_receiver.try_recv() {
+        wait_for_event(&ctx.bls_receiver, |event| {
             if let BLSOp::PushCertificate { certificate } = event {
                 assert_eq!(certificate.cert_type.slot(), target_slot);
                 assert!(
@@ -774,24 +742,12 @@ mod tests {
                             CertificateType::NotarizeFallback(_, _)
                         )
                 );
-                found_certificate = true;
+                true
+            } else {
+                false
             }
-        }
-        assert!(found_certificate, "Should have received a certificate");
-
-        // Verify that we received a finalized slot event
-        let finalized_event = events.iter().find(|event| {
-            matches!(
-                event,
-                VotorEvent::Finalized((slot, received_block_id), is_fast_finalized)
-                    if *slot == target_slot && *received_block_id == block_id && *is_fast_finalized
-            )
         });
-        assert!(
-            finalized_event.is_some(),
-            "Should have received a finalized event"
-        );
-        // Verify that we received a finalized slot event
+
         wait_for_event(&ctx.event_receiver, |event| {
             if let VotorEvent::Finalized((slot, receivied_block_id), is_fast_finalized) = event {
                 assert_eq!(*slot, target_slot);
@@ -823,46 +779,18 @@ mod tests {
             signature: BLSSignature::default(),
             bitmap: dummy_bitmap(),
         };
-        events.clear();
-
-        let result = ConsensusPoolService::add_message_and_maybe_update_commitment(
-            &root_bank,
-            &Pubkey::new_unique(),
-            &ctx.my_vote_pubkey,
-            ConsensusMessage::Certificate(skip_certificate),
-            &mut ctx.consensus_pool,
-            &mut events,
-            &ctx.commitment_sender,
-        );
-        assert!(result.is_ok());
-
-        let (new_finalized_slot, new_certificates_to_send) = result.unwrap();
-        let mut stats = ConsensusPoolServiceStats::new();
-        let mut standstill_timer = Instant::now();
-
-        ConsensusPoolService::maybe_update_root_and_send_new_certificates(
-            &mut ctx.consensus_pool,
-            &ctx.sharable_banks,
-            &ctx.bls_sender,
-            new_finalized_slot,
-            new_certificates_to_send,
-            &mut standstill_timer,
-            &mut stats,
-            &ctx.highest_finalized,
-        )
-        .unwrap();
+        ctx.consensus_message_sender
+            .send(vec![ConsensusMessage::Certificate(skip_certificate)])
+            .unwrap();
 
         // Verify skip certificate was forwarded
-        let mut found_skip = false;
-        while let Ok(event) = ctx.bls_receiver.try_recv() {
+        wait_for_event(&ctx.bls_receiver, |event| {
             if let BLSOp::PushCertificate { certificate } = event {
-                if matches!(certificate.cert_type, CertificateType::Skip(slot) if slot == target_slot)
-                {
-                    found_skip = true;
-                }
+                matches!(certificate.cert_type, CertificateType::Skip(slot) if slot == target_slot)
+            } else {
+                false
             }
-        }
-        assert!(found_skip);
+        });
         ctx.exit.store(true, Ordering::Relaxed);
     }
 

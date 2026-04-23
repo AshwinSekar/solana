@@ -11772,7 +11772,7 @@ fn test_get_top_epoch_stakes() {
 #[test_matrix([false, true], [false, true])]
 fn test_bank_burn_vat(enable_alpenglow: bool, enable_vat: bool) {
     // Create a bank with all features enabled expect for AG and VAT.
-    let bank_epoch_0 = {
+    let (bank_epoch_0, _bank_forks_0) = {
         let num_of_nodes: u64 = 100;
         let voting_keypairs = (0..num_of_nodes)
             .map(|_| ValidatorVoteKeypairs::new_rand())
@@ -11789,14 +11789,16 @@ fn test_bank_burn_vat(enable_alpenglow: bool, enable_vat: bool) {
             agave_feature_set::validator_admission_ticket::id(),
         ];
         deactivate_features(&mut genesis_config, &features_to_deactivate);
-        Bank::new_for_tests(&genesis_config)
+        let (bank_epoch_0, bank_forks_0) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        (bank_epoch_0, bank_forks_0)
     };
 
     // Now move to a bank in the next epoch.
     let mut bank_epoch_1 = {
         let first_slot_in_epoch_1 = bank_epoch_0.epoch_schedule().get_first_slot_in_epoch(1);
         Bank::new_from_parent(
-            Arc::new(bank_epoch_0),
+            bank_epoch_0.clone(),
             SlotLeader::new_unique(),
             first_slot_in_epoch_1,
         )
@@ -11815,8 +11817,9 @@ fn test_bank_burn_vat(enable_alpenglow: bool, enable_vat: bool) {
             feature_set.deactivate(&agave_feature_set::validator_admission_ticket::id());
         }
         bank_epoch_1.feature_set = Arc::new(feature_set);
+        let (bank_epoch_1, _bank_forks_1) = bank_epoch_1.wrap_with_bank_forks_for_tests();
         Bank::new_from_parent(
-            Arc::new(bank_epoch_1),
+            bank_epoch_1,
             SlotLeader::new_unique(),
             first_slot_in_epoch_2,
         )
@@ -11825,11 +11828,22 @@ fn test_bank_burn_vat(enable_alpenglow: bool, enable_vat: bool) {
     assert!(bank_epoch_2.epoch_stakes(3).is_some());
     assert!(bank_epoch_2.epoch_stakes(4).is_none());
     let capitalization_epoch_2 = bank_epoch_2.capitalization();
-    if enable_alpenglow && enable_vat {
-        // VAT should be burned
-        assert!(capitalization_epoch_2 < capitalization_epoch_1);
+    let vote_account_count = bank_epoch_2
+        .epoch_stakes(3)
+        .expect("epoch 3 stakes should exist")
+        .stakes()
+        .vote_accounts()
+        .len() as u64;
+    let expected_incinerator_balance = if enable_alpenglow && enable_vat {
+        vote_account_count * VAT_TO_BURN_PER_EPOCH
     } else {
-        // VAT should not be burned
-        assert!(capitalization_epoch_2 >= capitalization_epoch_1);
-    }
+        0
+    };
+    assert_eq!(
+        bank_epoch_2.get_balance(&incinerator::id()),
+        expected_incinerator_balance
+    );
+
+    // VAT is transferred to the incinerator account, so capitalization is not reduced here.
+    assert!(capitalization_epoch_2 >= capitalization_epoch_1);
 }

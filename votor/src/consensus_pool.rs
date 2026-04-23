@@ -1148,7 +1148,11 @@ mod tests {
         let new_validator_ix = 6;
         let (new_finalized_slot, certs_to_send) =
             ctx.add_message(dummy_vote_message(&ctx.validators, &vote, new_validator_ix));
-        assert!(new_finalized_slot.is_none());
+        if vote.is_finalize() {
+            assert_eq!(new_finalized_slot, Some(slot));
+        } else {
+            assert!(new_finalized_slot.is_none());
+        }
         // Assert certs_to_send contains the expected certificate types
         for expected_cert_type in expected_cert_types {
             assert!(certs_to_send.iter().any(|cert| {

@@ -2721,7 +2721,7 @@ mod tests {
         );
 
         let (ancestor_duplicate_slots_sender, _) = unbounded();
-        let repair_info = RepairInfo {
+        let mut repair_info = RepairInfo {
             bank_forks: bank_forks.clone(),
             cluster_info: cluster_info.clone(),
             cluster_slots: cluster_slots.clone(),
@@ -2742,6 +2742,7 @@ mod tests {
         // then no repairs should be generated
         for pubkey in &[solana_pubkey::new_rand(), *me.pubkey()] {
             let known_validators = Some(vec![*pubkey].into_iter().collect());
+            repair_info.repair_validators = known_validators.clone();
             assert!(
                 serve_repair
                     .repair_peers(&known_validators, 1, &identity_keypair.pubkey())
@@ -2762,6 +2763,7 @@ mod tests {
 
         // If known validator exists in gossip, should return repair successfully
         let known_validators = Some(vec![*contact_info2.pubkey()].into_iter().collect());
+        repair_info.repair_validators = known_validators.clone();
         let repair_peers =
             serve_repair.repair_peers(&known_validators, 1, &identity_keypair.pubkey());
         assert_eq!(repair_peers.len(), 1);
@@ -2780,6 +2782,7 @@ mod tests {
 
         // Using no known validators should default to all
         // validator's available in gossip, excluding myself
+        repair_info.repair_validators = None;
         let repair_peers: HashSet<Pubkey> = serve_repair
             .repair_peers(&None, 1, &identity_keypair.pubkey())
             .into_iter()
