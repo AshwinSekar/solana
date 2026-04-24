@@ -310,6 +310,12 @@ impl ValidatedBlockFinalizationCert {
         (&self.signers, self.slot())
     }
 
+    /// Returns the vote account pubkeys that signed this finalization certificate.
+    pub fn signers(&self) -> impl Iterator<Item = &Pubkey> {
+        self.signers.iter()
+    }
+
+    /// Consumes self and returns the contained certificates.
     /// Consumes self and returns the contained certificates and the signers.
     ///
     /// For slow finalization, returns (signers, finalize_cert, Some(notarize_cert)).
