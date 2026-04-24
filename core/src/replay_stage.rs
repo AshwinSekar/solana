@@ -3679,6 +3679,13 @@ impl ReplayStage {
                             VersionedUpdateParent::V1(x) => x.new_parent_slot,
                         };
 
+                        datapoint_info!(
+                            "replay-stage-update-parent",
+                            ("slot", bank_slot, i64),
+                            ("old_parent_slot", bank.parent_slot(), i64),
+                            ("new_parent_slot", new_parent_slot, i64),
+                        );
+
                         info!(
                             "AbandonedBank at slot {bank_slot}: switching parent from {} to \
                              {new_parent_slot}",

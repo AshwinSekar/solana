@@ -439,6 +439,9 @@ fn produce_window(
     // Insert the first bank
     let mut working_bank =
         start_leader_wait_for_parent_replay(start_slot, parent_slot, block_timer, ctx)?;
+    if fast_leader_handover {
+        ctx.slot_metrics.mark_fast_leader_handover();
+    }
 
     let my_pubkey = ctx.my_pubkey;
     let mut window_production_start = Measure::start("window_production");
