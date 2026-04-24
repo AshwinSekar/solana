@@ -273,8 +273,9 @@ fn start_loop(config: BlockCreationLoopConfig) {
             );
         }
 
-        // Race between parent ready notification and optimistic parent events.
-        // Parent ready is checked first and has priority if both channels are ready.
+        // Wait for the first window notification, then drain both sources and pick the newest
+        // leader window. This avoids revisiting stale optimistic windows after replay has already
+        // advanced to a later finalized parent.
         let window_source = select_biased! {
             recv(ctx.leader_window_info_receiver) -> msg => {
                 msg.ok().map(ParentSource::ParentReady)
@@ -285,34 +286,73 @@ fn start_loop(config: BlockCreationLoopConfig) {
             default(Duration::from_secs(1)) => continue,
         };
 
-        // Drain any additional pending messages and keep the latest one
-        let (info, fast_leader_handover) = match window_source {
-            Some(ParentSource::ParentReady(first)) => {
-                let info = ctx
-                    .leader_window_info_receiver
-                    .try_iter()
-                    .last()
-                    .unwrap_or(first);
+        let (mut latest_parent_ready, mut latest_optimistic_parent) = match window_source {
+            Some(ParentSource::ParentReady(first)) => (Some(first), None),
+            Some(ParentSource::OptimisticParent(first)) => (None, Some(first)),
+            None => {
+                info!("{my_pubkey}: channel disconnected");
+                return;
+            }
+        };
+
+        latest_parent_ready = ctx
+            .leader_window_info_receiver
+            .try_iter()
+            .last()
+            .or(latest_parent_ready);
+        latest_optimistic_parent = optimistic_parent_receiver
+            .try_iter()
+            .last()
+            .or(latest_optimistic_parent);
+
+        let (info, fast_leader_handover) = match (latest_parent_ready, latest_optimistic_parent) {
+            (Some(parent_ready), Some(optimistic_parent))
+                if optimistic_parent.start_slot > parent_ready.start_slot =>
+            {
+                trace!(
+                    "{my_pubkey}: picked newer optimistic window {}-{} over finalized {}-{}",
+                    optimistic_parent.start_slot,
+                    optimistic_parent.end_slot,
+                    parent_ready.start_slot,
+                    parent_ready.end_slot,
+                );
+                (optimistic_parent, true)
+            }
+            (Some(parent_ready), Some(optimistic_parent)) => {
+                if parent_ready.start_slot > optimistic_parent.start_slot {
+                    trace!(
+                        "{my_pubkey}: picked newer finalized window {}-{} over optimistic {}-{}",
+                        parent_ready.start_slot,
+                        parent_ready.end_slot,
+                        optimistic_parent.start_slot,
+                        optimistic_parent.end_slot,
+                    );
+                } else {
+                    trace!(
+                        "{my_pubkey}: both finalized and optimistic parents ready for window \
+                         {}-{}, preferring finalized parent",
+                        parent_ready.start_slot, parent_ready.end_slot,
+                    );
+                }
+                (parent_ready, false)
+            }
+            (Some(info), None) => {
                 trace!(
                     "{my_pubkey}: window {}-{} finalized parent",
                     info.start_slot, info.end_slot
                 );
                 (info, false)
             }
-            Some(ParentSource::OptimisticParent(first)) => {
-                let info = optimistic_parent_receiver
-                    .try_iter()
-                    .last()
-                    .unwrap_or(first);
+            (None, Some(info)) => {
                 trace!(
                     "{my_pubkey}: window {}-{} optimistic parent",
                     info.start_slot, info.end_slot
                 );
                 (info, true)
             }
-            None => {
-                info!("{my_pubkey}: channel disconnected");
-                return;
+            (None, None) => {
+                info!("{my_pubkey}: both leader window channels drained");
+                continue;
             }
         };
 
@@ -328,6 +368,11 @@ fn start_loop(config: BlockCreationLoopConfig) {
             "{my_pubkey}: window {start_slot}-{end_slot} parent {parent_slot} \
              flh={fast_leader_handover}"
         );
+
+        if (start_slot..=end_slot).any(|slot| ctx.blockstore.has_existing_shreds_for_slot(slot)) {
+            warn!("{my_pubkey}: already have shreds in window {start_slot}-{end_slot}, skipping");
+            continue;
+        }
 
         if let Err(e) = produce_window(
             fast_leader_handover,
@@ -541,7 +586,7 @@ fn handle_parent_ready(
     ctx: &mut LeaderContext,
     leader_window_info: LeaderWindowInfo,
     optimistic_parent_block: (Slot, Hash),
-    accumulated_txs: Vec<&VersionedTransaction>,
+    accumulated_txs: Vec<VersionedTransaction>,
     block_timer: &mut Instant,
 ) -> Result<Option<Arc<Bank>>, PohRecorderError> {
     if leader_window_info.parent_block == optimistic_parent_block {
@@ -576,7 +621,7 @@ fn handle_parent_ready(
         .into_iter()
         .filter_map(|tx| {
             // TODO(ksn): use wincode once we upstream to Agave
-            let serialized = bincode::serialize(tx)
+            let serialized = bincode::serialize(&tx)
                 .inspect_err(|e| {
                     error!(
                         "failed to serialize transaction for rescheduling - this should never \
@@ -592,6 +637,11 @@ fn handle_parent_ready(
         .collect();
 
     if !packets.is_empty() {
+        info!(
+            "{}: rescheduling {} txs after sad leader handover for slot {slot}",
+            ctx.my_pubkey,
+            packets.len(),
+        );
         let batch: PacketBatch = packets.into();
         let banking_packet_batch = Arc::new(vec![batch]);
         ctx.banking_stage_sender
@@ -645,14 +695,13 @@ fn record_and_complete_block(
     ctx.build_reward_certs_sender
         .send(BuildRewardCertsRequest { bank_slot })
         .map_err(|_| PohRecorderError::ChannelDisconnected)?;
+    let mut accumulated_txs = vec![];
     let window_has_moved_on = loop {
         // Don't timeout until we've received ParentReady
         let timeout = time_left(*block_timer, block_timeout);
         if timeout.is_zero() && optimistic_parent.is_none() {
             break false;
         }
-
-        let mut accumulated_txs = vec![];
 
         select_biased! {
             recv(ctx.leader_window_info_receiver) -> msg => {
@@ -663,7 +712,13 @@ fn record_and_complete_block(
                     }
                     Some(info) => {
                         if let Some(optimistic_parent_block) = optimistic_parent.take() {
-                            handle_parent_ready(ctx, info, optimistic_parent_block, accumulated_txs, block_timer)?;
+                            handle_parent_ready(
+                                ctx,
+                                info,
+                                optimistic_parent_block,
+                                std::mem::take(&mut accumulated_txs),
+                                block_timer,
+                            )?;
                         }
                     }
                     None => continue,
@@ -676,7 +731,7 @@ fn record_and_complete_block(
 
                     if optimistic_parent.is_some() {
                         record.transaction_batches.iter().for_each(|batch| {
-                            accumulated_txs.extend(batch.iter());
+                            accumulated_txs.extend(batch.iter().cloned());
                         });
                     }
 

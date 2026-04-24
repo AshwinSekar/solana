@@ -283,8 +283,8 @@ impl MigrationPhase {
     }
 
     /// Should this block allow the UpdateParent marker, i.e., support fast leader handover?
-    fn should_allow_fast_leader_handover(&self, _slot: Slot) -> bool {
-        false
+    fn should_allow_fast_leader_handover(&self, slot: Slot) -> bool {
+        self.is_alpenglow_block(slot)
     }
 }
 

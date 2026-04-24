@@ -901,6 +901,7 @@ impl ReplayStage {
                     &mut progress,
                     &mut replay_timing,
                     migration_status.as_ref(),
+                    &my_pubkey,
                 );
                 generate_new_bank_forks_time.stop();
 
@@ -4989,6 +4990,7 @@ impl ReplayStage {
         progress: &mut ProgressMap,
         replay_timing: &mut ReplayLoopTiming,
         migration_status: &MigrationStatus,
+        my_pubkey: &Pubkey,
     ) {
         // Find the next slot that chains to the old slot
         let mut generate_new_bank_forks_read_lock =
@@ -5058,6 +5060,14 @@ impl ReplayStage {
                         continue;
                     }
 
+                    if progress.contains_key(&child_slot) {
+                        warn!(
+                            "Removing stale progress entry for slot {child_slot} before replay \
+                             with parent {parent_slot}"
+                        );
+                        progress.remove(&child_slot);
+                    }
+
                     if Some(slot_meta.parent_block_id) != parent_bank.block_id()
                         // Genesis doesn't have a block id
                         && parent_slot != 0
@@ -5088,6 +5098,16 @@ impl ReplayStage {
                 let leader = leader_schedule_cache
                     .slot_leader_at(child_slot, Some(parent_bank))
                     .unwrap();
+
+                // In Alpenglow, BCL owns bank creation for our leader slots. Replay should not
+                // race BCL to create those banks, especially during FLH sad-path reparenting.
+                if migration_status.should_allow_block_markers(child_slot)
+                    && leader.id == *my_pubkey
+                {
+                    trace!("skipping bank creation for our leader slot {child_slot}");
+                    continue;
+                }
+
                 info!("new fork:{child_slot} parent:{parent_slot} root:{root}",);
                 // Migration period banks are VoM
                 let options = NewBankOptions {
@@ -5507,6 +5527,7 @@ pub(crate) mod tests {
             &mut progress,
             &mut replay_timing,
             &MigrationStatus::default(),
+            &Pubkey::default(),
         );
         assert!(
             bank_forks
@@ -5536,6 +5557,7 @@ pub(crate) mod tests {
             &mut progress,
             &mut replay_timing,
             &MigrationStatus::default(),
+            &Pubkey::default(),
         );
         assert!(
             bank_forks
@@ -7670,6 +7692,7 @@ pub(crate) mod tests {
             &mut progress,
             &mut replay_timing,
             &MigrationStatus::default(),
+            &Pubkey::default(),
         );
         assert_eq!(bank_forks.read().unwrap().active_bank_slots(), vec![3]);
 
@@ -7700,6 +7723,7 @@ pub(crate) mod tests {
             &mut progress,
             &mut replay_timing,
             &MigrationStatus::default(),
+            &Pubkey::default(),
         );
         assert_eq!(bank_forks.read().unwrap().active_bank_slots(), vec![5]);
 
@@ -7731,6 +7755,7 @@ pub(crate) mod tests {
             &mut progress,
             &mut replay_timing,
             &MigrationStatus::default(),
+            &Pubkey::default(),
         );
         assert_eq!(bank_forks.read().unwrap().active_bank_slots(), vec![6]);
 
@@ -7761,6 +7786,7 @@ pub(crate) mod tests {
             &mut progress,
             &mut replay_timing,
             &MigrationStatus::default(),
+            &Pubkey::default(),
         );
         assert_eq!(bank_forks.read().unwrap().active_bank_slots(), vec![7]);
     }

@@ -9023,6 +9023,7 @@ dependencies = [
  "tempfile",
  "tokio-util 0.7.18",
  "trees",
+ "wincode",
 ]
 
 [[package]]
