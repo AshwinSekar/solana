@@ -8,7 +8,7 @@ use {
     solana_vote::vote_account::VoteAccount,
     solana_vote_interface::state::{LandedVote, Lockout},
     solana_vote_program::vote_state::handler::VoteStateHandler,
-    std::collections::VecDeque,
+    std::collections::{HashMap, VecDeque},
     thiserror::Error,
 };
 
@@ -42,9 +42,10 @@ pub enum PayVoteRewardError {
     },
 }
 
-/// Calculates voting rewards and updates vote state fields for rewarded validators.
+/// Calculates voting rewards and updates vote state fields for rewarded validators and final-cert
+/// signers.
 ///
-/// This is a NOP if [`reward_slot_and_validators`] is [`None`].
+/// This is a NOP if both [`reward_slot_and_validators`] and [`final_cert`] are [`None`].
 ///
 /// The reward slot is in the past relative to the current slot and hence might be in a different
 /// epoch than the current epoch and may have different validator sets and stakes, etc.
@@ -58,121 +59,146 @@ pub(super) fn calculate_and_pay_voting_reward_and_update_vote_state(
     reward_slot_and_validators: Option<(Slot, Vec<Pubkey>)>,
     final_cert: Option<&ValidatedBlockFinalizationCert>,
 ) -> Result<(), PayVoteRewardError> {
-    let Some((reward_slot, validators_to_reward)) = reward_slot_and_validators else {
+    let vote_state_update_slot = reward_slot_and_validators
+        .as_ref()
+        .map(|(reward_slot, _)| *reward_slot)
+        .or_else(|| final_cert.map(ValidatedBlockFinalizationCert::slot));
+    let Some(vote_state_update_slot) = vote_state_update_slot else {
         return Ok(());
     };
 
     let current_slot = bank.slot();
-    let (reward_slot_accounts, reward_slot_total_stake) = {
-        let epoch_stakes = bank.epoch_stakes_from_slot(reward_slot).ok_or(
-            PayVoteRewardError::MissingEpochStakes {
-                reward_slot,
-                current_slot,
-            },
-        )?;
-        (
-            epoch_stakes.stakes().vote_accounts().as_ref(),
-            epoch_stakes.total_stake(),
-        )
-    };
-
-    // This assumes that if the epoch_schedule ever changes, the new schedule will maintain correct
-    // info about older slots as well.
-    let reward_epoch = bank.epoch_schedule.get_epoch(reward_slot);
-    let epoch_state = {
-        let epoch_inflation_account_state = EpochInflationAccountState::new_from_bank(bank);
-        // This function should only be called after alpenglow is active and the slot in the the epoch
-        // that activated Alpenglow should have created the account.
-        debug_assert!(epoch_inflation_account_state.is_some());
-        epoch_inflation_account_state
-            .ok_or(PayVoteRewardError::MissingEpochInflationAccountState { current_slot })?
-            .get_epoch_state(reward_epoch)
-            .ok_or(PayVoteRewardError::NoEpochValidatorStake {
-                reward_epoch,
-                current_slot,
-            })?
-    };
-
     let current_vote_accounts = bank.vote_accounts();
     let current_slot_leader_vote_pubkey = bank.leader().vote_address;
-    // Adding 1 to capacity in case the current leader was not in the aggregate and paying it
-    // triggers a reallocation.
-    let mut paid_vote_accounts = Vec::with_capacity(validators_to_reward.len().saturating_add(1));
-    let mut total_leader_reward = 0u64;
     let current_epoch = bank.epoch();
-    for validator_to_reward in validators_to_reward {
-        let (reward_slot_validator_stake, _) = reward_slot_accounts
-            .get(&validator_to_reward)
-            .ok_or(PayVoteRewardError::MissingRewardSlotValidator {
-                pubkey: validator_to_reward,
-                reward_slot,
-                current_slot,
-            })?;
-        let (validator_reward, add_leader_reward) = calculate_reward(
-            &epoch_state,
-            reward_slot_total_stake,
-            *reward_slot_validator_stake,
+    let mut vote_account_updates = HashMap::new();
+
+    if let Some(final_cert) = final_cert {
+        vote_account_updates.extend(
+            final_cert.signers().map(|validator_vote_pubkey| {
+                (*validator_vote_pubkey, VoteAccountUpdate::default())
+            }),
         );
-        total_leader_reward = total_leader_reward.saturating_add(add_leader_reward);
+    }
 
-        if current_slot_leader_vote_pubkey == validator_to_reward {
-            // Current slot's leader's node pubkey is associated with exactly one vote
-            // pubkey and this reward is for this vote pubkey.  The reward will be paid.
-            // However, we haven't finished calculating the total rewards for the leader yet.
-            // `total_leader_reward` be paid at the end of the function.
-            total_leader_reward = total_leader_reward.saturating_add(validator_reward);
-            continue;
+    if let Some((reward_slot, validators_to_reward)) = reward_slot_and_validators {
+        if !validators_to_reward.is_empty() {
+            let (reward_slot_accounts, reward_slot_total_stake) = {
+                let epoch_stakes = bank.epoch_stakes_from_slot(reward_slot).ok_or(
+                    PayVoteRewardError::MissingEpochStakes {
+                        reward_slot,
+                        current_slot,
+                    },
+                )?;
+                (
+                    epoch_stakes.stakes().vote_accounts().as_ref(),
+                    epoch_stakes.total_stake(),
+                )
+            };
+
+            // This assumes that if the epoch_schedule ever changes, the new schedule will maintain
+            // correct info about older slots as well.
+            let reward_epoch = bank.epoch_schedule.get_epoch(reward_slot);
+            let epoch_state = {
+                let epoch_inflation_account_state = EpochInflationAccountState::new_from_bank(bank);
+                // This function should only be called after alpenglow is active and the slot in the the epoch
+                // that activated Alpenglow should have created the account.
+                debug_assert!(epoch_inflation_account_state.is_some());
+                epoch_inflation_account_state
+                    .ok_or(PayVoteRewardError::MissingEpochInflationAccountState { current_slot })?
+                    .get_epoch_state(reward_epoch)
+                    .ok_or(PayVoteRewardError::NoEpochValidatorStake {
+                        reward_epoch,
+                        current_slot,
+                    })?
+            };
+
+            let mut total_leader_reward = 0u64;
+            for validator_to_reward in validators_to_reward {
+                let (reward_slot_validator_stake, _) = reward_slot_accounts
+                    .get(&validator_to_reward)
+                    .ok_or(PayVoteRewardError::MissingRewardSlotValidator {
+                        pubkey: validator_to_reward,
+                        reward_slot,
+                        current_slot,
+                    })?;
+                let (validator_reward, add_leader_reward) = calculate_reward(
+                    &epoch_state,
+                    reward_slot_total_stake,
+                    *reward_slot_validator_stake,
+                );
+                total_leader_reward = total_leader_reward.saturating_add(add_leader_reward);
+
+                if current_slot_leader_vote_pubkey == validator_to_reward {
+                    // Current slot's leader's node pubkey is associated with exactly one vote
+                    // pubkey and this reward is for this vote pubkey.  The reward will be paid.
+                    // However, we haven't finished calculating the total rewards for the leader yet.
+                    // `total_leader_reward` be paid at the end of the function.
+                    total_leader_reward = total_leader_reward.saturating_add(validator_reward);
+                    continue;
+                }
+
+                vote_account_updates
+                    .entry(validator_to_reward)
+                    .or_default()
+                    .add_reward(current_epoch, validator_reward);
+            }
+
+            // We have computed the final `total_leader_rewards` now.  We can pay it into the leader's
+            // vote account.
+            if total_leader_reward != 0 {
+                vote_account_updates
+                    .entry(current_slot_leader_vote_pubkey)
+                    .or_default()
+                    .add_reward(current_epoch, total_leader_reward);
+            }
         }
+    }
 
-        // The reward was not for a vote pubkey associated with the current slot's leader's node pubkey.
-        // We can pay it into the vote account immediately.
-        let Some((_, current_slot_account)) = current_vote_accounts.get(&validator_to_reward)
+    let mut paid_vote_accounts = Vec::with_capacity(vote_account_updates.len());
+    for (validator_vote_pubkey, vote_account_update) in vote_account_updates {
+        let Some((_, current_slot_account)) = current_vote_accounts.get(&validator_vote_pubkey)
         else {
-            info!(
-                "validator {validator_to_reward} was present for reward_slot {reward_slot} but is \
-                 absent for current_slot {current_slot}"
-            );
+            if vote_account_update.reward.is_some() {
+                info!(
+                    "validator {validator_vote_pubkey} was present for reward_slot \
+                     {vote_state_update_slot} but is absent for current_slot {current_slot}"
+                );
+            }
             continue;
         };
         if let Some(account_data) = update_vote_account(
-            current_epoch,
-            reward_slot,
+            vote_account_update.reward,
+            vote_state_update_slot,
             current_slot_account,
-            validator_to_reward,
-            validator_reward,
+            validator_vote_pubkey,
             final_cert,
         ) {
-            paid_vote_accounts.push((validator_to_reward, account_data));
+            paid_vote_accounts.push((validator_vote_pubkey, account_data));
         }
     }
 
-    // We have computed the final `total_leader_rewards` now.  We can pay it into the leader's
-    // vote account.
-    if total_leader_reward != 0 {
-        match current_vote_accounts.get(&current_slot_leader_vote_pubkey) {
-            Some((_, leader_account)) => {
-                if let Some(account_data) = update_vote_account(
-                    current_epoch,
-                    reward_slot,
-                    leader_account,
-                    current_slot_leader_vote_pubkey,
-                    total_leader_reward,
-                    final_cert,
-                ) {
-                    paid_vote_accounts.push((current_slot_leader_vote_pubkey, account_data));
-                }
-            }
-            None => {
-                info!(
-                    "Current slot {current_slot}'s leader's account \
-                     {current_slot_leader_vote_pubkey} not found.  It will not be paid."
-                )
-            }
-        }
+    if !paid_vote_accounts.is_empty() {
+        bank.store_accounts((current_slot, paid_vote_accounts.as_slice()));
     }
-
-    bank.store_accounts((current_slot, paid_vote_accounts.as_slice()));
     Ok(())
+}
+
+#[derive(Clone, Copy, Default)]
+struct VoteAccountUpdate {
+    reward: Option<(Epoch, u64)>,
+}
+
+impl VoteAccountUpdate {
+    fn add_reward(&mut self, reward_epoch: Epoch, reward: u64) {
+        match &mut self.reward {
+            Some((existing_epoch, total_reward)) => {
+                debug_assert_eq!(*existing_epoch, reward_epoch);
+                *total_reward = total_reward.saturating_add(reward);
+            }
+            None => self.reward = Some((reward_epoch, reward)),
+        }
+    }
 }
 
 /// Computes the voting reward in Lamports.
@@ -207,20 +233,18 @@ fn calculate_reward(
 ///
 /// If successful, returns the `AccountSharedData` that can be stored back into a `Bank`.
 fn update_vote_account(
-    current_epoch: Epoch,
-    reward_slot: Slot,
+    reward: Option<(Epoch, u64)>,
+    vote_state_update_slot: Slot,
     account: &VoteAccount,
     validator_vote_pubkey: Pubkey,
-    reward: u64,
     final_cert: Option<&ValidatedBlockFinalizationCert>,
 ) -> Option<AccountSharedData> {
     let versions = bincode::deserialize(account.account().data()).ok()?;
     let mut handle = VoteStateHandler::try_new_from_vote_state_versions(versions).ok()?;
     update_vote_state(
         &mut handle,
-        reward_slot,
-        current_epoch,
         reward,
+        vote_state_update_slot,
         validator_vote_pubkey,
         final_cert,
     );
@@ -235,10 +259,11 @@ fn update_vote_account(
     Some(paid_account)
 }
 
-/// Updates `epoch_credits`, `root_slot`, and `votes` in vote state using the rewards and finalization
-/// certificates from the footer.
+/// Updates `epoch_credits`, `root_slot`, and `votes` in vote state using the rewards and
+/// finalization certificates from the footer.
 ///
-/// `epoch_credits` are updated to record the rewards that the vote account has earned.
+/// `epoch_credits` are updated to record the rewards that the vote account has earned when a
+/// reward is present.
 ///
 /// Downstream tooling expects these fields to be be set:
 /// - `root_slot`, a validator's latest finalized & replayed slot
@@ -252,23 +277,28 @@ fn update_vote_account(
 ///
 /// Until we overhaul vote state we continue populating these two fields similar to TowerBFT:
 /// - `root_slot` is populated from the footer finalization certificate
-/// - `votes` is populated from the footer rewards aggregate
+/// - `votes` is populated from the footer rewards aggregate, or the finalization slot when no
+///   reward aggregate is available
 fn update_vote_state(
     handle: &mut VoteStateHandler,
-    reward_slot: Slot,
-    reward_epoch: Epoch,
-    reward: u64,
+    reward: Option<(Epoch, u64)>,
+    vote_state_update_slot: Slot,
     validator_vote_pubkey: Pubkey,
     final_cert: Option<&ValidatedBlockFinalizationCert>,
 ) {
-    handle.increment_credits(reward_epoch, reward);
+    if let Some((reward_epoch, reward)) = reward {
+        handle.increment_credits(reward_epoch, reward);
+    }
     if let Some(final_cert) = final_cert {
         if final_cert.was_signed_by(&validator_vote_pubkey) {
             handle.set_root_slot(Some(final_cert.slot()));
         }
     }
 
-    let latest_root_or_reward = handle.root_slot().unwrap_or(reward_slot).max(reward_slot);
+    let latest_root_or_reward = handle
+        .root_slot()
+        .unwrap_or(vote_state_update_slot)
+        .max(vote_state_update_slot);
     handle.set_votes(VecDeque::from([LandedVote {
         lockout: Lockout::new(latest_root_or_reward),
         latency: 0,
@@ -379,7 +409,8 @@ mod tests {
         let epoch = 1234;
         let reward = 3453423;
         let account_shared_data =
-            update_vote_account(epoch, 0, &account, Pubkey::default(), reward, None).unwrap();
+            update_vote_account(Some((epoch, reward)), 0, &account, Pubkey::default(), None)
+                .unwrap();
         let vote_state = vote_state_from_account(&account_shared_data);
         assert_eq!(reward, vote_state.epoch_credits().last().unwrap().1);
     }
@@ -597,6 +628,130 @@ mod tests {
         assert_eq!(
             vote_state.votes().front().unwrap().lockout.slot(),
             reward_slot
+        );
+    }
+
+    #[test]
+    fn calculate_and_pay_updates_final_cert_signer_when_not_rewarded() {
+        let validator_keypairs = (0..4)
+            .map(|_| ValidatorVoteKeypairs::new_rand())
+            .collect::<Vec<_>>();
+        let per_validator_stake = LAMPORTS_PER_SOL * 100;
+        let mut genesis_config = create_genesis_config_with_alpenglow_vote_accounts(
+            1_000_000_000,
+            &validator_keypairs,
+            vec![per_validator_stake; validator_keypairs.len()],
+        )
+        .genesis_config;
+        genesis_config.epoch_schedule = EpochSchedule::without_warmup();
+        genesis_config.rent = Rent::default();
+
+        let leader_node_pubkey = validator_keypairs[0].node_keypair.pubkey();
+        let leader_vote_pubkey = validator_keypairs[0].vote_keypair.pubkey();
+        let target_vote_pubkey = validator_keypairs[1].vote_keypair.pubkey();
+        let rewarded_vote_pubkey = validator_keypairs[2].vote_keypair.pubkey();
+        let slot_leader = SlotLeader {
+            id: leader_node_pubkey,
+            vote_address: leader_vote_pubkey,
+        };
+
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
+        let prev_bank = bank_forks.read().unwrap().root_bank();
+        let current_slot = prev_bank
+            .epoch_schedule
+            .get_first_slot_in_epoch(prev_bank.epoch() + 1)
+            + NUM_SLOTS_FOR_REWARD;
+        let bank = Bank::new_from_parent(prev_bank.clone(), slot_leader, current_slot);
+        let reward_slot = current_slot - NUM_SLOTS_FOR_REWARD;
+
+        let cert_rank = {
+            let rank_map = bank
+                .epoch_stakes_from_slot(bank.slot())
+                .unwrap()
+                .bls_pubkey_to_rank_map();
+            (0..rank_map.len())
+                .find_map(|rank| {
+                    rank_map.get_pubkey_stake_entry(rank).and_then(|entry| {
+                        (entry.vote_account_pubkey == target_vote_pubkey).then_some(rank)
+                    })
+                })
+                .unwrap()
+        };
+        let final_cert = build_fast_finalization_cert(&bank, &[cert_rank]);
+
+        calculate_and_pay_voting_reward_and_update_vote_state(
+            &bank,
+            Some((reward_slot, vec![rewarded_vote_pubkey])),
+            Some(&final_cert),
+        )
+        .unwrap();
+
+        let vote_state = vote_state_from_bank(&bank, &target_vote_pubkey);
+        assert!(vote_state.epoch_credits().is_empty());
+        assert_eq!(vote_state.root_slot(), Some(final_cert.slot()));
+        assert_eq!(vote_state.votes().len(), 1);
+        assert_eq!(
+            vote_state.votes().front().unwrap().lockout.slot(),
+            final_cert.slot().max(reward_slot)
+        );
+    }
+
+    #[test]
+    fn calculate_and_pay_updates_final_cert_signer_without_rewards() {
+        let validator_keypairs = (0..4)
+            .map(|_| ValidatorVoteKeypairs::new_rand())
+            .collect::<Vec<_>>();
+        let per_validator_stake = LAMPORTS_PER_SOL * 100;
+        let mut genesis_config = create_genesis_config_with_alpenglow_vote_accounts(
+            1_000_000_000,
+            &validator_keypairs,
+            vec![per_validator_stake; validator_keypairs.len()],
+        )
+        .genesis_config;
+        genesis_config.epoch_schedule = EpochSchedule::without_warmup();
+        genesis_config.rent = Rent::default();
+
+        let leader_node_pubkey = validator_keypairs[0].node_keypair.pubkey();
+        let leader_vote_pubkey = validator_keypairs[0].vote_keypair.pubkey();
+        let target_vote_pubkey = validator_keypairs[1].vote_keypair.pubkey();
+        let slot_leader = SlotLeader {
+            id: leader_node_pubkey,
+            vote_address: leader_vote_pubkey,
+        };
+
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
+        let prev_bank = bank_forks.read().unwrap().root_bank();
+        let current_slot = prev_bank
+            .epoch_schedule
+            .get_first_slot_in_epoch(prev_bank.epoch() + 1)
+            + NUM_SLOTS_FOR_REWARD;
+        let bank = Bank::new_from_parent(prev_bank.clone(), slot_leader, current_slot);
+
+        let cert_rank = {
+            let rank_map = bank
+                .epoch_stakes_from_slot(bank.slot())
+                .unwrap()
+                .bls_pubkey_to_rank_map();
+            (0..rank_map.len())
+                .find_map(|rank| {
+                    rank_map.get_pubkey_stake_entry(rank).and_then(|entry| {
+                        (entry.vote_account_pubkey == target_vote_pubkey).then_some(rank)
+                    })
+                })
+                .unwrap()
+        };
+        let final_cert = build_fast_finalization_cert(&bank, &[cert_rank]);
+
+        calculate_and_pay_voting_reward_and_update_vote_state(&bank, None, Some(&final_cert))
+            .unwrap();
+
+        let vote_state = vote_state_from_bank(&bank, &target_vote_pubkey);
+        assert!(vote_state.epoch_credits().is_empty());
+        assert_eq!(vote_state.root_slot(), Some(final_cert.slot()));
+        assert_eq!(vote_state.votes().len(), 1);
+        assert_eq!(
+            vote_state.votes().front().unwrap().lockout.slot(),
+            final_cert.slot()
         );
     }
 
