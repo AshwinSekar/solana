@@ -1,5 +1,8 @@
 use {
-    super::{repair_handler::RepairHandler, repair_response::repair_response_packet_from_bytes},
+    super::{
+        repair_handler::RepairHandler, repair_response::repair_response_packet_from_bytes,
+        standard_repair_handler::StandardRepairHandler,
+    },
     log::info,
     solana_clock::Slot,
     solana_entry::entry::Entry,
@@ -31,6 +34,7 @@ pub struct MaliciousRepairHandler {
     leader_schedule_cache: Arc<LeaderScheduleCache>,
     config: MaliciousRepairConfig,
     reed_solomon_cache: ReedSolomonCache,
+    standard_repair_handler: StandardRepairHandler,
 }
 
 impl MaliciousRepairHandler {
@@ -41,6 +45,7 @@ impl MaliciousRepairHandler {
         config: MaliciousRepairConfig,
     ) -> Self {
         Self {
+            standard_repair_handler: StandardRepairHandler::new(blockstore.clone()),
             blockstore,
             keypair,
             leader_schedule_cache,
@@ -176,13 +181,57 @@ impl RepairHandler for MaliciousRepairHandler {
 
     fn run_orphan(
         &self,
-        _recycler: &PacketBatchRecycler,
-        _from_addr: &SocketAddr,
-        _slot: Slot,
-        _max_responses: usize,
-        _nonce: Nonce,
+        recycler: &PacketBatchRecycler,
+        from_addr: &SocketAddr,
+        slot: Slot,
+        max_responses: usize,
+        nonce: Nonce,
     ) -> Option<PacketBatch> {
-        // Don't respond to orphan repair
-        None
+        self.standard_repair_handler
+            .run_orphan(recycler, from_addr, slot, max_responses, nonce)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::repair::standard_repair_handler::StandardRepairHandler,
+        solana_ledger::{
+            blockstore::{Blockstore, make_many_slot_entries},
+            genesis_utils::create_genesis_config,
+            get_tmp_ledger_path_auto_delete,
+        },
+        solana_runtime::bank::Bank,
+        std::net::SocketAddr,
+    };
+
+    #[test]
+    fn test_run_orphan_matches_standard_handler_when_not_equivocating() {
+        agave_logger::setup();
+        let recycler = PacketBatchRecycler::default();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let (shreds, _) = make_many_slot_entries(2, 3, 5);
+        blockstore.insert_shreds(shreds, None, false).unwrap();
+
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let bank = Bank::new_for_tests(&genesis_config);
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
+        let handler = MaliciousRepairHandler::new(
+            blockstore.clone(),
+            Arc::new(Keypair::new()),
+            leader_schedule_cache,
+            MaliciousRepairConfig::default(),
+        );
+        let standard = StandardRepairHandler::new(blockstore);
+        let from_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+        let nonce = 9;
+
+        let expected = standard.run_orphan(&recycler, &from_addr, 4, 5, nonce);
+        let actual = handler.run_orphan(&recycler, &from_addr, 4, 5, nonce);
+
+        assert!(actual.is_some());
+        assert_eq!(actual, expected);
     }
 }

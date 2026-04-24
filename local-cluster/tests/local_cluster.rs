@@ -6135,14 +6135,15 @@ fn test_alpenglow_basic_equivocation() {
         alpenglow_port_override: AlpenglowPortOverride::default(),
     });
 
+    let node_b_turbine_mode = TurbineMode::new(TurbineModeKind::TurbineDisabled);
     let mut b_validator_config = safe_clone_config(&a_validator_config);
-    b_validator_config.turbine_mode = TurbineMode::new(TurbineModeKind::TurbineDisabled);
+    b_validator_config.turbine_mode = node_b_turbine_mode.clone();
 
     // Equivocate every other slot, one shred per FEC set
     a_validator_config.repair_handler_type = RepairHandlerType::Malicious(MaliciousRepairConfig {
         bad_shred_slot_frequency: Some(2),
         bad_shred_index_frequency: Some(32), // Only equivocate for indices where index % 32 == 0
-        slot_range: Some((0, 50)),           // Only for the first few slots
+        slot_range: Some((0, 20)),           // Only for the first few slots
     });
 
     // Cluster config
@@ -6165,6 +6166,31 @@ fn test_alpenglow_basic_equivocation() {
 
     // Create local cluster
     let cluster = LocalCluster::new_alpenglow(&mut cluster_config, SocketAddrSpace::Unspecified);
+    let node_a_pubkey = validator_keys[0].node_keypair.pubkey();
+    let node_a_rpc_addr = cluster
+        .validators
+        .get(&node_a_pubkey)
+        .unwrap()
+        .info
+        .contact_info
+        .rpc()
+        .unwrap();
+    let client =
+        RpcClient::new_socket_with_commitment(node_a_rpc_addr, CommitmentConfig::processed());
+    loop {
+        match client.get_slot() {
+            Ok(slot) if slot > 20 => {
+                info!("Re-enabling NODE_B turbine after NODE_A reached slot {slot}");
+                node_b_turbine_mode.set(TurbineModeKind::Enabled);
+                break;
+            }
+            Ok(_) => sleep(Duration::from_millis(50)),
+            Err(err) => {
+                info!("Waiting to re-enable NODE_B turbine, failed to read NODE_A slot: {err}");
+                sleep(Duration::from_millis(50));
+            }
+        }
+    }
 
     // Ensure all nodes are rooting
     // Although the low staked node might be behind while the leader is equivocating,
