@@ -421,15 +421,6 @@ impl ConsensusPoolService {
         let start_slot = *highest_parent_ready;
         let end_slot = last_of_consecutive_leader_slots(start_slot);
 
-        if (start_slot..=end_slot).any(|s| ctx.blockstore.has_existing_shreds_for_slot(s)) {
-            warn!(
-                "{}: We have already produced shreds in the window {start_slot}-{end_slot}, \
-                 skipping production of our leader window",
-                ctx.cluster_info.id()
-            );
-            return;
-        }
-
         match consensus_pool
             .parent_ready_tracker
             .block_production_parent(start_slot)
@@ -586,7 +577,6 @@ mod tests {
         sharable_banks: SharableBanks,
         my_pubkey: Pubkey,
         my_vote_pubkey: Pubkey,
-        blockstore: Arc<Blockstore>,
         exit: Arc<AtomicBool>,
         cluster_info: Arc<ClusterInfo>,
         highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
@@ -616,8 +606,6 @@ mod tests {
             let bank0 = Bank::new_for_tests(&genesis.genesis_config);
             let bank_forks = BankForks::new_rw_arc(bank0);
 
-            let ledger_path = get_tmp_ledger_path_auto_delete!();
-            let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
             let sharable_banks = bank_forks.read().unwrap().sharable_banks();
             let leader_schedule_cache =
                 Arc::new(LeaderScheduleCache::new_from_bank(&sharable_banks.root()));
@@ -642,7 +630,6 @@ mod tests {
                 sharable_banks,
                 my_pubkey,
                 my_vote_pubkey,
-                blockstore,
                 exit: Arc::new(AtomicBool::new(false)),
                 cluster_info,
                 highest_finalized: Arc::new(RwLock::new(None)),
@@ -809,6 +796,10 @@ mod tests {
     #[test]
     fn test_send_produce_block_event() {
         let mut ctx = TestContext::default();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+
         let (repair_event_sender, _repair_event_receiver) = unbounded();
 
         // Find when is the next leader slot for me (validator 0)
@@ -850,15 +841,15 @@ mod tests {
             generated_cert_types: Arc::new(GeneratedCertTypes::default()),
             cluster_info: ctx.cluster_info.clone(),
             my_vote_pubkey: ctx.my_vote_pubkey,
-            blockstore: ctx.blockstore.clone(),
+            blockstore: Arc::new(blockstore),
             sharable_banks: ctx.sharable_banks.clone(),
             leader_schedule_cache: ctx.leader_schedule_cache.clone(),
             consensus_message_receiver: crossbeam_channel::unbounded().1,
             bls_sender: ctx.bls_sender.clone(),
             event_sender: crossbeam_channel::unbounded().0,
             commitment_sender: ctx.commitment_sender.clone(),
-            highest_finalized: ctx.highest_finalized.clone(),
             repair_event_sender,
+            highest_finalized: ctx.highest_finalized.clone(),
         };
 
         // Add a ParentReady event for the slot before our leader slot
