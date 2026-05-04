@@ -1339,7 +1339,7 @@ pub mod alpenglow {
     });
 
     #[cfg(not(feature = "dev-context-only-utils"))]
-    solana_pubkey::declare_id!("mustRekeyVm2QHYB3JPefBiU4BY3Z6JkW2k3Scw5GWP");
+    solana_pubkey::declare_id!("a1penGLz8Vm2QHYB3JPefBiU4BY3Z6JkW2k3Scw5GWP");
 
     #[cfg(feature = "dev-context-only-utils")]
     solana_pubkey::declare_id!("8KpruRFrT59jQ9NfFX9DU6j8a1hW7y6xchvZNQ5rxD4P");
