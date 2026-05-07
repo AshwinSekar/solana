@@ -108,23 +108,16 @@ impl StandardBroadcastRun {
                 bank.parent_slot(),
                 blockstore,
             )
-            .unwrap_or_else(|err: Error| {
-                error!("Unknown chained Merkle root: {err:?}");
-                process_stats.err_unknown_chained_merkle_root += 1;
-                Hash::default()
+            .unwrap_or_else(|_| {
+                // This is a snapshot slot that we don't have the shreds for. Use the block id from the snapshot
+                bank.parent_block_id()
+                    .expect("All banks (including snapshot banks) must have a block id")
             })
         };
 
-        let parent_block_id = bank.parent_block_id().unwrap_or_else(|| {
-            // Once SIMD-0333 is active, we can just hard unwrap here.
-            error!(
-                "Parent block id missing for slot {} parent {}",
-                bank.slot(),
-                bank.parent_slot()
-            );
-            process_stats.err_unknown_parent_block_id += 1;
-            Hash::default()
-        });
+        let parent_block_id = bank
+            .parent_block_id()
+            .expect("All banks (including snapshot banks) must have a block id");
 
         self.slot = bank.slot();
         self.parent = bank.parent_slot();
