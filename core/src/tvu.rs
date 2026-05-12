@@ -57,8 +57,12 @@ use {
         rpc_subscriptions::RpcSubscriptions, slot_status_notifier::SlotStatusNotifier,
     },
     solana_runtime::{
-        bank::MAX_ALPENGLOW_VOTE_ACCOUNTS, bank_forks::BankForks, commitment::BlockCommitmentCache,
-        prioritization_fee_cache::PrioritizationFeeCache, snapshot_controller::SnapshotController,
+        bank::MAX_ALPENGLOW_VOTE_ACCOUNTS,
+        bank_forks::BankForks,
+        bank_forks_controller::{BankForksCommandReceiver, BankForksController},
+        commitment::BlockCommitmentCache,
+        prioritization_fee_cache::PrioritizationFeeCache,
+        snapshot_controller::SnapshotController,
         validated_block_finalization::ValidatedBlockFinalizationCert,
         vote_sender_types::ReplayVoteSender,
     },
@@ -160,6 +164,8 @@ pub struct AlpenglowInitializationState {
     pub replay_highest_frozen: Arc<ReplayHighestFrozen>,
     pub highest_parent_ready: Arc<RwLock<(Slot, (Slot, Hash))>>,
     pub highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
+    pub bank_forks_controller: Arc<dyn BankForksController>,
+    pub bank_forks_controller_receiver: BankForksCommandReceiver,
 
     // Main communication channel
     pub votor_event_sender: VotorEventSender,
@@ -245,6 +251,8 @@ impl Tvu {
             leader_window_info_sender,
             replay_highest_frozen,
             highest_parent_ready,
+            bank_forks_controller,
+            bank_forks_controller_receiver,
             votor_event_sender,
             votor_event_receiver,
             cancel,
@@ -463,30 +471,28 @@ impl Tvu {
             wait_to_vote_slot,
             vote_history,
             vote_history_storage: vote_history_storage.clone(),
+            generated_cert_types,
             authorized_voter_keypairs: authorized_voter_keypairs.clone(),
             blockstore: blockstore.clone(),
             bank_forks: bank_forks.clone(),
             cluster_info: cluster_info.clone(),
             leader_schedule_cache: leader_schedule_cache.clone(),
-            rpc_subscriptions: rpc_subscriptions.clone(),
-            snapshot_controller: snapshot_controller.clone(),
+            consensus_metrics_sender,
+            highest_finalized,
+            bank_forks_controller,
             bls_sender: bls_sender.clone(),
             commitment_sender: votor_commitment_sender,
-            drop_bank_sender: drop_bank_sender.clone(),
             bank_notification_sender: bank_notification_sender.clone(),
             leader_window_info_sender,
             highest_parent_ready,
             event_sender: votor_event_sender.clone(),
-            event_receiver: votor_event_receiver,
             own_vote_sender: consensus_message_sender.clone(),
+            reward_certs_sender,
+            event_receiver: votor_event_receiver,
             consensus_message_receiver,
-            consensus_metrics_sender,
             consensus_metrics_receiver,
             reward_votes_receiver,
-            reward_certs_sender,
             build_reward_certs_receiver,
-            generated_cert_types,
-            highest_finalized,
         };
         let votor = Votor::new(votor_config);
 
@@ -518,6 +524,7 @@ impl Tvu {
             duplicate_confirmed_slots_receiver,
             gossip_verified_vote_hash_receiver,
             popular_pruned_forks_receiver,
+            bank_forks_controller_receiver,
         };
 
         let replay_stage_config = ReplayStageConfig {
@@ -691,7 +698,7 @@ pub mod tests {
         solana_net_utils::SocketAddrSpace,
         solana_poh::poh_recorder::create_test_recorder,
         solana_rpc::optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
-        solana_runtime::bank::Bank,
+        solana_runtime::{bank::Bank, bank_forks_controller::BankForksControllerHandle},
         solana_signer::Signer,
         solana_tpu_client::tpu_client::{DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC},
         std::{
@@ -786,6 +793,9 @@ pub mod tests {
         });
         let (reward_certs_sender, _reward_certs_receiver) = bounded(1);
         let (_build_reward_certs_sender, build_reward_certs_receiver) = bounded(1);
+        let (bank_forks_controller, bank_forks_controller_receiver) =
+            BankForksControllerHandle::new();
+        let bank_forks_controller = Arc::new(bank_forks_controller);
 
         let tvu = Tvu::new(
             &vote_keypair.pubkey(),
@@ -853,6 +863,8 @@ pub mod tests {
                 bls_connection_cache: Arc::new(bls_connection_cache),
                 voting_service_test_override: None,
                 highest_finalized: Arc::new(RwLock::new(None)),
+                bank_forks_controller,
+                bank_forks_controller_receiver,
                 build_reward_certs_receiver,
                 reward_certs_sender,
             },
