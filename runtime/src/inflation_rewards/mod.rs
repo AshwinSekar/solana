@@ -1,10 +1,12 @@
 //! Information about stake and voter rewards based on stake state.
-
+#[cfg(feature = "dev-context-only-utils")]
+use qualifier_attr::qualifiers;
 use {
     self::points::{
         CalculatedStakePoints, CalculationEnvironment, DelegatedVoteState,
         InflationPointCalculationEvent, SkippedReason, calculate_stake_points_and_credits,
     },
+    crate::inflation_rewards::points::CalcEpochType,
     solana_instruction::error::InstructionError,
     solana_stake_interface::{
         error::StakeError,
@@ -34,6 +36,7 @@ pub(crate) fn redeem_rewards<'a>(
     calculation_environment: CalculationEnvironment<'a>,
     inflation_point_calc_tracer: Option<impl Fn(&InflationPointCalculationEvent)>,
     stake_account_lamports_for_trace: u64,
+    calc_epoch_type: CalcEpochType,
 ) -> Result<(u64, u64, Stake), InstructionError> {
     if let StakeStateV2::Stake(_meta, stake, _stake_flags) = stake_state {
         if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
@@ -73,6 +76,7 @@ pub(crate) fn redeem_rewards<'a>(
             vote_state,
             calculation_environment,
             inflation_point_calc_tracer,
+            calc_epoch_type,
         ) {
             Ok((stakers_reward, voters_reward, stake))
         } else {
@@ -89,6 +93,7 @@ fn redeem_stake_rewards<'a>(
     vote_state: DelegatedVoteState,
     calculation_environment: CalculationEnvironment<'a>,
     inflation_point_calc_tracer: Option<impl Fn(&InflationPointCalculationEvent)>,
+    calc_epoch_type: CalcEpochType,
 ) -> Option<(u64, u64)> {
     if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
         inflation_point_calc_tracer(&InflationPointCalculationEvent::CreditsObserved(
@@ -102,6 +107,7 @@ fn redeem_stake_rewards<'a>(
         vote_state,
         calculation_environment,
         inflation_point_calc_tracer.as_ref(),
+        calc_epoch_type,
     )
     .map(|calculated_stake_rewards| {
         if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer {
@@ -132,6 +138,7 @@ fn calculate_stake_rewards<'a>(
     vote_state: DelegatedVoteState,
     calculation_environment: CalculationEnvironment<'a>,
     inflation_point_calc_tracer: Option<impl Fn(&InflationPointCalculationEvent)>,
+    calc_epoch_type: CalcEpochType,
 ) -> Option<CalculatedStakeRewards> {
     let CalculationEnvironment {
         stake_history,
@@ -140,9 +147,11 @@ fn calculate_stake_rewards<'a>(
         rewarded_epoch,
         ..
     } = calculation_environment;
+
     // ensure to run to trigger (optional) inflation_point_calc_tracer
     let CalculatedStakePoints {
-        points,
+        tower_points,
+        ag_points,
         new_credits_observed,
         mut force_credits_update_with_skipped_reward,
     } = calculate_stake_points_and_credits(
@@ -151,6 +160,7 @@ fn calculate_stake_rewards<'a>(
         stake_history,
         inflation_point_calc_tracer.as_ref(),
         new_rate_activation_epoch,
+        &calc_epoch_type,
     );
 
     // Drive credits_observed forward unconditionally when rewards are disabled
@@ -176,25 +186,69 @@ fn calculate_stake_rewards<'a>(
         });
     }
 
-    if points == 0 {
-        if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
-            inflation_point_calc_tracer(&SkippedReason::ZeroPoints.into());
+    let rewards = match calc_epoch_type {
+        CalcEpochType::Alpenglow { .. } => {
+            if ag_points == 0 {
+                if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
+                    inflation_point_calc_tracer(&SkippedReason::ZeroPoints.into());
+                }
+                return None;
+            }
+            // In alpenglow, `points` represents the actual reward that this `vote_state` earned.
+            ag_points
         }
-        return None;
-    }
-    if point_value.points == 0 {
-        if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
-            inflation_point_calc_tracer(&SkippedReason::ZeroPointValue.into());
+        CalcEpochType::Tower { .. } => {
+            if tower_points == 0 {
+                if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
+                    inflation_point_calc_tracer(&SkippedReason::ZeroPoints.into());
+                }
+                return None;
+            }
+            if point_value.points == 0 {
+                if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
+                    inflation_point_calc_tracer(&SkippedReason::ZeroPointValue.into());
+                }
+                return None;
+            }
+            // In tower, `points` still needs to be scaled by `point_value` to calculate this
+            // `vote_state` earned.
+            // The final unwrap is safe, as points_value.points is guaranteed to be non zero above.
+            tower_points
+                .checked_mul(u128::from(point_value.rewards))
+                .expect("Rewards intermediate calculation should fit within u128")
+                .checked_div(point_value.points)
+                .unwrap()
         }
-        return None;
-    }
-
-    // The final unwrap is safe, as points_value.points is guaranteed to be non zero above.
-    let rewards = points
-        .checked_mul(u128::from(point_value.rewards))
-        .expect("Rewards intermediate calculation should fit within u128")
-        .checked_div(point_value.points)
-        .unwrap();
+        CalcEpochType::Migrating {
+            num_tower_slots,
+            num_ag_slots,
+            epoch_stakes: _,
+        } => {
+            if tower_points == 0 && ag_points == 0 {
+                if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
+                    inflation_point_calc_tracer(&SkippedReason::ZeroPoints.into());
+                }
+                return None;
+            }
+            if ag_points == 0 && point_value.points == 0 {
+                if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
+                    inflation_point_calc_tracer(&SkippedReason::ZeroPointValue.into());
+                }
+                return None;
+            }
+            let total_slots = (num_tower_slots + num_ag_slots) as u128;
+            let tower_points = tower_points
+                .checked_mul(u128::from(point_value.rewards))
+                .expect("Rewards intermediate calculation should fit within u128")
+                .checked_div(point_value.points)
+                .unwrap()
+                .checked_mul(num_tower_slots as u128)
+                .unwrap()
+                .checked_div(total_slots)
+                .unwrap();
+            tower_points + ag_points
+        }
+    };
 
     let rewards = u64::try_from(rewards).expect("Rewards should fit within u64");
 
@@ -238,6 +292,7 @@ fn calculate_stake_rewards<'a>(
 ///   indicate with false for was_split
 ///
 /// DEVELOPER NOTE:  This function used to be a method on VoteState, but was moved here
+#[cfg_attr(any(test, feature = "dev-context-only-utils"), qualifiers(pub(crate)))]
 fn commission_split(commission_bps: u16, on: u64) -> (u64, u64, bool) {
     const MAX_BPS: u16 = 10_000;
     const MAX_BPS_U128: u128 = MAX_BPS as u128;
@@ -280,7 +335,7 @@ mod tests {
         solana_pubkey::Pubkey,
         solana_stake_interface::{stake_history::StakeHistory, state::Delegation},
         solana_vote_program::vote_state::{VoteStateV4, handler::VoteStateHandler},
-        test_case::test_case,
+        test_case::{test_case, test_matrix},
     };
 
     fn new_stake(
@@ -295,8 +350,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_stake_state_redeem_rewards() {
+    #[test_matrix([true, false])]
+    fn test_stake_state_redeem_rewards(ag_enabled: bool) {
         let mut vote_state = VoteStateHandler::new_v4(VoteStateV4::default());
         // assume stake.stake() is right
         // bootstrap means fully-vested stake at epoch 0
@@ -310,6 +365,29 @@ mod tests {
         let stake_history = &StakeHistory::default();
         let new_rate_activation_epoch = None;
         let commission_rate_in_basis_points = true;
+
+        // epoch credits work differently in AG, so we need a multiplier to account for that.
+        let (calc_epoch_type, ag_total_stake_multiplier) = if ag_enabled {
+            let (calc_epoch_type, ag_total_stake_multiplier, _) = CalcEpochType::new_for_tests();
+            (calc_epoch_type, ag_total_stake_multiplier)
+        } else {
+            (
+                CalcEpochType::Tower {
+                    migration_epoch: None,
+                },
+                1,
+            )
+        };
+
+        let inc_credits = |handler: &mut VoteStateHandler, epoch: Epoch, credits: u64| {
+            if ag_enabled {
+                let (_, _, first_ag_epoch) = CalcEpochType::new_for_tests();
+                handler
+                    .increment_credits(epoch + first_ag_epoch, credits * ag_total_stake_multiplier);
+            } else {
+                handler.increment_credits(epoch, credits);
+            }
+        };
 
         // this one can't collect now, credits_observed == vote_state.credits()
         assert_eq!(
@@ -329,12 +407,12 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone()
             )
         );
 
         // put 2 credits in at epoch 0
-        vote_state.increment_credits(0, 1);
-        vote_state.increment_credits(0, 1);
+        inc_credits(&mut vote_state, 0, 2);
 
         // this one should be able to collect exactly 2
         assert_eq!(
@@ -354,6 +432,7 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone()
             )
         );
 
@@ -361,11 +440,11 @@ mod tests {
             stake.delegation.stake,
             stake_lamports + (stake_lamports * 2)
         );
-        assert_eq!(stake.credits_observed, 2);
+        assert_eq!(stake.credits_observed, 2 * ag_total_stake_multiplier);
     }
 
-    #[test]
-    fn test_stake_state_calculate_rewards() {
+    #[test_matrix([true, false])]
+    fn test_stake_state_calculate_rewards(ag_enabled: bool) {
         let mut vote_state = VoteStateHandler::new_v4(VoteStateV4::default());
         // assume stake.stake() is right
         // bootstrap means fully-vested stake at epoch 0
@@ -374,6 +453,29 @@ mod tests {
         let stake_history = &StakeHistory::default();
         let new_rate_activation_epoch = None;
         let commission_rate_in_basis_points = true;
+
+        // epoch credits work differently in AG, so we need a multiplier to account for that.
+        let (calc_epoch_type, ag_total_stake_multiplier) = if ag_enabled {
+            let (calc_epoch_type, ag_total_stake_multiplier, _) = CalcEpochType::new_for_tests();
+            (calc_epoch_type, ag_total_stake_multiplier)
+        } else {
+            (
+                CalcEpochType::Tower {
+                    migration_epoch: None,
+                },
+                1,
+            )
+        };
+
+        let inc_credits = |handler: &mut VoteStateHandler, epoch: Epoch, credits: u64| {
+            if ag_enabled {
+                let (_, _, first_ag_epoch) = CalcEpochType::new_for_tests();
+                handler
+                    .increment_credits(epoch + first_ag_epoch, credits * ag_total_stake_multiplier);
+            } else {
+                handler.increment_credits(epoch, credits);
+            }
+        };
 
         // this one can't collect now, credits_observed == vote_state.credits()
         assert_eq!(
@@ -393,19 +495,19 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone(),
             )
         );
 
         // put 2 credits in at epoch 0
-        vote_state.increment_credits(0, 1);
-        vote_state.increment_credits(0, 1);
+        inc_credits(&mut vote_state, 0, 2);
 
         // this one should be able to collect exactly 2
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: stake.delegation.stake * 2,
                 voter_rewards: 0,
-                new_credits_observed: 2,
+                new_credits_observed: 2 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -422,16 +524,17 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone(),
             )
         );
 
-        stake.credits_observed = 1;
+        stake.credits_observed = ag_total_stake_multiplier;
         // this one should be able to collect exactly 1 (already observed one)
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: stake.delegation.stake,
                 voter_rewards: 0,
-                new_credits_observed: 2,
+                new_credits_observed: 2 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -448,19 +551,20 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone(),
             )
         );
 
         // put 1 credit in epoch 1
-        vote_state.increment_credits(1, 1);
+        inc_credits(&mut vote_state, 1, 1);
 
-        stake.credits_observed = 2;
+        stake.credits_observed = 2 * ag_total_stake_multiplier;
         // this one should be able to collect the one just added
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: stake.delegation.stake,
                 voter_rewards: 0,
-                new_credits_observed: 3,
+                new_credits_observed: 3 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -477,17 +581,18 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone(),
             )
         );
 
         // put 1 credit in epoch 2
-        vote_state.increment_credits(2, 1);
+        inc_credits(&mut vote_state, 2, 1);
         // this one should be able to collect 2 now
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: stake.delegation.stake * 2,
                 voter_rewards: 0,
-                new_credits_observed: 4,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -504,6 +609,7 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone(),
             )
         );
 
@@ -516,7 +622,7 @@ mod tests {
                     + stake.delegation.stake // epoch 1
                     + stake.delegation.stake, // epoch 2
                 voter_rewards: 0,
-                new_credits_observed: 4,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -533,6 +639,7 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone(),
             )
         );
 
@@ -556,6 +663,7 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone(),
             )
         );
         vote_state.set_inflation_rewards_commission_bps(9900);
@@ -576,6 +684,7 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone(),
             )
         );
 
@@ -586,7 +695,7 @@ mod tests {
             Some(CalculatedStakeRewards {
                 staker_rewards: 0,
                 voter_rewards: 0,
-                new_credits_observed: 4,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -603,17 +712,18 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone(),
             )
         );
 
         // credits_observed remains at previous level when vote_state credits are
         // not advancing and inflation is disabled
-        stake.credits_observed = 4;
+        stake.credits_observed = 4 * ag_total_stake_multiplier;
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: 0,
                 voter_rewards: 0,
-                new_credits_observed: 4,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -630,13 +740,15 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone(),
             )
         );
 
         assert_eq!(
             CalculatedStakePoints {
-                points: 0,
-                new_credits_observed: 4,
+                tower_points: 0,
+                ag_points: 0,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
                 force_credits_update_with_skipped_reward: false,
             },
             calculate_stake_points_and_credits(
@@ -644,18 +756,20 @@ mod tests {
                 DelegatedVoteState::from(vote_state.as_ref_v4()),
                 &StakeHistory::default(),
                 null_tracer(),
-                None
+                None,
+                &calc_epoch_type,
             )
         );
 
         // credits_observed is auto-rewound when vote_state credits are assumed to have been
         // recreated
-        stake.credits_observed = 1000;
+        stake.credits_observed = 1000 * ag_total_stake_multiplier;
         // this is new behavior 1; return the post-recreation rewound credits from the vote account
         assert_eq!(
             CalculatedStakePoints {
-                points: 0,
-                new_credits_observed: 4,
+                tower_points: 0,
+                ag_points: 0,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
                 force_credits_update_with_skipped_reward: true,
             },
             calculate_stake_points_and_credits(
@@ -663,15 +777,17 @@ mod tests {
                 DelegatedVoteState::from(vote_state.as_ref_v4()),
                 &StakeHistory::default(),
                 null_tracer(),
-                None
+                None,
+                &calc_epoch_type,
             )
         );
         // this is new behavior 2; don't hint when credits both from stake and vote are identical
-        stake.credits_observed = 4;
+        stake.credits_observed = 4 * ag_total_stake_multiplier;
         assert_eq!(
             CalculatedStakePoints {
-                points: 0,
-                new_credits_observed: 4,
+                tower_points: 0,
+                ag_points: 0,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
                 force_credits_update_with_skipped_reward: false,
             },
             calculate_stake_points_and_credits(
@@ -679,19 +795,20 @@ mod tests {
                 DelegatedVoteState::from(vote_state.as_ref_v4()),
                 &StakeHistory::default(),
                 null_tracer(),
-                None
+                None,
+                &calc_epoch_type,
             )
         );
 
         // get rewards and credits observed when not the activation epoch
         vote_state.set_inflation_rewards_commission_bps(0);
-        stake.credits_observed = 3;
+        stake.credits_observed = 3 * ag_total_stake_multiplier;
         stake.delegation.activation_epoch = 1;
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: stake.delegation.stake, // epoch 2
                 voter_rewards: 0,
-                new_credits_observed: 4,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -708,18 +825,19 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone(),
             )
         );
 
         // credits_observed is moved forward for the stake's activation epoch,
         // and no rewards are perceived
         stake.delegation.activation_epoch = 2;
-        stake.credits_observed = 3;
+        stake.credits_observed = 3 * ag_total_stake_multiplier;
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: 0,
                 voter_rewards: 0,
-                new_credits_observed: 4,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -736,6 +854,7 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                calc_epoch_type.clone(),
             )
         );
     }
@@ -765,11 +884,14 @@ mod tests {
                 commission_rate_in_basis_points,
             },
             null_tracer(),
+            CalcEpochType::Tower {
+                migration_epoch: None,
+            },
         );
     }
 
-    #[test]
-    fn test_stake_state_calculate_points_with_typical_values() {
+    #[test_matrix([true, false])]
+    fn test_stake_state_calculate_points_with_typical_values(ag_enabled: bool) {
         let vote_state = VoteStateHandler::new_v4(VoteStateV4::default());
 
         // bootstrap means fully-vested stake at epoch 0 with
@@ -783,6 +905,15 @@ mod tests {
         let stake_history = &StakeHistory::default();
         let new_rate_activation_epoch = None;
         let commission_rate_in_basis_points = true;
+
+        let ag_stake_state = if ag_enabled {
+            let (state, _stake, _first_ag_epoch) = CalcEpochType::new_for_tests();
+            state
+        } else {
+            CalcEpochType::Tower {
+                migration_epoch: None,
+            }
+        };
 
         // this one can't collect now, credits_observed == vote_state.credits()
         assert_eq!(
@@ -802,6 +933,7 @@ mod tests {
                     commission_rate_in_basis_points,
                 },
                 null_tracer(),
+                ag_stake_state
             )
         );
     }
