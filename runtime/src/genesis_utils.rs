@@ -320,18 +320,18 @@ pub fn activate_all_features_alpenglow(genesis_config: &mut GenesisConfig) {
 
     // This is a dev cluster with alpenglow enabled at genesis. We don't want to test the migration pathway
     // so we add a fake genesis certificate.
-    let cert = Certificate {
-        cert_type: CertificateType::Genesis(0, Hash::default()),
-        signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
-        bitmap: Vec::default(),
-    };
-    let cert_size = bincode::serialized_size(&cert).unwrap();
-    let lamports = Rent::default().minimum_balance(cert_size as usize);
-    let certificate_account = Account::new_data(lamports, &cert, &system_program::ID).unwrap();
+    // let cert = Certificate {
+    //     cert_type: CertificateType::Genesis(0, Hash::default()),
+    //     signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
+    //     bitmap: Vec::default(),
+    // };
+    // let cert_size = bincode::serialized_size(&cert).unwrap();
+    // let lamports = Rent::default().minimum_balance(cert_size as usize);
+    // let certificate_account = Account::new_data(lamports, &cert, &system_program::ID).unwrap();
 
-    genesis_config
-        .accounts
-        .insert(*GENESIS_CERTIFICATE_ACCOUNT, certificate_account);
+    // genesis_config
+    //     .accounts
+    //     .insert(*GENESIS_CERTIFICATE_ACCOUNT, certificate_account);
     EpochInflationAccountState::insert_into_genesis_config(genesis_config);
 }
 
