@@ -1,7 +1,13 @@
 //! Information about points calculation based on stake state.
 
 use {
-    solana_clock::Epoch,
+    crate::{
+        bank::{Bank, EpochType},
+        block_component_processor::vote_reward::AG_MIGRATION_EPOCH_CREDIT,
+        epoch_stakes::VersionedEpochStakes,
+    },
+    log::error,
+    solana_clock::{Epoch, Slot},
     solana_instruction::error::InstructionError,
     solana_pubkey::Pubkey,
     solana_stake_interface::{
@@ -9,8 +15,10 @@ use {
         state::{Delegation, Stake, StakeStateV2},
     },
     solana_vote::vote_state_view::VoteStateView,
-    std::cmp::Ordering,
+    std::{cmp::Ordering, collections::HashMap},
 };
+#[cfg(test)]
+use {solana_vote::vote_account::VoteAccount, std::sync::LazyLock};
 
 /// captures a rewards round as lamports to be awarded
 ///  and the total points over which those lamports
@@ -24,7 +32,8 @@ pub struct PointValue {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CalculatedStakePoints {
-    pub(crate) points: u128,
+    pub(crate) tower_points: u128,
+    pub(crate) ag_points: u128,
     pub(crate) new_credits_observed: u64,
     pub(crate) force_credits_update_with_skipped_reward: bool,
 }
@@ -98,6 +107,7 @@ pub(crate) fn calculate_points(
     vote_state: DelegatedVoteState,
     stake_history: &StakeHistory,
     new_rate_activation_epoch: Option<Epoch>,
+    calc_epoch_type: &CalcEpochType,
 ) -> Result<u128, InstructionError> {
     if let StakeStateV2::Stake(_meta, stake, _stake_flags) = stake_state {
         Ok(calculate_stake_points(
@@ -106,6 +116,7 @@ pub(crate) fn calculate_points(
             stake_history,
             null_tracer(),
             new_rate_activation_epoch,
+            calc_epoch_type,
         ))
     } else {
         Err(InstructionError::InvalidAccountData)
@@ -118,78 +129,136 @@ fn calculate_stake_points(
     stake_history: &StakeHistory,
     inflation_point_calc_tracer: Option<impl Fn(&InflationPointCalculationEvent)>,
     new_rate_activation_epoch: Option<Epoch>,
+    calc_epoch_type: &CalcEpochType,
 ) -> u128 {
-    calculate_stake_points_and_credits(
+    let res = calculate_stake_points_and_credits(
         stake,
         vote_state,
         stake_history,
         inflation_point_calc_tracer,
         new_rate_activation_epoch,
-    )
-    .points
+        calc_epoch_type,
+    );
+    match calc_epoch_type {
+        CalcEpochType::Alpenglow { .. } => res.ag_points,
+        CalcEpochType::Tower { .. } | CalcEpochType::Migrating { .. } => res.tower_points,
+    }
 }
 
-/// for a given stake and vote_state, calculate how many
-///   points were earned (credits * stake) and new value
-///   for credits_observed were the points paid
-pub(crate) fn calculate_stake_points_and_credits(
+/// Alpenglow related state needed in `calculate_stake_points_and_credits`.
+#[derive(Debug, Clone)]
+pub(crate) enum CalcEpochType<'a> {
+    /// Function is called when Tower is active for the entire epoch.
+    Tower { migration_epoch: Option<Epoch> },
+    /// Function is called when we migrate from Tower to Alpenglow.
+    Migrating {
+        num_tower_slots: Slot,
+        num_ag_slots: Slot,
+        /// `epoch_stakes` from the current bank.
+        epoch_stakes: &'a HashMap<Epoch, VersionedEpochStakes>,
+    },
+    /// Function is called when Alpenglow is active for the entire epoch.
+    Alpenglow {
+        migration_epoch: Epoch,
+        /// `epoch_stakes` from the current bank.
+        epoch_stakes: &'a HashMap<Epoch, VersionedEpochStakes>,
+    },
+}
+
+impl<'a> CalcEpochType<'a> {
+    pub(crate) fn new(bank: &'a Bank, epoch_type: &EpochType) -> Self {
+        match epoch_type {
+            EpochType::Tower { migration_epoch } => Self::Tower {
+                migration_epoch: *migration_epoch,
+            },
+            EpochType::FullAlpenglow { migration_epoch } => Self::Alpenglow {
+                epoch_stakes: bank.epoch_stakes_map(),
+                migration_epoch: *migration_epoch,
+            },
+            EpochType::MigrationEpoch { migration_slot } => {
+                let migration_epoch = bank.epoch_schedule.get_epoch(*migration_slot);
+                let first_slot_in_epoch =
+                    bank.epoch_schedule.get_first_slot_in_epoch(migration_epoch);
+                let num_tower_slots = migration_slot - first_slot_in_epoch;
+                let slots_in_epoch = bank.epoch_schedule.get_slots_in_epoch(migration_epoch);
+                let num_ag_slots = slots_in_epoch - num_tower_slots;
+                CalcEpochType::Migrating {
+                    epoch_stakes: bank.epoch_stakes_map(),
+                    num_tower_slots,
+                    num_ag_slots,
+                }
+            }
+        }
+    }
+
+    /// Returns the total stake delegated to `vote_pubkey` in the given `epoch`.
+    fn get_total_stake(
+        vote_pubkey: Pubkey,
+        epoch_stakes: &HashMap<Epoch, VersionedEpochStakes>,
+        epoch: Epoch,
+    ) -> Result<u64, String> {
+        let Some(rank_map) = epoch_stakes.get(&epoch).map(|e| e.bls_pubkey_to_rank_map()) else {
+            return Err(format!(
+                "epoch_stakes.get(epoch={epoch}) for vote_pubkey={vote_pubkey} failed"
+            ));
+        };
+        let Some(rank) = rank_map.get_rank_for_vote_pubkey(&vote_pubkey) else {
+            return Err(format!(
+                "get_rank_for_vote_pubkey(vote_pubkey={vote_pubkey}) in epoch={epoch} failed"
+            ));
+        };
+        let Some(entry) = rank_map.get_pubkey_stake_entry(*rank as usize) else {
+            return Err(format!(
+                "get_pubkey_stake_entry(rank={rank}) for vote_pubkey={vote_pubkey} in \
+                 epoch={epoch} failed",
+            ));
+        };
+        Ok(entry.stake)
+    }
+
+    /// Returns an instance of `Self`, total stake, and first AG epoch.
+    #[cfg(test)]
+    pub(super) fn new_for_tests() -> (Self, u64, Epoch) {
+        static STATE: LazyLock<(HashMap<Epoch, VersionedEpochStakes>, u64)> = LazyLock::new(|| {
+            let total_stake = 1_000;
+            let vote_account = VoteAccount::new_random();
+            let vote_account_hash_map = [(Pubkey::default(), (total_stake, vote_account))]
+                .into_iter()
+                .collect();
+            let versioned_epoch_stakes =
+                VersionedEpochStakes::new_for_tests(vote_account_hash_map, 0);
+            (
+                (0..10)
+                    .map(|epoch| (epoch, versioned_epoch_stakes.clone()))
+                    .collect(),
+                total_stake,
+            )
+        });
+        let migration_epoch = 0;
+        let first_ag_epoch = migration_epoch + 1;
+        (
+            Self::Alpenglow {
+                migration_epoch,
+                epoch_stakes: &STATE.0,
+            },
+            STATE.1,
+            first_ag_epoch,
+        )
+    }
+}
+
+fn tower_epoch_credits_iter(
     stake: &Stake,
-    vote_state: DelegatedVoteState,
+    epoch_credits_iter: impl Iterator<Item = (Epoch, u64, u64)>,
     stake_history: &StakeHistory,
     inflation_point_calc_tracer: Option<impl Fn(&InflationPointCalculationEvent)>,
     new_rate_activation_epoch: Option<Epoch>,
-) -> CalculatedStakePoints {
-    let credits_in_stake = stake.credits_observed;
-    let credits_in_vote = vote_state.credits;
-    // if there is no newer credits since observed, return no point
-    match credits_in_vote.cmp(&credits_in_stake) {
-        Ordering::Less => {
-            if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
-                inflation_point_calc_tracer(&SkippedReason::ZeroCreditsAndReturnRewound.into());
-            }
-            // Don't adjust stake.activation_epoch for simplicity:
-            //  - generally fast-forwarding stake.activation_epoch forcibly (for
-            //    artificial re-activation with re-warm-up) skews the stake
-            //    history sysvar. And properly handling all the cases
-            //    regarding deactivation epoch/warm-up/cool-down without
-            //    introducing incentive skew is hard.
-            //  - Conceptually, it should be acceptable for the staked SOLs at
-            //    the recreated vote to receive rewards again immediately after
-            //    rewind even if it looks like instant activation. That's
-            //    because it must have passed the required warmed-up at least
-            //    once in the past already
-            //  - Also such a stake account remains to be a part of overall
-            //    effective stake calculation even while the vote account is
-            //    missing for (indefinite) time or remains to be pre-remove
-            //    credits score. It should be treated equally to staking with
-            //    delinquent validator with no differentiation.
-
-            // hint with true to indicate some exceptional credits handling is needed
-            return CalculatedStakePoints {
-                points: 0,
-                new_credits_observed: credits_in_vote,
-                force_credits_update_with_skipped_reward: true,
-            };
-        }
-        Ordering::Equal => {
-            if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
-                inflation_point_calc_tracer(&SkippedReason::ZeroCreditsAndReturnCurrent.into());
-            }
-            // don't hint caller and return current value if credits remain unchanged (= delinquent)
-            return CalculatedStakePoints {
-                points: 0,
-                new_credits_observed: credits_in_stake,
-                force_credits_update_with_skipped_reward: false,
-            };
-        }
-        Ordering::Greater => {}
-    }
-
+) -> (u128, u64) {
     let mut points = 0;
+    let credits_in_stake = stake.credits_observed;
     let mut new_credits_observed = credits_in_stake;
 
-    for epoch_credits_item in vote_state.epoch_credits_iter {
-        let (epoch, final_epoch_credits, initial_epoch_credits) = epoch_credits_item;
+    for (epoch, final_epoch_credits, initial_epoch_credits) in epoch_credits_iter {
         let stake_amount = u128::from(stake.delegation.stake(
             epoch,
             stake_history,
@@ -227,9 +296,253 @@ pub(crate) fn calculate_stake_points_and_credits(
             ));
         }
     }
+    (points, new_credits_observed)
+}
 
+fn ag_epoch_credits_iter(
+    stake: &Stake,
+    epoch_credits_iter: impl Iterator<Item = (Epoch, u64, u64)>,
+    stake_history: &StakeHistory,
+    inflation_point_calc_tracer: Option<impl Fn(&InflationPointCalculationEvent)>,
+    new_rate_activation_epoch: Option<Epoch>,
+    epoch_stakes: &HashMap<Epoch, VersionedEpochStakes>,
+) -> Result<(u128, u64), CalculatedStakePoints> {
+    let mut points = 0;
+    let credits_in_stake = stake.credits_observed;
+    let mut new_credits_observed = credits_in_stake;
+
+    for (epoch, final_epoch_credits, initial_epoch_credits) in epoch_credits_iter {
+        let stake_amount = u128::from(stake.delegation.stake(
+            epoch,
+            stake_history,
+            new_rate_activation_epoch,
+        ));
+
+        // figure out how much this stake has seen that
+        //   for which the vote account has a record
+        let earned_credits = if credits_in_stake < initial_epoch_credits {
+            // the staker observed the entire epoch
+            final_epoch_credits - initial_epoch_credits
+        } else if credits_in_stake < final_epoch_credits {
+            // the staker registered sometime during the epoch, partial credit
+            final_epoch_credits - new_credits_observed
+        } else {
+            // the staker has already observed or been redeemed this epoch
+            //  or was activated after this epoch
+            0
+        };
+        let earned_credits = u128::from(earned_credits);
+
+        // don't want to assume anything about order of the iterator...
+        new_credits_observed = new_credits_observed.max(final_epoch_credits);
+
+        let earned_points = {
+            if earned_credits == 0 {
+                earned_credits
+            } else {
+                let total_stake = match CalcEpochType::get_total_stake(
+                    stake.delegation.voter_pubkey,
+                    epoch_stakes,
+                    epoch,
+                ) {
+                    Ok(t) => t,
+                    Err(msg) => {
+                        // assuming that we only do the calculations for the latest epoch, this
+                        // failure should be unlikely.
+                        error!("{msg}");
+                        datapoint_error!(
+                            "PER-total-stake-calculation-failure",
+                            ("error", msg, String)
+                        );
+                        return Err(CalculatedStakePoints {
+                            tower_points: 0,
+                            ag_points: 0,
+                            new_credits_observed,
+                            force_credits_update_with_skipped_reward: true,
+                        });
+                    }
+                };
+
+                earned_credits * stake_amount / total_stake as u128
+            }
+        };
+        points += earned_points;
+        if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
+            inflation_point_calc_tracer(&InflationPointCalculationEvent::CalculatedPoints(
+                epoch,
+                stake_amount,
+                earned_credits,
+                earned_points,
+            ));
+        }
+    }
+    Ok((points, new_credits_observed))
+}
+
+fn migrating_epoch_credits_iter(
+    stake: &Stake,
+    epoch_credits_iter: impl Iterator<Item = (Epoch, u64, u64)>,
+    stake_history: &StakeHistory,
+    inflation_point_calc_tracer: Option<impl Fn(&InflationPointCalculationEvent)>,
+    new_rate_activation_epoch: Option<Epoch>,
+    epoch_stakes: &HashMap<Epoch, VersionedEpochStakes>,
+) -> Result<(u128, u128, u64), CalculatedStakePoints> {
+    let epoch_credits = epoch_credits_iter.collect::<Vec<_>>();
+
+    let (ag_points, ag_new_credits_observed, ind) = match epoch_credits
+        .iter()
+        .position(|entry| entry == &AG_MIGRATION_EPOCH_CREDIT)
+    {
+        None => {
+            // No marker should mean that no rewards were paid during alpenglow slots
+            (0, 0, epoch_credits.len())
+        }
+        Some(ind) => {
+            let (ag_points, ag_new_credits_observed) = ag_epoch_credits_iter(
+                stake,
+                epoch_credits[ind + 1..].iter().cloned(),
+                stake_history,
+                inflation_point_calc_tracer.as_ref(),
+                new_rate_activation_epoch,
+                epoch_stakes,
+            )?;
+            (ag_points, ag_new_credits_observed, ind)
+        }
+    };
+
+    let (tower_points, tower_new_credits_observed) = tower_epoch_credits_iter(
+        stake,
+        epoch_credits[..ind].iter().cloned(),
+        stake_history,
+        inflation_point_calc_tracer,
+        new_rate_activation_epoch,
+    );
+
+    let new_credits_observed = tower_new_credits_observed.max(ag_new_credits_observed);
+    Ok((tower_points, ag_points, new_credits_observed))
+}
+
+/// for a given stake and vote_state, calculate how many
+///   points were earned (credits * stake) and new value
+///   for credits_observed were the points paid
+pub(crate) fn calculate_stake_points_and_credits(
+    stake: &Stake,
+    mut vote_state: DelegatedVoteState,
+    stake_history: &StakeHistory,
+    inflation_point_calc_tracer: Option<impl Fn(&InflationPointCalculationEvent)>,
+    new_rate_activation_epoch: Option<Epoch>,
+    calc_epoch_type: &CalcEpochType,
+) -> CalculatedStakePoints {
+    let credits_in_stake = stake.credits_observed;
+    let credits_in_vote = vote_state.credits;
+    // if there is no newer credits since observed, return no point
+    match credits_in_vote.cmp(&credits_in_stake) {
+        Ordering::Less => {
+            if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
+                inflation_point_calc_tracer(&SkippedReason::ZeroCreditsAndReturnRewound.into());
+            }
+            // Don't adjust stake.activation_epoch for simplicity:
+            //  - generally fast-forwarding stake.activation_epoch forcibly (for
+            //    artificial re-activation with re-warm-up) skews the stake
+            //    history sysvar. And properly handling all the cases
+            //    regarding deactivation epoch/warm-up/cool-down without
+            //    introducing incentive skew is hard.
+            //  - Conceptually, it should be acceptable for the staked SOLs at
+            //    the recreated vote to receive rewards again immediately after
+            //    rewind even if it looks like instant activation. That's
+            //    because it must have passed the required warmed-up at least
+            //    once in the past already
+            //  - Also such a stake account remains to be a part of overall
+            //    effective stake calculation even while the vote account is
+            //    missing for (indefinite) time or remains to be pre-remove
+            //    credits score. It should be treated equally to staking with
+            //    delinquent validator with no differentiation.
+
+            // hint with true to indicate some exceptional credits handling is needed
+            return CalculatedStakePoints {
+                tower_points: 0,
+                ag_points: 0,
+                new_credits_observed: credits_in_vote,
+                force_credits_update_with_skipped_reward: true,
+            };
+        }
+        Ordering::Equal => {
+            if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
+                inflation_point_calc_tracer(&SkippedReason::ZeroCreditsAndReturnCurrent.into());
+            }
+            // don't hint caller and return current value if credits remain unchanged (= delinquent)
+            return CalculatedStakePoints {
+                tower_points: 0,
+                ag_points: 0,
+                new_credits_observed: credits_in_stake,
+                force_credits_update_with_skipped_reward: false,
+            };
+        }
+        Ordering::Greater => {}
+    }
+
+    let (tower_points, ag_points, new_credits_observed) = match calc_epoch_type {
+        CalcEpochType::Tower { migration_epoch } => {
+            let (points, credits) = match migration_epoch {
+                None => tower_epoch_credits_iter(
+                    stake,
+                    vote_state.epoch_credits_iter,
+                    stake_history,
+                    inflation_point_calc_tracer,
+                    new_rate_activation_epoch,
+                ),
+                Some(migration_epoch) => {
+                    let tower = vote_state
+                        .epoch_credits_iter
+                        .by_ref()
+                        .filter(|(epoch, _, _)| epoch < migration_epoch);
+                    tower_epoch_credits_iter(
+                        stake,
+                        tower,
+                        stake_history,
+                        inflation_point_calc_tracer,
+                        new_rate_activation_epoch,
+                    )
+                }
+            };
+            (points, 0, credits)
+        }
+        CalcEpochType::Migrating { epoch_stakes, .. } => match migrating_epoch_credits_iter(
+            stake,
+            vote_state.epoch_credits_iter,
+            stake_history,
+            inflation_point_calc_tracer,
+            new_rate_activation_epoch,
+            epoch_stakes,
+        ) {
+            Ok(r) => r,
+            Err(e) => return e,
+        },
+        CalcEpochType::Alpenglow {
+            epoch_stakes,
+            migration_epoch,
+        } => {
+            let ag = vote_state
+                .epoch_credits_iter
+                .by_ref()
+                .filter(|entry| entry != &AG_MIGRATION_EPOCH_CREDIT && entry.0 > *migration_epoch);
+            let (ag_points, credits) = match ag_epoch_credits_iter(
+                stake,
+                ag,
+                stake_history,
+                inflation_point_calc_tracer,
+                new_rate_activation_epoch,
+                epoch_stakes,
+            ) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            (0, ag_points, credits)
+        }
+    };
     CalculatedStakePoints {
-        points,
+        tower_points,
+        ag_points,
         new_credits_observed,
         force_credits_update_with_skipped_reward: false,
     }
@@ -292,7 +605,10 @@ mod tests {
                 DelegatedVoteState::from(vote_state.as_ref_v4()),
                 &StakeHistory::default(),
                 null_tracer(),
-                None
+                None,
+                &CalcEpochType::Tower {
+                    migration_epoch: None
+                }
             )
         );
     }

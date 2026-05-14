@@ -73,7 +73,8 @@ use {
     agave_reserved_account_keys::ReservedAccountKeys,
     agave_snapshots::snapshot_hash::SnapshotHash,
     agave_votor_messages::{
-        consensus_message::Certificate, migration::GENESIS_CERTIFICATE_ACCOUNT,
+        consensus_message::{Certificate, CertificateType},
+        migration::GENESIS_CERTIFICATE_ACCOUNT,
     },
     ahash::AHashSet,
     dashmap::DashMap,
@@ -279,6 +280,48 @@ impl AddAssign for SquashTiming {
         self.squash_accounts_cache_ms += rhs.squash_accounts_cache_ms;
         self.squash_accounts_index_ms += rhs.squash_accounts_index_ms;
         self.squash_cache_ms += rhs.squash_cache_ms;
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum EpochType {
+    /// This is a full tower epoch.
+    Tower {
+        /// If migration has already happened, then contains the epoch when migration happened.
+        migration_epoch: Option<Epoch>,
+    },
+    /// The epoch started in tower and then switched to alpenglow
+    MigrationEpoch { migration_slot: Slot },
+    /// This is a full alpenglow epoch
+    FullAlpenglow { migration_epoch: Epoch },
+}
+
+impl EpochType {
+    pub(crate) fn new(bank: &Bank, epoch: Epoch) -> Self {
+        let Some(genesis_cert) = bank.get_alpenglow_genesis_certificate() else {
+            return Self::Tower {
+                migration_epoch: None,
+            };
+        };
+        debug_assert!(
+            matches!(genesis_cert.cert_type, CertificateType::Genesis(_, _)),
+            "cert_type={:?}",
+            genesis_cert.cert_type
+        );
+        let cert_slot = genesis_cert.cert_type.slot();
+        let migration_epoch = bank.epoch_schedule.get_epoch(cert_slot);
+        match (
+            cert_slot < bank.epoch_schedule.get_first_slot_in_epoch(epoch),
+            cert_slot < bank.epoch_schedule.get_last_slot_in_epoch(epoch),
+        ) {
+            (true, _) => Self::FullAlpenglow { migration_epoch },
+            (false, true) => Self::MigrationEpoch {
+                migration_slot: cert_slot,
+            },
+            (false, false) => Self::Tower {
+                migration_epoch: Some(migration_epoch),
+            },
+        }
     }
 }
 
