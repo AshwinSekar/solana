@@ -96,7 +96,8 @@ fn load_blockstore(ledger_path: &Path, arg_matches: &ArgMatches<'_>) -> Arc<Bank
         None,
     );
 
-    bank_forks.read().unwrap().working_bank()
+    let x = bank_forks.read().unwrap().working_bank();
+    x
 }
 
 pub trait ProgramSubCommand {

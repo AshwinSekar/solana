@@ -2516,6 +2516,10 @@ impl Bank {
         from_account(&self.get_account(&sysvar::slot_history::id()).unwrap()).unwrap()
     }
 
+    pub fn try_get_slot_history(&self) -> Option<SlotHistory> {
+        self.get_account(&sysvar::slot_history::id()).and_then(|acct| from_account(&acct))
+    }
+
     fn update_epoch_stakes(&mut self, leader_schedule_epoch: Epoch) {
         // update epoch_stakes cache
         //  if my parent didn't populate for this staker's epoch, we've
