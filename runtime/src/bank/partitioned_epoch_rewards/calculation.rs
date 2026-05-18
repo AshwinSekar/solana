@@ -7,10 +7,13 @@ use {
         epoch_rewards_hasher::hash_rewards_into_partitions,
     },
     crate::{
-        bank::{RewardCalcTracer, RewardCalculationEvent, RewardsMetrics, null_tracer},
+        bank::{EpochType, RewardCalcTracer, RewardCalculationEvent, RewardsMetrics, null_tracer},
         inflation_rewards::{
             adjust_delegation_for_rent,
-            points::{CalculationEnvironment, DelegatedVoteState, PointValue, calculate_points},
+            points::{
+                CalcEpochType, CalculationEnvironment, DelegatedVoteState, PointValue,
+                calculate_points,
+            },
             redeem_rewards,
         },
         reward_info::RewardInfo,
@@ -244,7 +247,12 @@ impl Bank {
         } = stake_rewards;
 
         // verify that we didn't pay any more than we expected to
-        assert!(point_value.rewards >= total_reward_commissions + total_stake_rewards_lamports);
+
+        assert!(
+            point_value.rewards >= total_reward_commissions + total_stake_rewards_lamports,
+            "point_value={point_value:?}; total_reward_commissions={total_reward_commissions} \
+             total_stake_rewards_lamports={total_stake_rewards_lamports}"
+        );
         info!(
             "distributed reward commissions: {} out of {}, remaining {}",
             total_reward_commissions, point_value.rewards, total_stake_rewards_lamports
@@ -308,7 +316,7 @@ impl Bank {
         metrics: &mut RewardsMetrics,
     ) -> PartitionedRewardsCalculation {
         let capitalization = self.capitalization();
-        let validator_rewards_lamports =
+        let epoch_inflation_lamports =
             self.calculate_epoch_inflation_rewards(capitalization, rewarded_epoch);
         // `distribution_epoch_vote_accounts` is the post-VAT-filter snapshot
         // produced upstream of this call (or unfiltered when VAT is off),
@@ -326,7 +334,7 @@ impl Bank {
                 stake_delegations,
                 cached_vote_accounts,
                 rewarded_epoch,
-                validator_rewards_lamports,
+                epoch_inflation_lamports,
                 reward_calc_tracer,
                 thread_pool,
                 metrics,
@@ -354,7 +362,7 @@ impl Bank {
         stake_delegations: Vec<(&'a Pubkey, &'a StakeAccount<Delegation>)>,
         cached_vote_accounts: CachedVoteAccounts<'_>,
         rewarded_epoch: Epoch,
-        rewards: u64,
+        epoch_inflation_lamports: u64,
         reward_calc_tracer: Option<impl RewardCalcTracer>,
         thread_pool: &ThreadPool,
         metrics: &mut RewardsMetrics,
@@ -363,8 +371,9 @@ impl Bank {
             stake_history,
             &stake_delegations,
             &cached_vote_accounts,
-            rewards,
+            epoch_inflation_lamports,
             thread_pool,
+            rewarded_epoch,
             metrics,
         )
         .map(|point_value| {
@@ -431,6 +440,7 @@ impl Bank {
         delay_commission_updates: bool,
         commission_rate_in_basis_points: bool,
         adjust_delegations_for_rent: bool,
+        epoch_type: &EpochType,
     ) -> Option<DelegationRewards> {
         // curry closure to add the contextual stake_pubkey
         let reward_calc_tracer = reward_calc_tracer.as_ref().map(|outer| {
@@ -519,6 +529,8 @@ impl Bank {
             vote_state.commission() as u16 * 100
         };
 
+        let calc_epoch_type = CalcEpochType::new(self, epoch_type);
+
         match redeem_rewards(
             stake,
             commission_bps,
@@ -532,6 +544,7 @@ impl Bank {
                 adjust_delegations_for_rent,
             },
             reward_calc_tracer,
+            calc_epoch_type,
             current_lamports,
             minimum_lamports,
         ) {
@@ -576,6 +589,7 @@ impl Bank {
         let feature_snapshot = self.feature_set.snapshot();
         let delay_commission_updates = feature_snapshot.delay_commission_updates;
         let commission_rate_in_basis_points = feature_snapshot.commission_rate_in_basis_points;
+        let epoch_type = EpochType::new(self, rewarded_epoch);
         // Name intentionally doesn't match -- "adjust delegations for rent" is
         // part of relaxing post-exec min balance checks.
         let adjust_delegations_for_rent = feature_snapshot.relax_post_exec_min_balance_check;
@@ -609,6 +623,7 @@ impl Bank {
                         delay_commission_updates,
                         commission_rate_in_basis_points,
                         adjust_delegations_for_rent,
+                        &epoch_type,
                     );
 
                     let (stake_reward, maybe_reward_record) = match maybe_reward_record {
@@ -682,8 +697,9 @@ impl Bank {
         stake_history: &StakeHistory,
         stake_delegations: &Vec<(&'a Pubkey, &'a StakeAccount<Delegation>)>,
         cached_vote_accounts: &CachedVoteAccounts<'_>,
-        rewards: u64,
+        epoch_inflation_lamports: u64,
         thread_pool: &ThreadPool,
+        rewarded_epoch: Epoch,
         metrics: &RewardsMetrics,
     ) -> Option<PointValue> {
         let CachedVoteAccounts {
@@ -693,6 +709,38 @@ impl Bank {
 
         let solana_vote_program: Pubkey = solana_vote_program::id();
         let new_warmup_cooldown_rate_epoch = self.new_warmup_cooldown_rate_epoch();
+        let epoch_type = EpochType::new(self, rewarded_epoch);
+        let (calc_epoch_type, rewards) = match epoch_type {
+            EpochType::Tower { migration_epoch } => (
+                CalcEpochType::Tower { migration_epoch },
+                epoch_inflation_lamports,
+            ),
+            EpochType::FullAlpenglow { migration_epoch } => (
+                CalcEpochType::Alpenglow {
+                    epoch_stakes: &self.epoch_stakes,
+                    migration_epoch,
+                },
+                epoch_inflation_lamports,
+            ),
+            EpochType::MigrationEpoch { migration_slot } => {
+                let migration_epoch = self.epoch_schedule.get_epoch(migration_slot);
+                let first_slot_in_epoch =
+                    self.epoch_schedule.get_first_slot_in_epoch(migration_epoch);
+                // + 1 because the migration_slot is still tower.
+                let num_tower_slots = migration_slot - first_slot_in_epoch + 1;
+                let num_ag_slots =
+                    self.epoch_schedule.get_slots_in_epoch(migration_epoch) - num_tower_slots;
+                (
+                    CalcEpochType::Migrating {
+                        epoch_stakes: &self.epoch_stakes,
+                        num_tower_slots,
+                        num_ag_slots,
+                    },
+                    epoch_inflation_lamports,
+                )
+            }
+        };
+
         let (points, measure_us) = measure_us!(thread_pool.install(|| {
             stake_delegations
                 .par_iter()
@@ -712,6 +760,7 @@ impl Bank {
                         DelegatedVoteState::from(vote_account.vote_state_view()),
                         stake_history,
                         new_warmup_cooldown_rate_epoch,
+                        &calc_epoch_type,
                     )
                     .unwrap_or(0)
                 })
@@ -1094,6 +1143,7 @@ mod tests {
             &cached_vote_accounts,
             expected_rewards,
             &thread_pool,
+            rewarded_epoch,
             &rewards_metrics,
         );
 
@@ -1127,6 +1177,7 @@ mod tests {
             &cached_vote_accounts,
             expected_rewards,
             &thread_pool,
+            rewarded_epoch,
             &rewards_metrics,
         );
 
