@@ -4582,6 +4582,11 @@ impl Bank {
         self.store_accounts((self.slot(), &[(pubkey, account)][..]))
     }
 
+    pub fn is_staked_in_upcoming(&self, vote_account_address: &Pubkey) -> bool {
+        self.stakes_cache
+            .is_staked_in_upcoming(vote_account_address, self.new_warmup_cooldown_rate_epoch())
+    }
+
     pub fn store_accounts<'a>(&self, accounts: impl StorableAccounts<'a>) {
         assert!(!self.freeze_started());
         let mut m = Measure::start("stakes_cache.check_and_store");
@@ -6381,7 +6386,7 @@ impl Bank {
     /// Minimum balance a vote account must hold to survive SIMD-0357 filtering
     /// under the current feature set. When `alpenglow` is active the threshold
     /// also includes one epoch's worth of VAT burn.
-    fn minimum_vote_account_balance_for_vat(&self) -> u64 {
+    pub fn minimum_vote_account_balance_for_vat(&self) -> u64 {
         let vote_account_rent_exempt_minimum = self
             .rent_collector
             .rent
