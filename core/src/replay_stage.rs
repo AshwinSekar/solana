@@ -138,6 +138,20 @@ const MAX_REPAIR_RETRY_LOOP_ATTEMPTS: usize = 10;
 // Give at least 4 leaders the chance to pack our vote
 const REFRESH_VOTE_BLOCKHEIGHT: usize = 16;
 
+enum VATHealthStatus {
+    Healthy,
+
+    NonVoting,
+
+    FeatureNotActive,
+
+    NoStake,
+
+    InsufficientFundsInVoteAccount(u64, u64),
+
+    NoBLSPubkey,
+}
+
 #[derive(PartialEq, Eq, Debug)]
 pub enum HeaviestForkFailures {
     LockedOut(u64),
@@ -933,11 +947,55 @@ impl ReplayStage {
                 // initially we wait for poh service to pick up the bank.
                 while poh_controller.has_pending_message() && !exit.load(Ordering::Relaxed) {}
             }
+            let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+            let mut vat_status_check = Instant::now();
 
             loop {
                 // Stop getting entries if we get exit signal
                 if exit.load(Ordering::Relaxed) {
                     break;
+                }
+
+                if vat_status_check.elapsed() >= Duration::from_secs(30) {
+                    let root_bank = sharable_banks.root();
+                    let vat_epoch = root_bank.epoch() + 1;
+                    let consensus_epoch = vat_epoch + 1;
+
+                    match Self::check_vat_health(
+                        &authorized_voter_keypairs,
+                        &root_bank,
+                        &vote_account,
+                    ) {
+                        VATHealthStatus::Healthy => info!(
+                            "VAT Health check: {vote_account} is healthy to pay VAT at epoch \
+                             {vat_epoch} for participation in {consensus_epoch}"
+                        ),
+                        VATHealthStatus::NonVoting => {
+                            info!("VAT Health check: non voting validator")
+                        }
+                        VATHealthStatus::FeatureNotActive => {
+                            info!("VAT Health check: feature is not active")
+                        }
+                        VATHealthStatus::NoStake => error!(
+                            "VAT Health check: {vote_account} is unhealthy to pay VAT at epoch \
+                             {vat_epoch} for participation in {consensus_epoch}, reason: No stake"
+                        ),
+                        VATHealthStatus::InsufficientFundsInVoteAccount(lamports, expected) => {
+                            error!(
+                                "VAT Health check: {vote_account} is unhealthy to pay VAT at \
+                                 epoch {vat_epoch} for participation in {consensus_epoch}, \
+                                 reason: Insufficient lamports in vote account {lamports} < \
+                                 {expected}",
+                            )
+                        }
+                        VATHealthStatus::NoBLSPubkey => error!(
+                            "VAT Health check: {vote_account} is unhealthy to pay VAT at epoch \
+                             {vat_epoch} for participation in {consensus_epoch}, reason: No BLS \
+                             pubkey"
+                        ),
+                    }
+
+                    vat_status_check = Instant::now();
                 }
 
                 if matches!(
@@ -1575,6 +1633,47 @@ impl ReplayStage {
             .unwrap();
 
         Ok(Self { t_replay })
+    }
+
+    fn check_vat_health(
+        authorized_voter_keypairs: &RwLock<Vec<Arc<Keypair>>>,
+        root_bank: &Bank,
+        vote_account_pubkey: &Pubkey,
+    ) -> VATHealthStatus {
+        if authorized_voter_keypairs.read().unwrap().is_empty() {
+            return VATHealthStatus::NonVoting;
+        }
+
+        let Some(_feature) = root_bank
+            .get_account_with_fixed_root(&agave_feature_set::validator_admission_ticket::id())
+            .and_then(|acct| solana_feature_gate_interface::state::from_account(&acct))
+        else {
+            return VATHealthStatus::FeatureNotActive;
+        };
+
+        let Some(vote_account) = root_bank.get_vote_account(vote_account_pubkey) else {
+            return VATHealthStatus::NoBLSPubkey;
+        };
+        if vote_account
+            .vote_state_view()
+            .bls_pubkey_compressed()
+            .is_none()
+        {
+            return VATHealthStatus::NoBLSPubkey;
+        }
+
+        if vote_account.lamports() < root_bank.minimum_vote_account_balance_for_vat() {
+            return VATHealthStatus::InsufficientFundsInVoteAccount(
+                vote_account.lamports(),
+                root_bank.minimum_vote_account_balance_for_vat(),
+            );
+        }
+
+        if !root_bank.is_staked_in_upcoming(vote_account_pubkey) {
+            return VATHealthStatus::NoStake;
+        }
+
+        VATHealthStatus::Healthy
     }
 
     fn alpenglow_handle_newly_frozen_banks(

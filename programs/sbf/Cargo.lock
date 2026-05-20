@@ -6533,6 +6533,7 @@ dependencies = [
  "solana-cost-model",
  "solana-entry",
  "solana-epoch-schedule",
+ "solana-feature-gate-interface",
  "solana-fee",
  "solana-fee-calculator",
  "solana-fee-structure",

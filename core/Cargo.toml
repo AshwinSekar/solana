@@ -98,6 +98,7 @@ solana-connection-cache = { workspace = true }
 solana-cost-model = { workspace = true }
 solana-entry = { workspace = true }
 solana-epoch-schedule = { workspace = true }
+solana-feature-gate-interface = { workspace = true }
 solana-fee = { workspace = true }
 solana-fee-calculator = { workspace = true }
 solana-fee-structure = { workspace = true }

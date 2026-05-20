@@ -158,6 +158,17 @@ impl StakesCache {
         let mut stakes = self.0.write().unwrap();
         stakes.activate_epoch(next_epoch, stake_history, vote_accounts)
     }
+
+    pub(crate) fn is_staked_in_upcoming(
+        &self,
+        vote_account_address: &Pubkey,
+        new_rate_activation_epoch: Option<Epoch>,
+    ) -> bool {
+        self.0
+            .read()
+            .unwrap()
+            .is_staked_in_upcoming(vote_account_address, new_rate_activation_epoch)
+    }
 }
 
 /// The generic type T is either Delegation or StakeAccount.
@@ -451,6 +462,40 @@ impl Stakes<StakeAccount> {
             .filter(|delegation| &delegation.voter_pubkey == voter_pubkey)
             .map(|delegation| delegation.stake(epoch, stake_history, new_rate_activation_epoch))
             .sum()
+    }
+
+    #[allow(deprecated)]
+    pub(crate) fn is_staked_in_upcoming(
+        &self,
+        vote_account_address: &Pubkey,
+        new_rate_activation_epoch: Option<Epoch>,
+    ) -> bool {
+        // Wrap up the prev epoch by adding new stake history entry for the
+        // prev epoch.
+        let stake_history_entry = self.stake_delegations.iter().fold(
+            StakeActivationStatus::default(),
+            |acc, (_stake_pubkey, stake_account)| {
+                let delegation = stake_account.delegation();
+                #[allow(deprecated)]
+                let activation_status = delegation.stake_activating_and_deactivating(
+                    self.epoch,
+                    &self.stake_history,
+                    new_rate_activation_epoch,
+                );
+                acc + activation_status
+            },
+        );
+        let mut stake_history = self.stake_history.clone();
+        stake_history.add(self.epoch, stake_history_entry);
+
+        self.stake_delegations
+            .values()
+            .map(StakeAccount::delegation)
+            .any(|delegation| {
+                &delegation.voter_pubkey == vote_account_address
+                    && delegation.stake(self.epoch + 1, &stake_history, new_rate_activation_epoch)
+                        > 0
+            })
     }
 
     fn remove_vote_account(&mut self, vote_pubkey: &Pubkey) -> Option<VoteAccount> {
