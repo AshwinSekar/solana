@@ -8007,6 +8007,7 @@ version = "0.3.2"
 dependencies = [
  "agave-feature-set",
  "agave-snapshots",
+ "agave-votor-messages",
  "base64 0.22.1",
  "bs58",
  "crossbeam-channel",
