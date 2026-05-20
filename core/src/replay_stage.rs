@@ -47,7 +47,7 @@ use {
         migration::{GENESIS_VOTE_REFRESH, MigrationStatus},
         vote::Vote,
     },
-    crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, select},
+    crossbeam_channel::{Receiver, Sender, TrySendError, select},
     itertools::Itertools,
     rayon::{ThreadPool, prelude::*},
     solana_accounts_db::contains::Contains,
@@ -84,7 +84,7 @@ use {
     solana_runtime::{
         bank::{Bank, NewBankOptions, bank_hash_details},
         bank_forks::BankForks,
-        bank_forks_controller::{BankForksCommand, BankForksCommandReceiver},
+        bank_forks_controller::{BankForksController, BankForksControllerError},
         block_component_processor::BlockComponentProcessorError,
         commitment::BlockCommitmentCache,
         installed_scheduler_pool::BankWithScheduler,
@@ -233,6 +233,7 @@ struct BankReplayResultTracker {
 
 struct ProcessActiveBanksContext {
     bank_forks: Arc<RwLock<BankForks>>,
+    bank_forks_controller: Arc<dyn BankForksController>,
     blockstore: Arc<Blockstore>,
     transaction_status_sender: Option<TransactionStatusSender>,
     entry_notification_sender: Option<EntryNotifierSender>,
@@ -250,16 +251,6 @@ struct ProcessActiveBanksContext {
     replay_tx_thread_pool: ThreadPool,
     prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
     migration_status: Arc<MigrationStatus>,
-}
-
-struct ProcessBankForksContext {
-    bank_forks: Arc<RwLock<BankForks>>,
-    blockstore: Arc<Blockstore>,
-    snapshot_controller: Option<Arc<SnapshotController>>,
-    bank_notification_sender: Option<BankNotificationSenderConfig>,
-    rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
-    drop_bank_sender: Sender<Vec<BankWithScheduler>>,
-    leader_schedule_cache: Arc<LeaderScheduleCache>,
 }
 
 impl ProcessActiveBanksContext {
@@ -303,6 +294,8 @@ struct NewBankForksContext<'a> {
     blockstore: &'a Blockstore,
     /// Fork graph where new banks are inserted after discovery.
     bank_forks: &'a RwLock<BankForks>,
+    /// Service used to serialize BankForks writes.
+    bank_forks_controller: &'a dyn BankForksController,
     /// Leader schedule used to construct child banks.
     leader_schedule_cache: &'a LeaderScheduleCache,
     /// Optional RPC fanout for bank-created notifications.
@@ -422,6 +415,7 @@ pub struct ReplayStageConfig {
     pub tower: Tower,
     pub vote_tracker: Arc<VoteTracker>,
     pub cluster_slots: Arc<ClusterSlots>,
+    pub bank_forks_controller: Arc<dyn BankForksController>,
     pub log_messages_bytes_limit: Option<usize>,
     pub prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
     pub banking_tracer: Arc<BankingTracer>,
@@ -460,7 +454,6 @@ pub struct ReplayReceivers {
     pub duplicate_confirmed_slots_receiver: Receiver<Vec<(u64, Hash)>>,
     pub gossip_verified_vote_hash_receiver: Receiver<(Pubkey, u64, Hash)>,
     pub popular_pruned_forks_receiver: Receiver<Vec<u64>>,
-    pub bank_forks_controller_receiver: BankForksCommandReceiver,
     pub switch_bank_receiver: SwitchBankEventReceiver,
 }
 
@@ -737,6 +730,7 @@ impl ReplayStage {
             mut tower,
             vote_tracker,
             cluster_slots,
+            bank_forks_controller,
             log_messages_bytes_limit,
             prioritization_fee_cache,
             banking_tracer,
@@ -775,7 +769,6 @@ impl ReplayStage {
             duplicate_confirmed_slots_receiver,
             gossip_verified_vote_hash_receiver,
             popular_pruned_forks_receiver,
-            bank_forks_controller_receiver,
             switch_bank_receiver,
         } = receivers;
 
@@ -887,6 +880,7 @@ impl ReplayStage {
 
             let process_active_banks_context = ProcessActiveBanksContext {
                 bank_forks: bank_forks.clone(),
+                bank_forks_controller: bank_forks_controller.clone(),
                 blockstore: blockstore.clone(),
                 transaction_status_sender: transaction_status_sender.clone(),
                 entry_notification_sender: entry_notification_sender.clone(),
@@ -904,15 +898,6 @@ impl ReplayStage {
                 replay_tx_thread_pool,
                 prioritization_fee_cache: prioritization_fee_cache.clone(),
                 migration_status: migration_status.clone(),
-            };
-            let process_bank_forks_context = ProcessBankForksContext {
-                bank_forks: bank_forks.clone(),
-                blockstore: blockstore.clone(),
-                snapshot_controller: snapshot_controller.clone(),
-                bank_notification_sender: bank_notification_sender.clone(),
-                rpc_subscriptions: rpc_subscriptions.clone(),
-                drop_bank_sender: drop_bank_sender.clone(),
-                leader_schedule_cache: leader_schedule_cache.clone(),
             };
 
             let poh_shared_leader_state = poh_recorder.read().unwrap().shared_leader_state();
@@ -935,22 +920,11 @@ impl ReplayStage {
                     break;
                 }
 
-                if matches!(
-                    Self::process_bank_forks_commands(
-                        &bank_forks_controller_receiver,
-                        &process_bank_forks_context,
-                        &mut progress,
-                        &mut async_verification_freelist,
-                    ),
-                    Err(TryRecvError::Disconnected)
-                ) {
-                    break;
-                }
-
                 handle_update_parent_interrupts(
                     &my_pubkey,
                     &blockstore,
                     &bank_forks,
+                    bank_forks_controller.as_ref(),
                     &mut progress,
                     &mut async_verification_freelist,
                     &update_parent_receiver,
@@ -964,6 +938,7 @@ impl ReplayStage {
                     NewBankForksContext {
                         blockstore: &blockstore,
                         bank_forks: &bank_forks,
+                        bank_forks_controller: bank_forks_controller.as_ref(),
                         leader_schedule_cache: &leader_schedule_cache,
                         rpc_subscriptions: rpc_subscriptions.as_deref(),
                         slot_status_notifier: &slot_status_notifier,
@@ -1023,6 +998,7 @@ impl ReplayStage {
                         &my_pubkey,
                         &blockstore,
                         &bank_forks,
+                        bank_forks_controller.as_ref(),
                         &rpc_subscriptions,
                         &slot_status_notifier,
                         &mut progress,
@@ -1049,6 +1025,7 @@ impl ReplayStage {
                         &mut pending_switch,
                         &blockstore,
                         &bank_forks,
+                        bank_forks_controller.as_ref(),
                         &mut progress,
                         &mut async_verification_freelist,
                     )
@@ -1519,17 +1496,6 @@ impl ReplayStage {
                         recv(ledger_signal_receiver) -> result => match result {
                             Err(_) => break,
                             Ok(_) => trace!("blockstore signal"),
-                        },
-                        recv(bank_forks_controller_receiver.receiver()) -> result => match result {
-                            Err(_) => break,
-                            Ok(command) => {
-                                Self::process_bank_forks_command(
-                                    command,
-                                    &process_bank_forks_context,
-                                    &mut progress,
-                                    &mut async_verification_freelist,
-                                );
-                            }
                         },
                         default(timer) => (),
                     }
@@ -2363,6 +2329,7 @@ impl ReplayStage {
         pending_switch: &mut Option<(Slot, Hash)>,
         blockstore: &Blockstore,
         bank_forks: &RwLock<BankForks>,
+        bank_forks_controller: &dyn BankForksController,
         progress: &mut ProgressMap,
         async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
     ) -> Result<(), BlockstoreError> {
@@ -2458,12 +2425,15 @@ impl ReplayStage {
             .slots_to_clear(blocks_to_switch.iter().map(|(slot, _)| *slot));
 
         info!("{my_pubkey}: Clearing banks for switching and descendants: {slots_to_clear:?}");
-        Self::clear_banks(
+        if let Err(err) = Self::clear_banks(
             &slots_to_clear,
-            bank_forks,
+            bank_forks_controller,
             progress,
             async_verification_freelist,
-        );
+        ) {
+            warn!("{my_pubkey}: unable to clear banks for switching: {err}");
+            return Ok(());
+        }
 
         // Banks are clear, move shreds in blockstore
         for (slot, location) in blocks_to_switch {
@@ -2479,15 +2449,15 @@ impl ReplayStage {
         Ok(())
     }
 
-    /// For slots to clear, clear the bank from progress, bank forks, and recycle the async verification
+    /// For slots to clear, clear the bank from progress and ask the controller to clear BankForks.
     fn clear_banks(
         slots_to_clear: &BTreeSet<Slot>,
-        bank_forks: &RwLock<BankForks>,
+        bank_forks_controller: &dyn BankForksController,
         progress: &mut ProgressMap,
         async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
-    ) {
+    ) -> Result<(), BankForksControllerError> {
         if slots_to_clear.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Wait for async verify to complete
@@ -2502,52 +2472,7 @@ impl ReplayStage {
             }
         }
 
-        let banks_to_remove = {
-            let bank_forks = bank_forks.read().unwrap();
-            slots_to_clear
-                .iter()
-                .filter_map(|slot| bank_forks.get_with_scheduler(*slot))
-                .collect::<Vec<_>>()
-        };
-
-        // Wait for any in progress execution
-        for bank in banks_to_remove {
-            let _ = bank.wait_for_completed_scheduler();
-        }
-
-        // Dump the banks from bank forks
-        let (root_bank, slots_to_purge, removed_banks) = {
-            let mut w_bank_forks = bank_forks.write().unwrap();
-            let slots_to_clear = slots_to_clear
-                .iter()
-                .copied()
-                .filter(|slot| w_bank_forks.get(*slot).is_some())
-                .collect::<BTreeSet<_>>();
-            if slots_to_clear.is_empty() {
-                return;
-            }
-
-            let root_bank = w_bank_forks.root_bank();
-            let (slots_to_purge, removed_banks) =
-                w_bank_forks.dump_slots(slots_to_clear.iter(), true);
-            (root_bank, slots_to_purge, removed_banks)
-        };
-
-        // Clear the accounts for these slots so that any ongoing RPC scans fail.
-        // These have to be atomically cleared together in the same batch, in order
-        // to prevent RPC from seeing inconsistent results in scans.
-        root_bank.remove_unrooted_slots(&slots_to_purge);
-
-        // Once the slots above have been purged, now it's safe to remove the banks from
-        // BankForks, allowing the Bank::drop() purging to run and not race with the
-        // `remove_unrooted_slots()` call.
-        drop(removed_banks);
-
-        // Clear slot signatures from status cache and programs from program cache
-        for (slot, _) in slots_to_purge {
-            root_bank.clear_slot_signatures(slot);
-            root_bank.prune_program_cache_by_deployment_slot(slot);
-        }
+        bank_forks_controller.clear_banks(slots_to_clear.clone())
     }
 
     fn recycle_async_verification(
@@ -5000,102 +4925,6 @@ impl ReplayStage {
         );
     }
 
-    /// Process any commands from the bank forks controller
-    fn process_bank_forks_commands(
-        bank_forks_controller_receiver: &BankForksCommandReceiver,
-        context: &ProcessBankForksContext,
-        progress: &mut ProgressMap,
-        async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
-    ) -> Result<(), TryRecvError> {
-        loop {
-            let command = bank_forks_controller_receiver.receiver().try_recv()?;
-            Self::process_bank_forks_command(
-                command,
-                context,
-                progress,
-                async_verification_freelist,
-            );
-        }
-    }
-
-    /// Process a bank forks command
-    fn process_bank_forks_command(
-        command: BankForksCommand,
-        context: &ProcessBankForksContext,
-        progress: &mut ProgressMap,
-        async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
-    ) {
-        debug_assert!(
-            context
-                .bank_forks
-                .read()
-                .unwrap()
-                .migration_status()
-                .is_alpenglow_enabled()
-        );
-        match command {
-            BankForksCommand::InsertBank {
-                bank,
-                response_sender,
-            } => {
-                // Check that the bank is still valid to be inserted
-                let bank = {
-                    let mut bank_forks = context.bank_forks.write().unwrap();
-                    if bank_forks.get(bank.slot()).is_none()
-                        && bank_forks.get(bank.parent_slot()).is_some()
-                    {
-                        Some(bank_forks.insert(*bank))
-                    } else {
-                        None
-                    }
-                };
-
-                response_sender.send(bank).unwrap_or_else(|_| {
-                    warn!("bank forks controller insert-bank response receiver dropped")
-                });
-            }
-            BankForksCommand::SetRoot {
-                my_pubkey,
-                parent_slot,
-                new_root,
-                highest_super_majority_root,
-                response_sender,
-            } => {
-                root_utils::check_and_handle_new_root(
-                    parent_slot,
-                    new_root,
-                    context.snapshot_controller.as_deref(),
-                    highest_super_majority_root,
-                    &context.bank_notification_sender,
-                    &context.drop_bank_sender,
-                    &context.blockstore,
-                    &context.leader_schedule_cache,
-                    &context.bank_forks,
-                    context.rpc_subscriptions.as_deref(),
-                    &my_pubkey,
-                    |_| {},
-                );
-                response_sender.send(()).unwrap_or_else(|_| {
-                    warn!("bank forks controller set-root response receiver dropped")
-                });
-            }
-            BankForksCommand::ClearBank {
-                slot,
-                response_sender,
-            } => {
-                Self::clear_banks(
-                    &BTreeSet::from([slot]),
-                    &context.bank_forks,
-                    progress,
-                    async_verification_freelist,
-                );
-                response_sender.send(()).unwrap_or_else(|_| {
-                    warn!("bank forks controller clear-bank response receiver dropped")
-                });
-            }
-        }
-    }
-
     fn generate_new_bank_forks(
         ctx: NewBankForksContext<'_>,
         progress: &mut ProgressMap,
@@ -5104,6 +4933,7 @@ impl ReplayStage {
         let NewBankForksContext {
             blockstore,
             bank_forks,
+            bank_forks_controller,
             leader_schedule_cache,
             rpc_subscriptions,
             slot_status_notifier,
@@ -5222,19 +5052,19 @@ impl ReplayStage {
         let mut generate_new_bank_forks_write_lock =
             Measure::start("generate_new_bank_forks_write_lock");
         if !new_banks.is_empty() {
-            let mut forks = bank_forks.write().unwrap();
-            let root = forks.root();
             for (slot, (bank, replay_offset)) in new_banks {
-                if slot < root {
-                    continue;
-                }
-                if forks.get(slot).is_some() {
-                    continue;
-                }
-                let Some(parent_bank) = forks.get(bank.parent_slot()) else {
-                    continue;
+                let parent_bank = {
+                    let forks = bank_forks.read().unwrap();
+                    if slot < forks.root() || forks.get(slot).is_some() {
+                        continue;
+                    }
+                    let Some(parent_bank) = forks.get(bank.parent_slot()) else {
+                        continue;
+                    };
+                    parent_bank
                 };
-                if let Some(num_shreds) = replay_offset {
+
+                let fork_progress = replay_offset.map(|num_shreds| {
                     let prev_leader_slot = progress.get_bank_prev_leader_slot(&bank);
                     let fork_progress = ForkProgress::new(
                         parent_bank.last_blockhash(),
@@ -5248,9 +5078,21 @@ impl ReplayStage {
                         let mut replay_progress = fork_progress.replay_progress.write().unwrap();
                         replay_progress.num_shreds = num_shreds;
                     }
-                    progress.insert(slot, fork_progress);
+                    fork_progress
+                });
+
+                match bank_forks_controller.insert_bank(bank) {
+                    Ok(_) => {
+                        if let Some(fork_progress) = fork_progress {
+                            progress.insert(slot, fork_progress);
+                        }
+                    }
+                    Err(BankForksControllerError::UnableToInsertStaleBank(_)) => (),
+                    Err(err) => {
+                        warn!("bank forks controller insert-bank failed for slot {slot}: {err}");
+                        break;
+                    }
                 }
-                forks.insert(bank);
             }
         }
         generate_new_bank_forks_write_lock.stop();

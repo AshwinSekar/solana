@@ -4,6 +4,9 @@
 use {
     crate::{
         admin_rpc_post_init::{KeyUpdaterType, KeyUpdaters},
+        bank_forks_controller_service::{
+            BankForksControllerService, BankForksControllerServiceConfig,
+        },
         banking_trace::BankingTracer,
         block_creation_loop::ReplayHighestFrozen,
         bls_sigverify::bls_sigverifier::{self, SigVerifierChannels, SigVerifierContext},
@@ -117,6 +120,7 @@ pub struct Tvu {
     bls_voting_service: BLSVotingService,
     warm_quic_cache_service: Option<WarmQuicCacheService>,
     drop_bank_service: DropBankService,
+    bank_forks_controller_service: BankForksControllerService,
     duplicate_shred_listener: DuplicateShredListener,
     bls_sigverify_threads: Option<(JoinHandle<()>, JoinHandle<()>)>,
     votor: Votor,
@@ -493,6 +497,19 @@ impl Tvu {
         let (drop_bank_sender, drop_bank_receiver) = unbounded();
         let (voting_sender, voting_receiver) = unbounded();
         let (bls_sender, bls_receiver) = bounded(MAX_BLS_MESSAGES_TO_SEND);
+        let bank_forks_controller_service = BankForksControllerService::new(
+            BankForksControllerServiceConfig {
+                exit: exit.clone(),
+                bank_forks: bank_forks.clone(),
+                blockstore: blockstore.clone(),
+                snapshot_controller: snapshot_controller.clone(),
+                bank_notification_sender: bank_notification_sender.clone(),
+                rpc_subscriptions: rpc_subscriptions.clone(),
+                drop_bank_sender: drop_bank_sender.clone(),
+                leader_schedule_cache: leader_schedule_cache.clone(),
+            },
+            bank_forks_controller_receiver,
+        );
 
         let (lockouts_sender, votor_commitment_sender, commitment_service) =
             AggregateCommitmentService::new(
@@ -515,7 +532,7 @@ impl Tvu {
             leader_schedule_cache: leader_schedule_cache.clone(),
             consensus_metrics_sender,
             highest_finalized,
-            bank_forks_controller,
+            bank_forks_controller: bank_forks_controller.clone(),
             bls_sender: bls_sender.clone(),
             commitment_sender: votor_commitment_sender,
             bank_notification_sender: bank_notification_sender.clone(),
@@ -565,7 +582,6 @@ impl Tvu {
             duplicate_confirmed_slots_receiver,
             gossip_verified_vote_hash_receiver,
             popular_pruned_forks_receiver,
-            bank_forks_controller_receiver,
             switch_bank_receiver,
         };
 
@@ -588,6 +604,7 @@ impl Tvu {
             tower,
             vote_tracker,
             cluster_slots,
+            bank_forks_controller: bank_forks_controller.clone(),
             log_messages_bytes_limit,
             prioritization_fee_cache,
             banking_tracer,
@@ -660,6 +677,7 @@ impl Tvu {
             bls_voting_service,
             warm_quic_cache_service,
             drop_bank_service,
+            bank_forks_controller_service,
             duplicate_shred_listener,
             bls_sigverify_threads,
             votor,
@@ -681,13 +699,14 @@ impl Tvu {
         if let Some(warmup_service) = self.warm_quic_cache_service {
             warmup_service.join()?;
         }
-        self.drop_bank_service.join()?;
         self.duplicate_shred_listener.join()?;
         if let Some((streamer, sigverifier)) = self.bls_sigverify_threads {
             streamer.join()?;
             sigverifier.join()?;
         }
         self.votor.join()?;
+        self.bank_forks_controller_service.join()?;
+        self.drop_bank_service.join()?;
         self.commitment_service.join()?;
         Ok(())
     }

@@ -4,6 +4,8 @@
 #[macro_use]
 extern crate log;
 
+#[cfg(any(test, feature = "dev-context-only-utils"))]
+pub mod bank_forks_controller_test_utils;
 pub mod commitment;
 pub mod common;
 pub mod consensus_metrics;
