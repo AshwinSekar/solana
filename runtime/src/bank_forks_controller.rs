@@ -6,7 +6,6 @@ use {
     solana_metrics::datapoint_info,
     solana_pubkey::Pubkey,
     std::{
-        collections::BTreeSet,
         fmt,
         time::{Duration, Instant},
     },
@@ -33,9 +32,10 @@ pub enum BankForksCommand {
         parent_slot: Slot,
         new_root: Slot,
         highest_super_majority_root: Option<Slot>,
+        response_sender: Sender<()>,
     },
-    ClearBanks {
-        slots_to_clear: BTreeSet<Slot>,
+    ClearBank {
+        slot: Slot,
         response_sender: Sender<()>,
     },
 }
@@ -45,9 +45,7 @@ impl BankForksCommand {
         match self {
             Self::InsertBank { bank, .. } => bank.slot(),
             Self::SetRoot { new_root, .. } => *new_root,
-            Self::ClearBanks { slots_to_clear, .. } => {
-                slots_to_clear.iter().next().copied().unwrap_or_default()
-            }
+            Self::ClearBank { slot, .. } => *slot,
         }
     }
 }
@@ -57,7 +55,7 @@ impl fmt::Display for BankForksCommand {
         match self {
             Self::InsertBank { .. } => write!(f, "insert_bank"),
             Self::SetRoot { .. } => write!(f, "set_root"),
-            Self::ClearBanks { .. } => write!(f, "clear_banks"),
+            Self::ClearBank { .. } => write!(f, "clear_bank"),
         }
     }
 }
@@ -74,16 +72,9 @@ pub trait BankForksController: Send + Sync {
     ) -> Result<(), BankForksControllerError>;
 
     fn clear_bank(&self, slot: Slot) -> Result<(), BankForksControllerError>;
-
-    fn clear_banks(&self, slots_to_clear: BTreeSet<Slot>) -> Result<(), BankForksControllerError> {
-        for slot in slots_to_clear {
-            self.clear_bank(slot)?;
-        }
-        Ok(())
-    }
 }
 
-/// Handle used by threads to serialize BankForks writes onto the controller service.
+/// Handle used by non-replay threads to serialize BankForks writes onto ReplayStage.
 #[derive(Clone)]
 pub struct BankForksControllerHandle {
     sender: Sender<BankForksCommand>,
@@ -139,33 +130,6 @@ impl BankForksControllerHandle {
 
         Ok(response)
     }
-
-    fn send_command_without_response(
-        &self,
-        command: BankForksCommand,
-    ) -> Result<(), BankForksControllerError> {
-        let command_name = command.to_string();
-        let slot = command.metric_slot();
-        let queue_len_before_send = self.sender.len();
-        let total_start = Instant::now();
-        let send_start = Instant::now();
-        if self.sender.send(command).is_err() {
-            return Err(BankForksControllerError::Disconnected);
-        }
-        let send_us = send_start.elapsed().as_micros() as i64;
-        let total_us = total_start.elapsed().as_micros() as i64;
-        datapoint_info!(
-            "bank_forks_controller-command",
-            ("command", command_name, String),
-            ("slot", slot as i64, i64),
-            ("queue_len_before_send", queue_len_before_send as i64, i64),
-            ("send_us", send_us, i64),
-            ("response_wait_us", 0, i64),
-            ("total_us", total_us, i64),
-        );
-
-        Ok(())
-    }
 }
 
 impl BankForksController for BankForksControllerHandle {
@@ -189,26 +153,24 @@ impl BankForksController for BankForksControllerHandle {
         new_root: Slot,
         highest_super_majority_root: Option<Slot>,
     ) -> Result<(), BankForksControllerError> {
-        self.send_command_without_response(BankForksCommand::SetRoot {
-            my_pubkey,
-            parent_slot,
-            new_root,
-            highest_super_majority_root,
-        })
+        let (response_sender, response_receiver) = bounded(1);
+        self.send_command(
+            BankForksCommand::SetRoot {
+                my_pubkey,
+                parent_slot,
+                new_root,
+                highest_super_majority_root,
+                response_sender,
+            },
+            response_receiver,
+        )
     }
 
     fn clear_bank(&self, slot: Slot) -> Result<(), BankForksControllerError> {
-        self.clear_banks(BTreeSet::from([slot]))
-    }
-
-    fn clear_banks(&self, slots_to_clear: BTreeSet<Slot>) -> Result<(), BankForksControllerError> {
-        if slots_to_clear.is_empty() {
-            return Ok(());
-        }
         let (response_sender, response_receiver) = bounded(1);
         self.send_command(
-            BankForksCommand::ClearBanks {
-                slots_to_clear,
+            BankForksCommand::ClearBank {
+                slot,
                 response_sender,
             },
             response_receiver,
@@ -240,7 +202,6 @@ mod tests {
         let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis.genesis_config));
         let (controller, receiver) = BankForksControllerHandle::new();
         let replay_bank_forks = bank_forks.clone();
-        let (root_sender, root_receiver) = bounded(1);
         let replay_thread = thread::spawn(move || {
             loop {
                 let Ok(command) = receiver.receiver().recv() else {
@@ -257,30 +218,30 @@ mod tests {
                         };
                         response_sender.send(Some(bank)).unwrap();
                     }
-                    BankForksCommand::SetRoot { new_root, .. } => {
+                    BankForksCommand::SetRoot {
+                        new_root,
+                        response_sender,
+                        ..
+                    } => {
                         {
                             let mut bank_forks = replay_bank_forks.write().unwrap();
                             bank_forks.set_root(new_root, None, None);
                         }
-                        root_sender.send(new_root).unwrap();
+                        response_sender.send(()).unwrap();
                     }
-                    BankForksCommand::ClearBanks {
-                        slots_to_clear,
+                    BankForksCommand::ClearBank {
+                        slot,
                         response_sender,
                     } => {
-                        for slot in &slots_to_clear {
-                            let bank_to_clear =
-                                replay_bank_forks.read().unwrap().get_with_scheduler(*slot);
-                            if let Some(bank) = bank_to_clear {
-                                let _ = bank.wait_for_completed_scheduler();
-                            }
+                        let bank_to_clear =
+                            replay_bank_forks.read().unwrap().get_with_scheduler(slot);
+                        if let Some(bank) = bank_to_clear {
+                            let _ = bank.wait_for_completed_scheduler();
                         }
 
                         {
                             let mut bank_forks = replay_bank_forks.write().unwrap();
-                            for slot in slots_to_clear {
-                                bank_forks.clear_bank(slot, false);
-                            }
+                            bank_forks.clear_bank(slot, false);
                         }
                         response_sender.send(()).unwrap();
                     }
@@ -296,7 +257,6 @@ mod tests {
         assert!(bank_forks.read().unwrap().get(1).is_some());
 
         controller.set_root(Pubkey::default(), 1, 1, None).unwrap();
-        root_receiver.recv().unwrap();
         assert_eq!(bank_forks.read().unwrap().root(), 1);
 
         let parent_bank = bank_forks.read().unwrap().root_bank();

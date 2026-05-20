@@ -9,7 +9,6 @@
 //!
 
 pub mod admin_rpc_post_init;
-mod bank_forks_controller_service;
 pub mod banking_simulation;
 pub mod banking_stage;
 pub mod banking_trace;

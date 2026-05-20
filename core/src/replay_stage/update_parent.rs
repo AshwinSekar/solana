@@ -21,10 +21,7 @@ use {
         blockstore_processor::AsyncVerificationProgress,
     },
     solana_pubkey::Pubkey,
-    solana_runtime::{
-        bank::Bank, bank_forks::BankForks, bank_forks_controller::BankForksController,
-        vote_sender_types::ReplayVoteSender,
-    },
+    solana_runtime::{bank::Bank, bank_forks::BankForks, vote_sender_types::ReplayVoteSender},
     std::{
         collections::BTreeSet,
         sync::{Arc, RwLock},
@@ -102,12 +99,10 @@ pub(super) fn child_bank_replay_start(
 
 /// Clear an in-progress bank so the next replay iteration recreates it from
 /// the current UpdateParent parent and FEC-set offset recorded in `SlotMeta`.
-#[allow(clippy::too_many_arguments)]
 fn try_restart_slot_from_update_parent(
     my_pubkey: &Pubkey,
     blockstore: &Blockstore,
     bank_forks: &RwLock<BankForks>,
-    bank_forks_controller: &dyn BankForksController,
     progress: &mut ProgressMap,
     async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
     slot: Slot,
@@ -171,15 +166,12 @@ fn try_restart_slot_from_update_parent(
     if let Some(bank) = bank {
         send_invalid_bank(&bank, replay_vote_sender);
     }
-    if let Err(err) = ReplayStage::clear_banks(
+    ReplayStage::clear_banks(
         &BTreeSet::from([slot]),
-        bank_forks_controller,
+        bank_forks,
         progress,
         async_verification_freelist,
-    ) {
-        info!("{my_pubkey}: unable to clear bank {slot} for UpdateParent restart: {err}");
-        return false;
-    }
+    );
     true
 }
 
@@ -188,12 +180,10 @@ fn try_restart_slot_from_update_parent(
 /// If an UpdateParent marker is now visible in SlotMeta, replay is restarted
 /// from the marker's FEC set. If the slot completes without a marker, the
 /// soft-dead state is promoted to a durable hard-dead slot.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn process_soft_dead_slots(
     my_pubkey: &Pubkey,
     blockstore: &Arc<Blockstore>,
     bank_forks: &RwLock<BankForks>,
-    bank_forks_controller: &dyn BankForksController,
     rpc_subscriptions: &Option<Arc<solana_rpc::rpc_subscriptions::RpcSubscriptions>>,
     slot_status_notifier: &Option<solana_rpc::slot_status_notifier::SlotStatusNotifier>,
     progress: &mut ProgressMap,
@@ -231,7 +221,6 @@ pub(super) fn process_soft_dead_slots(
                 my_pubkey,
                 blockstore.as_ref(),
                 bank_forks,
-                bank_forks_controller,
                 progress,
                 async_verification_freelist,
                 slot,
@@ -279,7 +268,6 @@ pub(super) fn handle_update_parent_interrupts(
     my_pubkey: &Pubkey,
     blockstore: &Blockstore,
     bank_forks: &RwLock<BankForks>,
-    bank_forks_controller: &dyn BankForksController,
     progress: &mut ProgressMap,
     async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
     update_parent_receiver: &UpdateParentReceiver,
@@ -291,7 +279,6 @@ pub(super) fn handle_update_parent_interrupts(
             my_pubkey,
             blockstore,
             bank_forks,
-            bank_forks_controller,
             progress,
             async_verification_freelist,
             signal.slot,
@@ -375,12 +362,10 @@ pub(super) fn handle_abandoned_bank(
 
     // Clear the bank from bank_forks. It will be recreated with the correct
     // parent by generate_new_bank_forks on the next iteration.
-    if let Err(err) = ReplayStage::clear_banks(
+    ReplayStage::clear_banks(
         &BTreeSet::from([bank_slot]),
-        process_active_banks_context.bank_forks_controller.as_ref(),
+        bank_forks.as_ref(),
         progress,
         async_verification_freelist,
-    ) {
-        info!("unable to clear abandoned bank {bank_slot}: {err}");
-    }
+    );
 }

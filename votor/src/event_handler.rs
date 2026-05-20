@@ -913,9 +913,6 @@ mod tests {
     use {
         super::*,
         crate::{
-            bank_forks_controller_test_utils::{
-                DirectBankForksController, DirectBankForksControllerRootContext,
-            },
             commitment::CommitmentAggregationData,
             consensus_metrics::ConsensusMetricsEventReceiver,
             event::{LeaderWindowInfo, RepairEventReceiver, SwitchBankEventReceiver},
@@ -929,7 +926,7 @@ mod tests {
             consensus_message::{BLS_KEYPAIR_DERIVE_SEED, ConsensusMessage, VoteMessage},
             vote::Vote,
         },
-        crossbeam_channel::{Receiver, TryRecvError, unbounded},
+        crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded},
         parking_lot::RwLock as PlRwLock,
         solana_bls_signatures::{
             keypair::Keypair as BLSKeypair, signature::Signature as BLSSignature,
@@ -944,6 +941,7 @@ mod tests {
         solana_runtime::{
             bank::{Bank, SlotLeader},
             bank_forks::BankForks,
+            bank_forks_controller::{BankForksController, BankForksControllerError},
             genesis_utils::{
                 ValidatorVoteKeypairs, create_genesis_config_with_alpenglow_vote_accounts,
             },
@@ -979,6 +977,53 @@ mod tests {
         root_context: RootContext,
         local_context: LocalContext,
         bls_ops: Vec<BLSOp>,
+    }
+
+    struct DirectBankForksController {
+        bank_forks: Arc<RwLock<BankForks>>,
+        blockstore: Arc<Blockstore>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
+        drop_bank_sender: Sender<Vec<BankWithScheduler>>,
+    }
+
+    impl BankForksController for DirectBankForksController {
+        fn insert_bank(&self, bank: Bank) -> Result<BankWithScheduler, BankForksControllerError> {
+            Ok(self.bank_forks.write().unwrap().insert(bank))
+        }
+
+        fn set_root(
+            &self,
+            my_pubkey: Pubkey,
+            parent_slot: Slot,
+            new_root: Slot,
+            highest_super_majority_root: Option<Slot>,
+        ) -> Result<(), BankForksControllerError> {
+            root_utils::check_and_handle_new_root(
+                parent_slot,
+                new_root,
+                None,
+                highest_super_majority_root,
+                &None,
+                &self.drop_bank_sender,
+                &self.blockstore,
+                &self.leader_schedule_cache,
+                &self.bank_forks,
+                None,
+                &my_pubkey,
+                |_| {},
+            );
+            Ok(())
+        }
+
+        fn clear_bank(&self, slot: Slot) -> Result<(), BankForksControllerError> {
+            let bank_to_clear = self.bank_forks.read().unwrap().get_with_scheduler(slot);
+            if let Some(bank) = bank_to_clear {
+                let _ = bank.wait_for_completed_scheduler();
+            }
+
+            self.bank_forks.write().unwrap().clear_bank(slot, false);
+            Ok(())
+        }
     }
 
     fn setup() -> EventHandlerTestContext {
@@ -1034,17 +1079,12 @@ mod tests {
         let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(
             &bank_forks.read().unwrap().root_bank(),
         ));
-        let bank_forks_controller = DirectBankForksController::new_shared_with_root_context(
-            bank_forks.clone(),
-            DirectBankForksControllerRootContext {
-                blockstore: blockstore.clone(),
-                leader_schedule_cache,
-                drop_bank_sender: drop_bank_sender.clone(),
-                snapshot_controller: None,
-                bank_notification_sender: None,
-                rpc_subscriptions: None,
-            },
-        );
+        let bank_forks_controller = Arc::new(DirectBankForksController {
+            bank_forks: bank_forks.clone(),
+            blockstore: blockstore.clone(),
+            leader_schedule_cache,
+            drop_bank_sender: drop_bank_sender.clone(),
+        });
         let highest_parent_ready = Arc::new(RwLock::default());
 
         let shared_context = SharedContext {

@@ -11,7 +11,6 @@ use {
         replay_stage::ReplayStage,
         vote_simulator::{self, VoteSimulator},
     },
-    agave_votor::bank_forks_controller_test_utils::DirectBankForksController,
     agave_votor_messages::consensus_message::{Certificate, CertificateType},
     blockstore_processor::{
         ConfirmationProgress, ProcessOptions, confirm_full_slot, fill_blockstore_slot_with_ticks,
@@ -56,7 +55,6 @@ use {
     },
     solana_runtime::{
         bank::BankTestConfig,
-        bank_forks_controller::BankForksController,
         block_component_processor::BlockComponentProcessorError,
         commitment::{BlockCommitment, VOTE_THRESHOLD_SIZE},
         genesis_utils::{GenesisConfigInfo, ValidatorVoteKeypairs},
@@ -84,12 +82,6 @@ use {
 
 static_assertions::const_assert!(REFRESH_VOTE_BLOCKHEIGHT < solana_clock::MAX_PROCESSING_AGE);
 
-fn direct_bank_forks_controller(
-    bank_forks: &Arc<RwLock<BankForks>>,
-) -> Arc<dyn BankForksController> {
-    DirectBankForksController::new_shared(bank_forks.clone())
-}
-
 impl ProcessActiveBanksContext {
     fn new_for_tests(
         bank_forks: Arc<RwLock<BankForks>>,
@@ -108,8 +100,7 @@ impl ProcessActiveBanksContext {
             .build()
             .expect("new rayon threadpool");
         Self {
-            bank_forks: bank_forks.clone(),
-            bank_forks_controller: direct_bank_forks_controller(&bank_forks),
+            bank_forks,
             blockstore,
             transaction_status_sender: None,
             entry_notification_sender: None,
@@ -416,7 +407,6 @@ fn test_child_slots_of_same_parent() {
         NewBankForksContext {
             blockstore: &blockstore,
             bank_forks: &bank_forks,
-            bank_forks_controller: direct_bank_forks_controller(&bank_forks).as_ref(),
             leader_schedule_cache: &leader_schedule_cache,
             rpc_subscriptions: rpc_subscriptions.as_deref(),
             slot_status_notifier: &None,
@@ -449,7 +439,6 @@ fn test_child_slots_of_same_parent() {
         NewBankForksContext {
             blockstore: &blockstore,
             bank_forks: &bank_forks,
-            bank_forks_controller: direct_bank_forks_controller(&bank_forks).as_ref(),
             leader_schedule_cache: &leader_schedule_cache,
             rpc_subscriptions: rpc_subscriptions.as_deref(),
             slot_status_notifier: &None,
@@ -2705,7 +2694,6 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
         NewBankForksContext {
             blockstore: &blockstore,
             bank_forks: &bank_forks,
-            bank_forks_controller: direct_bank_forks_controller(&bank_forks).as_ref(),
             leader_schedule_cache: &leader_schedule_cache,
             rpc_subscriptions: rpc_subscriptions.as_deref(),
             slot_status_notifier: &None,
@@ -2739,7 +2727,6 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
         NewBankForksContext {
             blockstore: &blockstore,
             bank_forks: &bank_forks,
-            bank_forks_controller: direct_bank_forks_controller(&bank_forks).as_ref(),
             leader_schedule_cache: &leader_schedule_cache,
             rpc_subscriptions: rpc_subscriptions.as_deref(),
             slot_status_notifier: &None,
@@ -2774,7 +2761,6 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
         NewBankForksContext {
             blockstore: &blockstore,
             bank_forks: &bank_forks,
-            bank_forks_controller: direct_bank_forks_controller(&bank_forks).as_ref(),
             leader_schedule_cache: &leader_schedule_cache,
             rpc_subscriptions: rpc_subscriptions.as_deref(),
             slot_status_notifier: &None,
@@ -2808,7 +2794,6 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
         NewBankForksContext {
             blockstore: &blockstore,
             bank_forks: &bank_forks,
-            bank_forks_controller: direct_bank_forks_controller(&bank_forks).as_ref(),
             leader_schedule_cache: &leader_schedule_cache,
             rpc_subscriptions: rpc_subscriptions.as_deref(),
             slot_status_notifier: &None,
@@ -2871,7 +2856,6 @@ fn test_update_parent_restart() {
         &Pubkey::new_unique(),
         &blockstore,
         &bank_forks,
-        direct_bank_forks_controller(&bank_forks).as_ref(),
         &mut progress,
         &mut async_verification_freelist,
         &rx,
@@ -2943,7 +2927,6 @@ fn test_headerless_update_parent() {
         NewBankForksContext {
             blockstore: &blockstore,
             bank_forks: &bank_forks,
-            bank_forks_controller: direct_bank_forks_controller(&bank_forks).as_ref(),
             leader_schedule_cache: &leader_schedule_cache,
             rpc_subscriptions: None,
             slot_status_notifier: &None,
@@ -3004,7 +2987,6 @@ fn test_update_parent_tower_gated() {
         &Pubkey::new_unique(),
         &blockstore,
         &bank_forks,
-        direct_bank_forks_controller(&bank_forks).as_ref(),
         &mut progress,
         &mut async_verification_freelist,
         &rx,
@@ -3052,7 +3034,6 @@ fn test_update_parent_keeps_hard() {
         &Pubkey::new_unique(),
         &blockstore,
         &bank_forks,
-        direct_bank_forks_controller(&bank_forks).as_ref(),
         &mut progress,
         &mut async_verification_freelist,
         &rx,
@@ -3272,7 +3253,6 @@ fn test_soft_dead_restarts() {
         &Pubkey::new_unique(),
         &blockstore,
         &bank_forks,
-        direct_bank_forks_controller(&bank_forks).as_ref(),
         &None,
         &None,
         &mut progress,
@@ -3316,7 +3296,6 @@ fn test_full_soft_dead_hardens() {
         &Pubkey::new_unique(),
         &blockstore,
         &bank_forks,
-        direct_bank_forks_controller(&bank_forks).as_ref(),
         &None,
         &None,
         &mut progress,
@@ -3451,7 +3430,6 @@ fn test_skip_own_update_full() {
         NewBankForksContext {
             blockstore: &blockstore,
             bank_forks: &bank_forks,
-            bank_forks_controller: direct_bank_forks_controller(&bank_forks).as_ref(),
             leader_schedule_cache: &leader_schedule_cache,
             rpc_subscriptions: None,
             slot_status_notifier: &None,
