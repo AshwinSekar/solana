@@ -119,7 +119,7 @@ esac
 )
 
 # newVersion="$MAJOR.$MINOR.$PATCH$SPECIAL"
-newVersion="0.4.0"
+newVersion="0.4.1"
 
 # Update all the Cargo.toml files
 for Cargo_toml in "${Cargo_tomls[@]}"; do
