@@ -1347,8 +1347,11 @@ mod tests {
                     signature,
                 });
                 let prev_length = self.bls_ops.len();
-                self.bls_ops.retain(|bls_op| {
-                    !matches!(bls_op, BLSOp::PushVote { message, .. } if **message == expected_message)
+                self.bls_ops.retain(|bls_op| match bls_op {
+                    BLSOp::PushVote { message, .. } | BLSOp::RefreshVote { message, .. } => {
+                        **message != expected_message
+                    }
+                    BLSOp::PushCertificate { .. } => true,
                 });
                 assert!(
                     self.bls_ops.len() < prev_length,

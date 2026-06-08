@@ -35,6 +35,10 @@ pub enum BLSOp {
         slot: Slot,
         saved_vote_history: SavedVoteHistoryVersions,
     },
+    RefreshVote {
+        message: Arc<ConsensusMessage>,
+        slot: Slot,
+    },
     PushCertificate {
         certificate: Arc<Certificate>,
     },
@@ -223,6 +227,16 @@ impl VotingService {
                     staked_validators_cache,
                 );
             }
+            BLSOp::RefreshVote { message, slot } => {
+                Self::broadcast_consensus_message(
+                    slot,
+                    cluster_info,
+                    &message,
+                    connection_cache,
+                    additional_listeners,
+                    staked_validators_cache,
+                );
+            }
             BLSOp::PushCertificate { certificate } => {
                 let vote_slot = certificate.cert_type.slot();
                 let message = ConsensusMessage::Certificate((*certificate).clone());
@@ -332,6 +346,18 @@ mod tests {
         saved_vote_history: SavedVoteHistoryVersions::Current(SavedVoteHistory::default()),
     }, ConsensusMessage::Vote(VoteMessage {
         vote: Vote::new_skip_vote(5),
+        signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
+        rank: 1,
+    }))]
+    #[test_case(BLSOp::RefreshVote {
+        message: Arc::new(ConsensusMessage::Vote(VoteMessage {
+            vote: Vote::new_skip_vote(6),
+            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
+            rank: 1,
+        })),
+        slot: 6,
+    }, ConsensusMessage::Vote(VoteMessage {
+        vote: Vote::new_skip_vote(6),
         signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
         rank: 1,
     }))]

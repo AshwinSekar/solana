@@ -230,7 +230,7 @@ pub fn generate_vote_tx(
 /// - authorized voter checks
 ///
 /// We also update the vote history and send the vote to
-/// the certificate pool thread for ingestion.
+/// the certificate pool thread for ingestion, except for refresh votes.
 ///
 /// Returns false if we are currently a non-voting node
 fn insert_vote_and_create_bls_message(
@@ -262,12 +262,18 @@ fn insert_vote_and_create_bls_message(
             }
         }
     };
+    if is_refresh {
+        return Ok(BLSOp::RefreshVote {
+            message: Arc::new(message),
+            slot: vote.slot(),
+        });
+    }
+
     context
         .own_vote_sender
         .send(vec![message.clone()])
         .map_err(|_| SendError(()))?;
 
-    // TODO: for refresh votes use a different BLSOp so we don't have to rewrite the same vote history to file
     let saved_vote_history =
         SavedVoteHistory::new(&context.vote_history, &context.identity_keypair)?;
 
@@ -432,7 +438,20 @@ mod tests {
 
         // Check that own vote sender receives the vote
         let received_message = own_vote_receiver.recv().unwrap();
-        assert_eq!(received_message, vec![expected_message]);
+        assert_eq!(received_message, vec![expected_message.clone()]);
+
+        let refresh_vote = Vote::new_notarization_vote(vote_slot, block_id);
+        let refresh_result = generate_vote_message(refresh_vote, true, &mut voting_context)
+            .ok()
+            .unwrap()
+            .unwrap();
+        if let BLSOp::RefreshVote { message, slot } = &refresh_result {
+            assert_eq!(slot, &vote_slot);
+            assert_eq!(**message, expected_message);
+        } else {
+            panic!("Expected BLSOp::RefreshVote, got {refresh_result:?}");
+        }
+        assert!(own_vote_receiver.try_recv().is_err());
     }
 
     #[test]

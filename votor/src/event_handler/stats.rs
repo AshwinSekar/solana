@@ -185,7 +185,7 @@ impl EventHandlerStats {
     }
 
     pub fn incr_vote(&mut self, bls_op: &BLSOp) {
-        if let BLSOp::PushVote { message, .. } = bls_op {
+        if let BLSOp::PushVote { message, .. } | BLSOp::RefreshVote { message, .. } = bls_op {
             let ConsensusMessage::Vote(vote) = **message else {
                 warn!("Unexpected BLS message type: {message:?}");
                 return;
