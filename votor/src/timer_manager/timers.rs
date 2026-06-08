@@ -1,6 +1,6 @@
 use {
     crate::{event::VotorEvent, timer_manager::stats::TimerManagerStats},
-    crossbeam_channel::Sender,
+    crossbeam_channel::{Sender, TrySendError},
     solana_clock::Slot,
     solana_leader_schedule::NUM_CONSECUTIVE_LEADER_SLOTS,
     solana_runtime::leader_schedule_utils::last_of_consecutive_leader_slots,
@@ -247,7 +247,18 @@ impl Timers {
 
                     let mut timer = self.timers.remove(&slot).unwrap();
                     if let Some(event) = timer.progress(now) {
-                        self.event_sender.send(event).unwrap();
+                        let send_start = Instant::now();
+                        let blocked = match self.event_sender.try_send(event) {
+                            Ok(()) => false,
+                            Err(TrySendError::Full(event)) => {
+                                self.event_sender.send(event).unwrap();
+                                true
+                            }
+                            Err(TrySendError::Disconnected(_)) => {
+                                panic!("TimerManager event receiver disconnected");
+                            }
+                        };
+                        self.stats.record_event_send(send_start.elapsed(), blocked);
                     }
                     if let Some(next_fire) = timer.next_fire() {
                         self.heap.push(Reverse((next_fire, slot)));

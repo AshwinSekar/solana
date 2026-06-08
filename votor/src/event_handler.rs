@@ -18,7 +18,7 @@ use {
         votor::SharedContext,
     },
     agave_votor_messages::{consensus_message::Block, migration::MigrationStatus, vote::Vote},
-    crossbeam_channel::{RecvError, SendError, TrySendError, select},
+    crossbeam_channel::{RecvError, SendError, Sender, TrySendError, select},
     parking_lot::RwLock,
     solana_clock::Slot,
     solana_hash::Hash,
@@ -166,6 +166,9 @@ impl EventHandler {
                 .stats
                 .receive_event_time_us
                 .saturating_add(receive_event_time.as_us() as u32);
+            local_context
+                .stats
+                .observe_event_queue(event_receiver.len(), event_receiver.capacity());
 
             let root_bank = vctx.sharable_banks.root();
             if event.should_ignore(root_bank.slot().max(vctx.vote_history.root())) {
@@ -190,8 +193,7 @@ impl EventHandler {
 
             let mut send_votes_batch_time = Measure::start("send_votes_batch");
             for vote in votes {
-                local_context.stats.incr_vote(&vote);
-                vctx.bls_sender.send(vote).map_err(|_| SendError(()))?;
+                Self::send_bls_op(&vctx.bls_sender, &mut local_context.stats, vote)?;
             }
             send_votes_batch_time.stop();
             local_context.stats.send_votes_batch_time_us = local_context
@@ -201,6 +203,47 @@ impl EventHandler {
             local_context.stats.maybe_report();
         }
 
+        Ok(())
+    }
+
+    fn send_bls_op(
+        bls_sender: &Sender<BLSOp>,
+        stats: &mut EventHandlerStats,
+        vote: BLSOp,
+    ) -> Result<(), EventLoopError> {
+        let vote_type_and_slot = EventHandlerStats::vote_type_and_slot(&vote);
+        let bls_queue_capacity = bls_sender.capacity();
+        stats.observe_bls_queue(bls_sender.len(), bls_queue_capacity);
+
+        let mut bls_send_time = Measure::start("bls_send");
+        if matches!(&vote, BLSOp::RefreshVote { .. }) {
+            match bls_sender.try_send(vote) {
+                Ok(()) => {
+                    bls_send_time.stop();
+                    stats.record_bls_send(bls_send_time.as_us());
+                    if let Some((vote_type, slot)) = vote_type_and_slot {
+                        stats.incr_vote_type(vote_type, slot);
+                    }
+                }
+                Err(TrySendError::Full(_)) => {
+                    bls_send_time.stop();
+                    stats.record_bls_send(bls_send_time.as_us());
+                    stats.incr_refresh_votes_dropped();
+                    stats.incr_refresh_vote_queue_full();
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(EventLoopError::SenderDisconnected(SendError(())));
+                }
+            }
+        } else {
+            bls_sender.send(vote).map_err(|_| SendError(()))?;
+            bls_send_time.stop();
+            stats.record_bls_send(bls_send_time.as_us());
+            if let Some((vote_type, slot)) = vote_type_and_slot {
+                stats.incr_vote_type(vote_type, slot);
+            }
+        }
+        stats.observe_bls_queue(bls_sender.len(), bls_queue_capacity);
         Ok(())
     }
 
@@ -930,7 +973,7 @@ mod tests {
             consensus_message::{BLS_KEYPAIR_DERIVE_SEED, ConsensusMessage, VoteMessage},
             vote::Vote,
         },
-        crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded},
+        crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded},
         parking_lot::RwLock as PlRwLock,
         solana_bls_signatures::{
             keypair::Keypair as BLSKeypair, signature::Signature as BLSSignature,
@@ -1843,6 +1886,37 @@ mod tests {
         test_context.send_standstill_event(1);
 
         test_context.check_for_votes(&[Vote::new_skip_vote(2), Vote::new_skip_vote(3)]);
+    }
+
+    #[test]
+    fn test_refresh_vote_dropped_when_bls_queue_full() {
+        let mut test_context = setup();
+        let refresh_vote = generate_vote_message(
+            Vote::new_skip_vote(1),
+            true,
+            &mut test_context.voting_context,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(refresh_vote, BLSOp::RefreshVote { .. }));
+
+        let (bls_sender, bls_receiver) = bounded(0);
+        EventHandler::send_bls_op(
+            &bls_sender,
+            &mut test_context.local_context.stats,
+            refresh_vote,
+        )
+        .unwrap();
+
+        assert!(matches!(bls_receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(test_context.local_context.stats.refresh_votes_dropped(), 1);
+        assert_eq!(
+            test_context
+                .local_context
+                .stats
+                .refresh_vote_queue_full_count(),
+            1
+        );
     }
 
     #[test]
