@@ -3,7 +3,10 @@ use {
         staked_validators_cache::StakedValidatorsCache,
         vote_history_storage::{SavedVoteHistoryVersions, VoteHistoryStorage},
     },
-    agave_votor_messages::{certificate::Certificate, consensus_message::ConsensusMessage},
+    agave_votor_messages::{
+        certificate::Certificate,
+        consensus_message::{ConsensusMessage, VoteMessage},
+    },
     crossbeam_channel::Receiver,
     solana_client::connection_cache::ConnectionCache,
     solana_clock::Slot,
@@ -28,19 +31,18 @@ const STAKED_VALIDATORS_CACHE_TTL_S: u64 = 5;
 /// before evicting down to this target.
 const STAKED_VALIDATORS_CACHE_NUM_EPOCH_TARGET: usize = 3;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BLSOp {
     PushVote {
         message: Arc<ConsensusMessage>,
         slot: Slot,
         saved_vote_history: SavedVoteHistoryVersions,
     },
-    RefreshVote {
-        message: Arc<ConsensusMessage>,
-        slot: Slot,
+    PushCertificates {
+        certificates: Vec<Arc<Certificate>>,
     },
-    PushCertificate {
-        certificate: Arc<Certificate>,
+    RefreshVotes {
+        votes: Vec<Arc<VoteMessage>>,
     },
 }
 
@@ -227,27 +229,33 @@ impl VotingService {
                     staked_validators_cache,
                 );
             }
-            BLSOp::RefreshVote { message, slot } => {
-                Self::broadcast_consensus_message(
-                    slot,
-                    cluster_info,
-                    &message,
-                    connection_cache,
-                    additional_listeners,
-                    staked_validators_cache,
-                );
+            BLSOp::PushCertificates { certificates } => {
+                for certificate in certificates {
+                    let slot = certificate.cert_type.slot();
+                    let message = ConsensusMessage::Certificate(Arc::unwrap_or_clone(certificate));
+                    Self::broadcast_consensus_message(
+                        slot,
+                        cluster_info,
+                        &message,
+                        connection_cache.clone(),
+                        additional_listeners,
+                        staked_validators_cache,
+                    );
+                }
             }
-            BLSOp::PushCertificate { certificate } => {
-                let vote_slot = certificate.cert_type.slot();
-                let message = ConsensusMessage::Certificate((*certificate).clone());
-                Self::broadcast_consensus_message(
-                    vote_slot,
-                    cluster_info,
-                    &message,
-                    connection_cache,
-                    additional_listeners,
-                    staked_validators_cache,
-                );
+            BLSOp::RefreshVotes { votes } => {
+                for vote in votes {
+                    let slot = vote.vote.slot();
+                    let msg = ConsensusMessage::Vote(Arc::unwrap_or_clone(vote));
+                    Self::broadcast_consensus_message(
+                        slot,
+                        cluster_info,
+                        &msg,
+                        connection_cache.clone(),
+                        additional_listeners,
+                        staked_validators_cache,
+                    );
+                }
             }
         }
     }
@@ -349,28 +357,27 @@ mod tests {
         signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
         rank: 1,
     }))]
-    #[test_case(BLSOp::RefreshVote {
-        message: Arc::new(ConsensusMessage::Vote(VoteMessage {
-            vote: Vote::new_skip_vote(6),
-            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
-            rank: 1,
-        })),
-        slot: 6,
-    }, ConsensusMessage::Vote(VoteMessage {
-        vote: Vote::new_skip_vote(6),
-        signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
-        rank: 1,
-    }))]
-    #[test_case(BLSOp::PushCertificate {
-        certificate: Arc::new(Certificate {
-            cert_type: CertificateType::Skip(5),
+    #[test_case(BLSOp::PushCertificates {
+        certificates: vec![Arc::new(Certificate {
+                cert_type: CertificateType::Skip(5),
             signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
             bitmap: Vec::new(),
-        }),
+        })],
     }, ConsensusMessage::Certificate(Certificate {
         cert_type: CertificateType::Skip(5),
         signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
         bitmap: Vec::new(),
+    }))]
+    #[test_case(BLSOp::RefreshVotes {
+        votes: vec![Arc::new(VoteMessage {
+            vote: Vote::new_skip_vote(6),
+            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
+            rank: 1,
+        })],
+    }, ConsensusMessage::Vote(VoteMessage {
+        vote: Vote::new_skip_vote(6),
+        signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
+        rank: 1,
     }))]
     fn test_send_message(bls_op: BLSOp, expected_message: ConsensusMessage) {
         agave_logger::setup();

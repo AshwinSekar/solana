@@ -16,7 +16,7 @@ use {
         voting_service::BLSOp,
     },
     agave_votor_messages::{
-        certificate::Certificate,
+        certificate::{Certificate, CertificateType},
         consensus_message::{Block, ConsensusMessage},
         migration::MigrationStatus,
     },
@@ -32,7 +32,8 @@ use {
     },
     stats::ConsensusPoolServiceStats,
     std::{
-        collections::HashSet,
+        cmp::Reverse,
+        collections::{HashSet, VecDeque},
         sync::{
             Arc, RwLock,
             atomic::{AtomicBool, Ordering},
@@ -41,6 +42,9 @@ use {
         time::{Duration, Instant},
     },
 };
+
+const MAX_CERTIFICATES_PER_BLS_OP: usize = 8;
+const MAX_STANDSTILL_CERTIFICATES_PER_TICK: usize = 32;
 
 /// Inputs for the certificate pool thread
 pub(crate) struct ConsensusPoolContext {
@@ -68,6 +72,62 @@ pub(crate) struct ConsensusPoolContext {
 
 pub(crate) struct ConsensusPoolService {
     t_ingest: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct CertificateRefreshQueue {
+    pending: VecDeque<Arc<Certificate>>,
+    pending_types: HashSet<CertificateType>,
+    cursor: usize,
+}
+
+impl CertificateRefreshQueue {
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn add_rotating(&mut self, mut certificates: Vec<Arc<Certificate>>) -> usize {
+        if certificates.is_empty() {
+            self.cursor = 0;
+            return 0;
+        }
+
+        certificates.sort_by_key(|cert| Reverse(cert.cert_type.slot()));
+        let total_certificates = certificates.len();
+        let refresh_count = total_certificates.min(MAX_STANDSTILL_CERTIFICATES_PER_TICK);
+        let start = self.cursor % total_certificates;
+        self.cursor = (self.cursor + refresh_count) % total_certificates;
+
+        let mut queued = 0usize;
+        for offset in 0..refresh_count {
+            let certificate = certificates[(start + offset) % total_certificates].clone();
+            if self.pending_types.insert(certificate.cert_type) {
+                self.pending.push_back(certificate);
+                queued = queued.saturating_add(1);
+            }
+        }
+        queued
+    }
+
+    fn pop_batch(&mut self) -> Vec<Arc<Certificate>> {
+        let mut batch = Vec::with_capacity(MAX_CERTIFICATES_PER_BLS_OP);
+        for _ in 0..MAX_CERTIFICATES_PER_BLS_OP {
+            let Some(certificate) = self.pending.pop_front() else {
+                break;
+            };
+            self.pending_types.remove(&certificate.cert_type);
+            batch.push(certificate);
+        }
+        batch
+    }
+
+    fn push_front_batch(&mut self, certificates: Vec<Arc<Certificate>>) {
+        for certificate in certificates.into_iter().rev() {
+            if self.pending_types.insert(certificate.cert_type) {
+                self.pending.push_front(certificate);
+            }
+        }
+    }
 }
 
 impl ConsensusPoolService {
@@ -151,12 +211,15 @@ impl ConsensusPoolService {
         stats: &mut ConsensusPoolServiceStats,
     ) -> Result<(), AddVoteError> {
         let num_certs = certificates_to_send.len();
-        for (i, certificate) in certificates_to_send.into_iter().enumerate() {
-            // The buffer should normally be large enough, so we don't handle
-            // certificate re-send here.
-            match bls_sender.try_send(BLSOp::PushCertificate { certificate }) {
-                Ok(_) => {
-                    stats.certificates_sent += 1;
+        let mut sent = 0usize;
+        for batch in certificates_to_send.chunks(MAX_CERTIFICATES_PER_BLS_OP) {
+            let batch_len = batch.len();
+            match bls_sender.try_send(BLSOp::PushCertificates {
+                certificates: batch.to_vec(),
+            }) {
+                Ok(()) => {
+                    sent = sent.saturating_add(batch_len);
+                    stats.certificates_sent += batch_len;
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     return Err(AddVoteError::ChannelDisconnected(
@@ -164,11 +227,46 @@ impl ConsensusPoolService {
                     ));
                 }
                 Err(TrySendError::Full(_)) => {
-                    stats.certificates_dropped += num_certs.saturating_sub(i);
+                    stats.certificates_dropped += num_certs.saturating_sub(sent);
                     return Err(AddVoteError::VotingServiceQueueFull);
                 }
             }
         }
+        Ok(())
+    }
+
+    fn drain_certificate_refresh_queue(
+        my_pubkey: &Pubkey,
+        bls_sender: &Sender<BLSOp>,
+        refresh_queue: &mut CertificateRefreshQueue,
+        stats: &mut ConsensusPoolServiceStats,
+    ) -> Result<(), AddVoteError> {
+        while refresh_queue.len() > 0 {
+            let certificates = refresh_queue.pop_batch();
+            let num_certs = certificates.len();
+            match bls_sender.try_send(BLSOp::PushCertificates { certificates }) {
+                Ok(()) => {
+                    stats.certificates_sent += num_certs;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(AddVoteError::ChannelDisconnected(
+                        "VotingService".to_string(),
+                    ));
+                }
+                Err(TrySendError::Full(BLSOp::PushCertificates { certificates })) => {
+                    refresh_queue.push_front_batch(certificates);
+                    stats.certificates_deferred += num_certs;
+                    warn!(
+                        "{my_pubkey}: channel is full, deferring {num_certs} refreshed certs, \
+                         pending={}",
+                        refresh_queue.len()
+                    );
+                    break;
+                }
+                Err(TrySendError::Full(_)) => unreachable!("unexpected BLS operation"),
+            }
+        }
+        stats.certificate_refresh_pending = refresh_queue.len();
         Ok(())
     }
 
@@ -287,6 +385,7 @@ impl ConsensusPoolService {
 
         // Standstill tracking
         let mut standstill_timer = Instant::now();
+        let mut certificate_refresh_queue = CertificateRefreshQueue::default();
 
         // Kick off parent ready
         let mut kick_off_parent_ready = false;
@@ -296,6 +395,24 @@ impl ConsensusPoolService {
 
         // Ingest votes into certificate pool and notify voting loop of new events
         while !ctx.exit.load(Ordering::Relaxed) {
+            match Self::drain_certificate_refresh_queue(
+                &ctx.cluster_info.id(),
+                &ctx.bls_sender,
+                &mut certificate_refresh_queue,
+                &mut stats,
+            ) {
+                Ok(()) => (),
+                Err(AddVoteError::ChannelDisconnected(channel_name)) => {
+                    return Self::handle_channel_disconnected(&mut ctx, channel_name.as_str());
+                }
+                Err(e) => {
+                    trace!(
+                        "{}: unable to drain refreshed certificates into voting service {e}",
+                        ctx.cluster_info.id()
+                    );
+                }
+            }
+
             // Kick off parent ready event, this either happens:
             // - When we first migrate to alpenglow from TowerBFT - kick off with genesis block
             // - If we startup post alpenglow migration - kick off with root block
@@ -334,11 +451,21 @@ impl ConsensusPoolService {
                 }
                 stats.standstill = true;
                 standstill_timer = Instant::now();
-                match Self::send_certificates(
-                    &ctx.sharable_banks,
+                let certificates = consensus_pool.get_certs_for_standstill();
+                let total_certificates = certificates.len();
+                let queued = certificate_refresh_queue.add_rotating(certificates);
+                stats.certificate_refresh_queued += queued;
+                stats.certificate_refresh_pending = certificate_refresh_queue.len();
+                info!(
+                    "{}: queued {queued}/{total_certificates} standstill cert refreshes, \
+                     pending={}",
+                    ctx.cluster_info.id(),
+                    certificate_refresh_queue.len(),
+                );
+                match Self::drain_certificate_refresh_queue(
                     &ctx.cluster_info.id(),
                     &ctx.bls_sender,
-                    consensus_pool.get_certs_for_standstill(),
+                    &mut certificate_refresh_queue,
                     &mut stats,
                 ) {
                     Ok(()) => (),
@@ -413,6 +540,7 @@ impl ConsensusPoolService {
                     }
                 }
             }
+            stats.certificate_refresh_pending = certificate_refresh_queue.len();
             stats.maybe_report();
             consensus_pool.maybe_report();
         }
@@ -789,17 +917,19 @@ mod tests {
         // Verify that we received certificates via the bls channel
         let mut found_certificate = false;
         while let Ok(event) = ctx.bls_receiver.try_recv() {
-            if let BLSOp::PushCertificate { certificate } = event {
-                assert_eq!(certificate.cert_type.slot(), target_slot);
-                assert!(
-                    matches!(certificate.cert_type, CertificateType::Notarize(_, _))
-                        || matches!(certificate.cert_type, CertificateType::FinalizeFast(_, _))
-                        || matches!(
-                            certificate.cert_type,
-                            CertificateType::NotarizeFallback(_, _)
-                        )
-                );
-                found_certificate = true;
+            if let BLSOp::PushCertificates { certificates } = event {
+                for certificate in certificates {
+                    assert_eq!(certificate.cert_type.slot(), target_slot);
+                    assert!(
+                        matches!(certificate.cert_type, CertificateType::Notarize(_, _))
+                            || matches!(certificate.cert_type, CertificateType::FinalizeFast(_, _))
+                            || matches!(
+                                certificate.cert_type,
+                                CertificateType::NotarizeFallback(_, _)
+                            )
+                    );
+                    found_certificate = true;
+                }
             }
         }
         assert!(found_certificate, "Should have received a certificate");
@@ -869,10 +999,12 @@ mod tests {
         // Verify skip certificate was forwarded
         let mut found_skip = false;
         while let Ok(event) = ctx.bls_receiver.try_recv() {
-            if let BLSOp::PushCertificate { certificate } = event {
-                if matches!(certificate.cert_type, CertificateType::Skip(slot) if slot == target_slot)
-                {
-                    found_skip = true;
+            if let BLSOp::PushCertificates { certificates } = event {
+                for certificate in certificates {
+                    if matches!(certificate.cert_type, CertificateType::Skip(slot) if slot == target_slot)
+                    {
+                        found_skip = true;
+                    }
                 }
             }
         }
@@ -1088,17 +1220,49 @@ mod tests {
         assert_eq!(stats.certificates_sent.0, 2);
 
         // Verify certificates were received
-        let cert1 = ctx.bls_receiver.try_recv();
-        assert!(cert1.is_ok());
-        if let BLSOp::PushCertificate { certificate } = cert1.unwrap() {
-            assert!(matches!(certificate.cert_type, CertificateType::Skip(1)));
-        }
+        let certs = ctx.bls_receiver.try_recv().unwrap();
+        let BLSOp::PushCertificates { certificates } = certs else {
+            panic!("expected PushCertificates");
+        };
+        assert_eq!(certificates.len(), 2);
+        assert!(matches!(
+            certificates[0].cert_type,
+            CertificateType::Skip(1)
+        ));
+        assert!(matches!(
+            certificates[1].cert_type,
+            CertificateType::Skip(2)
+        ));
+        assert!(ctx.bls_receiver.try_recv().is_err());
+    }
 
-        let cert2 = ctx.bls_receiver.try_recv();
-        assert!(cert2.is_ok());
-        if let BLSOp::PushCertificate { certificate } = cert2.unwrap() {
-            assert!(matches!(certificate.cert_type, CertificateType::Skip(2)));
-        }
+    #[test]
+    fn test_certificate_refresh_queue_rotates_and_dedupes() {
+        let certificates = (1..=(MAX_STANDSTILL_CERTIFICATES_PER_TICK + 4) as Slot)
+            .map(|slot| {
+                Arc::new(Certificate {
+                    cert_type: CertificateType::Skip(slot),
+                    signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
+                    bitmap: vec![],
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut refresh_queue = CertificateRefreshQueue::default();
+
+        assert_eq!(
+            refresh_queue.add_rotating(certificates.clone()),
+            MAX_STANDSTILL_CERTIFICATES_PER_TICK
+        );
+        assert_eq!(refresh_queue.len(), MAX_STANDSTILL_CERTIFICATES_PER_TICK);
+
+        assert_eq!(refresh_queue.add_rotating(certificates.clone()), 4);
+        assert_eq!(refresh_queue.len(), certificates.len());
+
+        assert_eq!(refresh_queue.add_rotating(certificates), 0);
+        assert_eq!(
+            refresh_queue.len(),
+            MAX_STANDSTILL_CERTIFICATES_PER_TICK + 4
+        );
     }
 
     #[test]

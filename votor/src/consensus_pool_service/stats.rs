@@ -13,6 +13,9 @@ pub(super) struct ConsensusPoolServiceStats {
     pub(super) add_message_failed: Saturating<usize>,
     pub(super) certificates_sent: Saturating<usize>,
     pub(super) certificates_dropped: Saturating<usize>,
+    pub(super) certificates_deferred: Saturating<usize>,
+    pub(super) certificate_refresh_queued: Saturating<usize>,
+    pub(super) certificate_refresh_pending: usize,
     pub(super) certificates_skipped_unstaked: Saturating<usize>,
     pub(super) new_finalized_slot: Saturating<usize>,
     pub(super) parent_ready_missed_window: Saturating<usize>,
@@ -32,6 +35,9 @@ impl ConsensusPoolServiceStats {
             add_message_failed: Saturating(0),
             certificates_sent: Saturating(0),
             certificates_dropped: Saturating(0),
+            certificates_deferred: Saturating(0),
+            certificate_refresh_queued: Saturating(0),
+            certificate_refresh_pending: 0,
             certificates_skipped_unstaked: Saturating(0),
             new_finalized_slot: Saturating(0),
             parent_ready_missed_window: Saturating(0),
@@ -51,6 +57,9 @@ impl ConsensusPoolServiceStats {
             add_message_failed: Saturating(add_message_failed),
             certificates_sent: Saturating(certificates_sent),
             certificates_dropped: Saturating(certificates_dropped),
+            certificates_deferred: Saturating(certificates_deferred),
+            certificate_refresh_queued: Saturating(certificate_refresh_queued),
+            certificate_refresh_pending,
             certificates_skipped_unstaked: Saturating(certificates_skipped_unstaked),
             new_finalized_slot: Saturating(new_finalized_slot),
             parent_ready_missed_window: Saturating(parent_ready_missed_window),
@@ -68,6 +77,17 @@ impl ConsensusPoolServiceStats {
             ("add_message_failed", add_message_failed, i64),
             ("certificates_sent", certificates_sent, i64),
             ("certificates_dropped", certificates_dropped, i64),
+            ("certificates_deferred", certificates_deferred, i64),
+            (
+                "certificate_refresh_queued",
+                certificate_refresh_queued,
+                i64
+            ),
+            (
+                "certificate_refresh_pending",
+                certificate_refresh_pending as i64,
+                i64
+            ),
             (
                 "certificates_skipped_unstaked",
                 certificates_skipped_unstaked,

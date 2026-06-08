@@ -1,6 +1,9 @@
 use {
     crate::{event::VotorEvent, voting_service::BLSOp},
-    agave_votor_messages::{consensus_message::ConsensusMessage, vote::VoteType},
+    agave_votor_messages::{
+        consensus_message::{ConsensusMessage, VoteMessage},
+        vote::VoteType,
+    },
     solana_clock::Slot,
     solana_metrics::datapoint_info,
     std::{
@@ -71,14 +74,9 @@ pub(crate) struct EventHandlerStats {
     // Amount of time spent sending votes.
     pub(crate) send_votes_batch_time_us: u32,
 
-    // Number of BLS queue send attempts, and time spent in those calls.
-    bls_send_count: u32,
-    bls_send_time_us: u64,
-    bls_send_max_time_us: u64,
-
-    // Refresh votes are best-effort and may be dropped when the BLS queue is full.
-    refresh_votes_dropped: u32,
-    refresh_vote_queue_full_count: u32,
+    pub(crate) bls_ops_sent: u32,
+    pub(crate) bls_ops_deferred: u32,
+    pub(crate) pending_bls_ops: usize,
 
     // Maximum queue depths observed since the last report.
     event_queue_max_len: u32,
@@ -151,11 +149,9 @@ impl EventHandlerStats {
             timeout_set: 0,
             receive_event_time_us: 0,
             send_votes_batch_time_us: 0,
-            bls_send_count: 0,
-            bls_send_time_us: 0,
-            bls_send_max_time_us: 0,
-            refresh_votes_dropped: 0,
-            refresh_vote_queue_full_count: 0,
+            bls_ops_sent: 0,
+            bls_ops_deferred: 0,
+            pending_bls_ops: 0,
             event_queue_max_len: 0,
             event_queue_capacity: None,
             bls_queue_max_len: 0,
@@ -208,45 +204,44 @@ impl EventHandlerStats {
         entry.time_us = entry.time_us.saturating_add(time_us as u32);
     }
 
-    pub fn vote_type_and_slot(bls_op: &BLSOp) -> Option<(VoteType, Slot)> {
-        let (BLSOp::PushVote { message, .. } | BLSOp::RefreshVote { message, .. }) = bls_op else {
-            return None;
-        };
-        let ConsensusMessage::Vote(vote) = &**message else {
-            warn!("Unexpected BLS message type: {message:?}");
-            return None;
-        };
-        Some((vote.vote.get_type(), vote.vote.slot()))
-    }
-
-    pub fn incr_vote_type(&mut self, vote_type: VoteType, slot: Slot) {
+    fn incr_vote_message(&mut self, vote: &VoteMessage) {
+        let vote_type = vote.vote.get_type();
         let entry = self.sent_votes.entry(vote_type).or_insert(0);
         *entry = entry.saturating_add(1);
         if vote_type == VoteType::Notarize {
-            let entry = self.slot_tracking_map.entry(slot).or_default();
+            let entry = self.slot_tracking_map.entry(vote.vote.slot()).or_default();
             entry.vote_notarize = Some(Instant::now());
         } else if vote_type == VoteType::Skip {
-            let entry = self.slot_tracking_map.entry(slot).or_default();
+            let entry = self.slot_tracking_map.entry(vote.vote.slot()).or_default();
             entry.vote_skip = Some(Instant::now());
         }
     }
 
-    pub fn incr_refresh_votes_dropped(&mut self) {
-        self.refresh_votes_dropped = self.refresh_votes_dropped.saturating_add(1);
+    pub fn incr_bls_op_sent(&mut self, bls_op: &BLSOp) {
+        self.bls_ops_sent = self.bls_ops_sent.saturating_add(1);
+        match bls_op {
+            BLSOp::PushVote { message, .. } => {
+                if let ConsensusMessage::Vote(vote) = &**message {
+                    self.incr_vote_message(vote);
+                } else {
+                    warn!("Unexpected BLS message type: {message:?}");
+                }
+            }
+            BLSOp::RefreshVotes { votes } => {
+                for vote in votes {
+                    self.incr_vote_message(vote);
+                }
+            }
+            BLSOp::PushCertificates { .. } => {}
+        }
     }
 
-    pub fn incr_refresh_vote_queue_full(&mut self) {
-        self.refresh_vote_queue_full_count = self.refresh_vote_queue_full_count.saturating_add(1);
+    pub fn incr_bls_op_deferred(&mut self) {
+        self.bls_ops_deferred = self.bls_ops_deferred.saturating_add(1);
     }
 
-    #[cfg(test)]
-    pub fn refresh_votes_dropped(&self) -> u32 {
-        self.refresh_votes_dropped
-    }
-
-    #[cfg(test)]
-    pub fn refresh_vote_queue_full_count(&self) -> u32 {
-        self.refresh_vote_queue_full_count
+    pub fn set_pending_bls_ops(&mut self, pending_bls_ops: usize) {
+        self.pending_bls_ops = pending_bls_ops;
     }
 
     pub fn observe_event_queue(&mut self, len: usize, capacity: Option<usize>) {
@@ -257,12 +252,6 @@ impl EventHandlerStats {
     pub fn observe_bls_queue(&mut self, len: usize, capacity: Option<usize>) {
         self.bls_queue_max_len = self.bls_queue_max_len.max(len as u32);
         self.bls_queue_capacity = capacity;
-    }
-
-    pub fn record_bls_send(&mut self, time_us: u64) {
-        self.bls_send_count = self.bls_send_count.saturating_add(1);
-        self.bls_send_time_us = self.bls_send_time_us.saturating_add(time_us);
-        self.bls_send_max_time_us = self.bls_send_max_time_us.max(time_us);
     }
 
     pub fn maybe_report(&mut self) {
@@ -280,6 +269,9 @@ impl EventHandlerStats {
             ),
             ("set_root_count", self.set_root_count as i64, i64),
             ("timeout_set", self.timeout_set as i64, i64),
+            ("bls_ops_sent", self.bls_ops_sent as i64, i64),
+            ("bls_ops_deferred", self.bls_ops_deferred as i64, i64),
+            ("pending_bls_ops", self.pending_bls_ops as i64, i64),
         );
         for (event, EventCountAndTime { count, time_us }) in &self.received_events_count_and_timing
         {
@@ -316,26 +308,6 @@ impl EventHandlerStats {
                 "bls_queue_capacity",
                 self.bls_queue_capacity.map(|c| c as i64),
                 Option<i64>
-            ),
-        );
-        datapoint_info!(
-            "event_handler_bls_send",
-            ("bls_send_count", self.bls_send_count as i64, i64),
-            ("bls_send_time_us", self.bls_send_time_us as i64, i64),
-            (
-                "bls_send_max_time_us",
-                self.bls_send_max_time_us as i64,
-                i64
-            ),
-            (
-                "refresh_votes_dropped",
-                self.refresh_votes_dropped as i64,
-                i64
-            ),
-            (
-                "refresh_vote_queue_full_count",
-                self.refresh_vote_queue_full_count as i64,
-                i64
             ),
         );
         for (vote_type, count) in &self.sent_votes {

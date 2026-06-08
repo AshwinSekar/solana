@@ -18,7 +18,7 @@ use {
         votor::SharedContext,
     },
     agave_votor_messages::{consensus_message::Block, migration::MigrationStatus, vote::Vote},
-    crossbeam_channel::{RecvError, SendError, Sender, TrySendError, select},
+    crossbeam_channel::{RecvError, SendError, TrySendError, select},
     parking_lot::RwLock,
     solana_clock::Slot,
     solana_hash::Hash,
@@ -32,7 +32,8 @@ use {
     },
     solana_signer::Signer,
     std::{
-        collections::{BTreeMap, BTreeSet},
+        cmp::Reverse,
+        collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -44,6 +45,10 @@ use {
 };
 
 mod stats;
+
+const BLS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_REFRESH_VOTES_PER_STANDSTILL: usize = 32;
+const MAX_REFRESH_VOTES_PER_BLS_OP: usize = 8;
 
 /// Banks that have completed replay, but are yet to be voted on
 /// in the form of (block, parent block)
@@ -92,6 +97,9 @@ struct LocalContext {
     /// Used to calculate dynamic timeout extensions (5% per leader window since standstill).
     /// Reset to `None` when a new finalization event is received.
     pub(crate) standstill_slot: Option<Slot>,
+    pub(crate) refresh_vote_cursor: usize,
+    pub(crate) pending_bls_ops: VecDeque<BLSOp>,
+    pub(crate) pending_refresh_votes: HashSet<Vote>,
 }
 
 impl EventHandler {
@@ -127,6 +135,9 @@ impl EventHandler {
             received_shred: BTreeSet::default(),
             stats: EventHandlerStats::new(),
             standstill_slot: None,
+            refresh_vote_cursor: 0,
+            pending_bls_ops: VecDeque::new(),
+            pending_refresh_votes: HashSet::new(),
         };
 
         // Wait until migration has completed
@@ -154,12 +165,25 @@ impl EventHandler {
         }
 
         while !exit.load(Ordering::Relaxed) {
+            Self::flush_pending_bls_ops(&vctx, &mut local_context)?;
+
             let mut receive_event_time = Measure::start("receive_event");
+            let wait_timeout = if local_context.pending_bls_ops.is_empty() {
+                Duration::from_secs(1)
+            } else {
+                BLS_RETRY_INTERVAL
+            };
             let event = select! {
                 recv(event_receiver) -> msg => {
                     msg?
                 },
-                default(Duration::from_secs(1))  => continue
+                default(wait_timeout) => {
+                    local_context
+                        .stats
+                        .set_pending_bls_ops(local_context.pending_bls_ops.len());
+                    local_context.stats.maybe_report();
+                    continue;
+                }
             };
             receive_event_time.stop();
             local_context.stats.receive_event_time_us = local_context
@@ -192,58 +216,83 @@ impl EventHandler {
                 .incr_event_with_timing(stats_event, event_processing_time.as_us());
 
             let mut send_votes_batch_time = Measure::start("send_votes_batch");
-            for vote in votes {
-                Self::send_bls_op(&vctx.bls_sender, &mut local_context.stats, vote)?;
-            }
+            Self::queue_bls_ops(&mut local_context, votes);
+            Self::flush_pending_bls_ops(&vctx, &mut local_context)?;
             send_votes_batch_time.stop();
             local_context.stats.send_votes_batch_time_us = local_context
                 .stats
                 .send_votes_batch_time_us
                 .saturating_add(send_votes_batch_time.as_us() as u32);
+            local_context
+                .stats
+                .set_pending_bls_ops(local_context.pending_bls_ops.len());
             local_context.stats.maybe_report();
         }
 
         Ok(())
     }
 
-    fn send_bls_op(
-        bls_sender: &Sender<BLSOp>,
-        stats: &mut EventHandlerStats,
-        vote: BLSOp,
-    ) -> Result<(), EventLoopError> {
-        let vote_type_and_slot = EventHandlerStats::vote_type_and_slot(&vote);
-        let bls_queue_capacity = bls_sender.capacity();
-        stats.observe_bls_queue(bls_sender.len(), bls_queue_capacity);
-
-        let mut bls_send_time = Measure::start("bls_send");
-        if matches!(&vote, BLSOp::RefreshVote { .. }) {
-            match bls_sender.try_send(vote) {
-                Ok(()) => {
-                    bls_send_time.stop();
-                    stats.record_bls_send(bls_send_time.as_us());
-                    if let Some((vote_type, slot)) = vote_type_and_slot {
-                        stats.incr_vote_type(vote_type, slot);
+    fn queue_bls_ops(local_context: &mut LocalContext, bls_ops: Vec<BLSOp>) {
+        for bls_op in bls_ops {
+            match bls_op {
+                BLSOp::RefreshVotes { votes } => {
+                    let votes = votes
+                        .into_iter()
+                        .filter(|vote| local_context.pending_refresh_votes.insert(vote.vote))
+                        .collect::<Vec<_>>();
+                    if !votes.is_empty() {
+                        local_context
+                            .pending_bls_ops
+                            .push_back(BLSOp::RefreshVotes { votes });
                     }
                 }
+                bls_op => local_context.pending_bls_ops.push_back(bls_op),
+            }
+        }
+    }
+
+    fn clear_pending_refresh_votes(
+        pending_bls_ops: &mut VecDeque<BLSOp>,
+        pending_refresh_votes: &mut HashSet<Vote>,
+    ) {
+        pending_bls_ops.retain(|bls_op| !matches!(bls_op, BLSOp::RefreshVotes { .. }));
+        pending_refresh_votes.clear();
+    }
+
+    fn flush_pending_bls_ops(
+        vctx: &VotingContext,
+        local_context: &mut LocalContext,
+    ) -> Result<(), EventLoopError> {
+        let bls_queue_capacity = vctx.bls_sender.capacity();
+        local_context
+            .stats
+            .observe_bls_queue(vctx.bls_sender.len(), bls_queue_capacity);
+        while let Some(bls_op) = local_context.pending_bls_ops.pop_front() {
+            match vctx.bls_sender.try_send(bls_op.clone()) {
+                Ok(()) => {
+                    if let BLSOp::RefreshVotes { votes } = &bls_op {
+                        for vote in votes {
+                            local_context.pending_refresh_votes.remove(&vote.vote);
+                        }
+                    }
+                    local_context.stats.incr_bls_op_sent(&bls_op);
+                }
                 Err(TrySendError::Full(_)) => {
-                    bls_send_time.stop();
-                    stats.record_bls_send(bls_send_time.as_us());
-                    stats.incr_refresh_votes_dropped();
-                    stats.incr_refresh_vote_queue_full();
+                    local_context.pending_bls_ops.push_front(bls_op);
+                    local_context.stats.incr_bls_op_deferred();
+                    break;
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     return Err(EventLoopError::SenderDisconnected(SendError(())));
                 }
             }
-        } else {
-            bls_sender.send(vote).map_err(|_| SendError(()))?;
-            bls_send_time.stop();
-            stats.record_bls_send(bls_send_time.as_us());
-            if let Some((vote_type, slot)) = vote_type_and_slot {
-                stats.incr_vote_type(vote_type, slot);
-            }
         }
-        stats.observe_bls_queue(bls_sender.len(), bls_queue_capacity);
+        local_context
+            .stats
+            .observe_bls_queue(vctx.bls_sender.len(), bls_queue_capacity);
+        local_context
+            .stats
+            .set_pending_bls_ops(local_context.pending_bls_ops.len());
         Ok(())
     }
 
@@ -304,6 +353,10 @@ impl EventHandler {
             ref mut received_shred,
             ref mut stats,
             ref mut standstill_slot,
+            ref mut refresh_vote_cursor,
+            ref mut pending_bls_ops,
+            ref mut pending_refresh_votes,
+            ..
         } = local_context;
         match event {
             // Block has completed replay
@@ -490,6 +543,8 @@ impl EventHandler {
                 if let Some(slot) = *standstill_slot {
                     if block.0 > slot {
                         *standstill_slot = None;
+                        *refresh_vote_cursor = 0;
+                        Self::clear_pending_refresh_votes(pending_bls_ops, pending_refresh_votes);
                         info!(
                             "{my_pubkey}: Standstill initially detected at slot={slot} has ended \
                              at slot={}. Ending timeout extension",
@@ -542,7 +597,13 @@ impl EventHandler {
                     }
                 }
                 // certs refresh happens in ConsensusPoolService
-                Self::refresh_votes(my_pubkey, highest_finalized_slot, vctx, &mut votes)?;
+                Self::refresh_votes(
+                    my_pubkey,
+                    highest_finalized_slot,
+                    vctx,
+                    refresh_vote_cursor,
+                    &mut votes,
+                )?;
             }
 
             // Operator called set identity make sure that our keypair is updated for voting
@@ -558,6 +619,8 @@ impl EventHandler {
                     );
                     return Err(EventLoopError::SetIdentityError(e));
                 }
+                *refresh_vote_cursor = 0;
+                Self::clear_pending_refresh_votes(pending_bls_ops, pending_refresh_votes);
             }
         }
         Ok(votes)
@@ -829,16 +892,45 @@ impl EventHandler {
         my_pubkey: &Pubkey,
         highest_finalized_slot: Slot,
         voting_context: &mut VotingContext,
+        refresh_vote_cursor: &mut usize,
         votes: &mut Vec<BLSOp>,
     ) -> Result<(), VoteError> {
-        for vote in voting_context
+        let mut votes_to_refresh = voting_context
             .vote_history
-            .votes_cast_since(highest_finalized_slot)
-        {
-            info!("{my_pubkey}: Refreshing vote {vote:?}");
+            .votes_cast_since(highest_finalized_slot);
+        if votes_to_refresh.is_empty() {
+            *refresh_vote_cursor = 0;
+            return Ok(());
+        }
+        votes_to_refresh.sort_by_key(|vote| Reverse(vote.slot()));
+
+        let total_votes = votes_to_refresh.len();
+        let refresh_count = total_votes.min(MAX_REFRESH_VOTES_PER_STANDSTILL);
+        let start = *refresh_vote_cursor % total_votes;
+        info!(
+            "{my_pubkey}: Refreshing {refresh_count}/{total_votes} votes since finalized slot \
+             {highest_finalized_slot}, refresh_cursor={start}"
+        );
+
+        let mut refreshed_votes = Vec::new();
+        for offset in 0..refresh_count {
+            let vote = votes_to_refresh[(start + offset) % total_votes];
+            debug!("{my_pubkey}: Refreshing vote {vote:?}");
             if let Some(bls_op) = generate_vote_message(vote, true, voting_context)? {
-                votes.push(bls_op);
+                match bls_op {
+                    BLSOp::RefreshVotes { votes } => refreshed_votes.extend(votes),
+                    BLSOp::PushVote { .. } | BLSOp::PushCertificates { .. } => {
+                        unreachable!("refresh vote generation returned a non-refresh BLS op")
+                    }
+                }
             }
+        }
+
+        *refresh_vote_cursor = (*refresh_vote_cursor + refresh_count) % total_votes;
+        for batch in refreshed_votes.chunks(MAX_REFRESH_VOTES_PER_BLS_OP) {
+            votes.push(BLSOp::RefreshVotes {
+                votes: batch.to_vec(),
+            });
         }
         Ok(())
     }
@@ -973,7 +1065,7 @@ mod tests {
             consensus_message::{BLS_KEYPAIR_DERIVE_SEED, ConsensusMessage, VoteMessage},
             vote::Vote,
         },
-        crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded},
+        crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded},
         parking_lot::RwLock as PlRwLock,
         solana_bls_signatures::{
             keypair::Keypair as BLSKeypair, signature::Signature as BLSSignature,
@@ -995,7 +1087,7 @@ mod tests {
             installed_scheduler_pool::BankWithScheduler,
         },
         std::{
-            collections::HashMap,
+            collections::{BTreeSet, HashMap},
             fs::remove_file,
             path::PathBuf,
             sync::{Arc, RwLock},
@@ -1170,6 +1262,9 @@ mod tests {
             received_shred: BTreeSet::new(),
             stats: EventHandlerStats::default(),
             standstill_slot: None,
+            refresh_vote_cursor: 0,
+            pending_bls_ops: VecDeque::new(),
+            pending_refresh_votes: HashSet::new(),
         };
 
         EventHandlerTestContext {
@@ -1389,17 +1484,25 @@ mod tests {
                     rank: 0,
                     signature,
                 });
-                let prev_length = self.bls_ops.len();
-                self.bls_ops.retain(|bls_op| match bls_op {
-                    BLSOp::PushVote { message, .. } | BLSOp::RefreshVote { message, .. } => {
-                        **message != expected_message
+                let ConsensusMessage::Vote(expected_vote_message) = &expected_message else {
+                    unreachable!("expected vote message")
+                };
+                let mut found = false;
+                self.bls_ops.retain_mut(|bls_op| match bls_op {
+                    BLSOp::PushVote { message, .. } => {
+                        let keep = message.as_ref() != &expected_message;
+                        found |= !keep;
+                        keep
                     }
-                    BLSOp::PushCertificate { .. } => true,
+                    BLSOp::RefreshVotes { votes } => {
+                        let previous_len = votes.len();
+                        votes.retain(|vote| vote.as_ref() != expected_vote_message);
+                        found |= votes.len() != previous_len;
+                        !votes.is_empty()
+                    }
+                    BLSOp::PushCertificates { .. } => true,
                 });
-                assert!(
-                    self.bls_ops.len() < prev_length,
-                    "Did not find expected vote: {expected_message:?}",
-                );
+                assert!(found, "Did not find expected vote: {expected_message:?}",);
             }
         }
 
@@ -1412,17 +1515,52 @@ mod tests {
                 rank: 0,
                 signature,
             });
-            let prev_length = self.bls_ops.len();
-            self.bls_ops.retain(|bls_op| {
-                !matches!(bls_op, BLSOp::PushVote { message, .. } if **message == expected_message)
+            let ConsensusMessage::Vote(expected_vote_message) = &expected_message else {
+                unreachable!("expected vote message")
+            };
+            let mut found = false;
+            self.bls_ops.retain_mut(|bls_op| match bls_op {
+                BLSOp::PushVote { message, .. } => {
+                    let keep = message.as_ref() != &expected_message;
+                    found |= !keep;
+                    keep
+                }
+                BLSOp::RefreshVotes { votes } => {
+                    let previous_len = votes.len();
+                    votes.retain(|vote| vote.as_ref() != expected_vote_message);
+                    found |= votes.len() != previous_len;
+                    !votes.is_empty()
+                }
+                BLSOp::PushCertificates { .. } => true,
             });
-            assert!(
-                self.bls_ops.len() < prev_length,
-                "Did not find expected vote: {expected_message:?}",
-            );
+            assert!(found, "Did not find expected vote: {expected_message:?}",);
             // Also check own_vote_receiver
             let own_vote = self.own_vote_receiver.try_recv().unwrap();
             assert_eq!(own_vote, vec![expected_message]);
+        }
+
+        fn check_refresh_votes_batch_len(&self, expected_len: usize) {
+            let batch_lens = self
+                .bls_ops
+                .iter()
+                .filter_map(|bls_op| match bls_op {
+                    BLSOp::RefreshVotes { votes } => Some(votes.len()),
+                    BLSOp::PushVote { .. } | BLSOp::PushCertificates { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(batch_lens, vec![expected_len]);
+        }
+
+        fn refresh_vote_slots(&self) -> Vec<Slot> {
+            self.bls_ops
+                .iter()
+                .flat_map(|bls_op| match bls_op {
+                    BLSOp::RefreshVotes { votes } => {
+                        votes.iter().map(|vote| vote.vote.slot()).collect()
+                    }
+                    BLSOp::PushVote { .. } | BLSOp::PushCertificates { .. } => vec![],
+                })
+                .collect()
         }
 
         fn check_for_commitment(&mut self, expected_type: CommitmentType, expected_slot: Slot) {
@@ -1871,6 +2009,7 @@ mod tests {
 
         // Send a standstill event with highest finalized at 0, we should refresh all the votes
         test_context.send_standstill_event(0);
+        test_context.check_refresh_votes_batch_len(3);
 
         test_context.check_for_votes(&[
             Vote::new_notarization_vote(1, block_id_1),
@@ -1884,39 +2023,38 @@ mod tests {
 
         // Send another standstill event with highest finalized at 1, we should refresh votes for 2 and 3 only
         test_context.send_standstill_event(1);
+        test_context.check_refresh_votes_batch_len(2);
 
         test_context.check_for_votes(&[Vote::new_skip_vote(2), Vote::new_skip_vote(3)]);
     }
 
     #[test]
-    fn test_refresh_vote_dropped_when_bls_queue_full() {
+    fn test_standstill_refresh_rotates_large_vote_history() {
         let mut test_context = setup();
-        let refresh_vote = generate_vote_message(
-            Vote::new_skip_vote(1),
-            true,
-            &mut test_context.voting_context,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(matches!(refresh_vote, BLSOp::RefreshVote { .. }));
-
-        let (bls_sender, bls_receiver) = bounded(0);
-        EventHandler::send_bls_op(
-            &bls_sender,
-            &mut test_context.local_context.stats,
-            refresh_vote,
-        )
-        .unwrap();
-
-        assert!(matches!(bls_receiver.try_recv(), Err(TryRecvError::Empty)));
-        assert_eq!(test_context.local_context.stats.refresh_votes_dropped(), 1);
-        assert_eq!(
+        let total_votes = MAX_REFRESH_VOTES_PER_STANDSTILL + 4;
+        for slot in 1..=total_votes as Slot {
             test_context
-                .local_context
-                .stats
-                .refresh_vote_queue_full_count(),
-            1
-        );
+                .voting_context
+                .vote_history
+                .add_vote(Vote::new_skip_vote(slot));
+        }
+
+        test_context.send_standstill_event(0);
+        let first_refresh = test_context.refresh_vote_slots();
+        assert_eq!(first_refresh.len(), MAX_REFRESH_VOTES_PER_STANDSTILL);
+        assert!(first_refresh.contains(&(total_votes as Slot)));
+        assert!(!first_refresh.contains(&1));
+
+        test_context.bls_ops.clear();
+        test_context.send_standstill_event(0);
+        let second_refresh = test_context.refresh_vote_slots();
+
+        let refreshed_slots = first_refresh
+            .into_iter()
+            .chain(second_refresh)
+            .collect::<BTreeSet<_>>();
+        let expected_slots = (1..=total_votes as Slot).collect::<BTreeSet<_>>();
+        assert_eq!(refreshed_slots, expected_slots);
     }
 
     #[test]

@@ -263,9 +263,11 @@ fn insert_vote_and_create_bls_message(
         }
     };
     if is_refresh {
-        return Ok(BLSOp::RefreshVote {
-            message: Arc::new(message),
-            slot: vote.slot(),
+        let ConsensusMessage::Vote(vote_msg) = message else {
+            unreachable!("vote generation returned a non-vote consensus message")
+        };
+        return Ok(BLSOp::RefreshVotes {
+            votes: vec![Arc::new(vote_msg)],
         });
     }
 
@@ -445,11 +447,15 @@ mod tests {
             .ok()
             .unwrap()
             .unwrap();
-        if let BLSOp::RefreshVote { message, slot } = &refresh_result {
-            assert_eq!(slot, &vote_slot);
-            assert_eq!(**message, expected_message);
+        if let BLSOp::RefreshVotes { votes } = &refresh_result {
+            let ConsensusMessage::Vote(expected_vote_message) = &expected_message else {
+                unreachable!("expected vote message")
+            };
+            assert_eq!(votes.len(), 1);
+            assert_eq!(votes[0].vote.slot(), vote_slot);
+            assert_eq!(votes[0].as_ref(), expected_vote_message);
         } else {
-            panic!("Expected BLSOp::RefreshVote, got {refresh_result:?}");
+            panic!("Expected BLSOp::RefreshVotes, got {refresh_result:?}");
         }
         assert!(own_vote_receiver.try_recv().is_err());
     }
