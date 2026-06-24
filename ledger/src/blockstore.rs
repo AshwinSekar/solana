@@ -44,7 +44,7 @@ use {
         block_component::{
             BlockComponent, VersionedBlockHeader, VersionedBlockMarker, VersionedUpdateParent,
         },
-        entry::{Entry, MaxDataShredsLen, create_ticks},
+        entry::{Entry, create_ticks},
     },
     solana_genesis_config::{DEFAULT_GENESIS_ARCHIVE, DEFAULT_GENESIS_FILE, GenesisConfig},
     solana_hash::{HASH_BYTES, Hash},
@@ -91,7 +91,7 @@ use {
     tar,
     tempfile::{Builder, TempDir},
     thiserror::Error,
-    wincode::{Deserialize as _, config::DefaultConfig, containers::Vec as WincodeVec},
+    wincode::config::DefaultConfig,
 };
 
 pub mod blockstore_purge;
@@ -5009,7 +5009,6 @@ impl Blockstore {
         })
     }
 
-    /// Fetch the entries corresponding to all of the shred indices in `completed_ranges`.
     fn get_slot_entries_in_block(
         &self,
         slot: Slot,
@@ -5017,15 +5016,21 @@ impl Blockstore {
         slot_meta: Option<&SlotMeta>,
     ) -> Result<Vec<Entry>> {
         self.get_slot_data_in_block(slot, completed_ranges, slot_meta, |payload| {
-            <WincodeVec<Entry, MaxDataShredsLen>>::deserialize(&payload)
-                .map_err(|e| {
-                    BlockstoreError::InvalidShredData(format!("could not reconstruct entries: {e}"))
-                })
-                .and_then(|entries| {
-                    if entries.is_empty() {
-                        Err(BlockstoreError::EmptyEntryBatch(slot))
+            wincode::deserialize(&payload)
+                .map(|component| {
+                    if let BlockComponent::EntryBatch(entries) = component {
+                        entries
                     } else {
-                        Ok(entries)
+                        vec![]
+                    }
+                })
+                .map_err(|e| {
+                    if BlockComponent::infer_is_empty_entry_batch(&payload) {
+                        BlockstoreError::BlockAborted(slot)
+                    } else {
+                        BlockstoreError::InvalidShredData(format!(
+                            "could not reconstruct block component: {e}"
+                        ))
                     }
                 })
         })
