@@ -71,7 +71,7 @@ use {
 /// Epoch boundaries induce heavy computation often resulting in forks. It's best to decouple the migration period
 /// from the boundary. We require that a root is made between the epoch boundary and this migration slot offset.
 #[cfg(not(feature = "dev-context-only-utils"))]
-pub const MIGRATION_SLOT_OFFSET: Slot = 5000;
+pub const MIGRATION_SLOT_OFFSET: Slot = 1000;
 
 /// Small offset for tests
 #[cfg(feature = "dev-context-only-utils")]

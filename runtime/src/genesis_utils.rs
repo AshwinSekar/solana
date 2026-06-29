@@ -10,7 +10,6 @@ use {
     agave_votor_messages::{
         self,
         consensus_message::{BLS_KEYPAIR_DERIVE_SEED, Block},
-        migration::GENESIS_CERTIFICATE_ACCOUNT,
         wire::{WireBlockCertMessage, WireCertSignature},
     },
     bincode::serialize,
@@ -332,7 +331,7 @@ pub fn activate_alpenglow_at_genesis(genesis_config: &mut GenesisConfig) {
 
 fn configure_alpenglow_at_genesis(genesis_config: &mut GenesisConfig) {
     // PoH is in low power mode
-    genesis_config.poh_config.hashes_per_tick = None;
+    // genesis_config.poh_config.hashes_per_tick = None;
 
     // This is a dev cluster with alpenglow enabled at genesis. We don't want to test the migration pathway
     // so we add a fake genesis certificate.
@@ -348,11 +347,11 @@ fn configure_alpenglow_at_genesis(genesis_config: &mut GenesisConfig) {
     };
     let cert_size = bincode::serialized_size(&cert).unwrap();
     let lamports = Rent::default().minimum_balance(cert_size as usize);
-    let certificate_account = Account::new_data(lamports, &cert, &system_program::ID).unwrap();
+    let _certificate_account = Account::new_data(lamports, &cert, &system_program::ID).unwrap();
 
-    genesis_config
-        .accounts
-        .insert(*GENESIS_CERTIFICATE_ACCOUNT, certificate_account);
+    //genesis_config
+    //    .accounts
+    //    .insert(*GENESIS_CERTIFICATE_ACCOUNT, certificate_account);
     EpochInflationAccountState::insert_into_genesis_config(genesis_config);
 }
 
