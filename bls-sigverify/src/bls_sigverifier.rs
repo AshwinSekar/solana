@@ -53,10 +53,9 @@ use {
 /// fallen so far behind.
 pub const NUM_SLOTS_FOR_VERIFY: Slot = 30_000;
 
-/// If we receive an invalid certificate or vote, we ban its attributed sender. For certificates
-/// received from blockstore, that sender is the scheduled leader for the carrier slot. We ban the
-/// sender for 2 days, which roughly corresponds to an epoch.
-pub(super) const BAN_TIMEOUT: Duration = Duration::from_hours(48);
+/// If we receive an invalid certificate or vote from a QUIC connection, we ban the sender.
+/// We ban the sender for 1 second which prevents DoS but allows for recovery in case of instability.
+pub(super) const BAN_TIMEOUT: Duration = Duration::from_secs(1);
 
 type SigVerifierInputs = (Vec<Datagram>, Vec<(Slot, UnverifiedCertificate)>);
 
