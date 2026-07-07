@@ -11,10 +11,11 @@ mod sigverify_fixture_common;
 use {
     agave_bls_sigverify::bls_sigverifier::PerSlotTiming,
     clap::{Parser, ValueEnum},
-    rand::{Rng, SeedableRng, rngs::StdRng},
+    crossbeam_channel::Receiver,
+    rand::{rngs::StdRng, Rng, SeedableRng},
     sigverify_fixture_common::{
-        ExampleContext, StoredPacket, StoredPacketKind, StoredWorkload, fixture_max_slot,
-        init_example_context,
+        fixture_max_slot, init_example_context, ExampleContext, StoredPacket, StoredPacketKind,
+        StoredWorkload,
     },
     solana_perf::packet::{Packet, PacketBatch, RecycledPacketBatch},
     std::{
@@ -22,8 +23,8 @@ use {
         io::BufReader,
         path::Path,
         sync::{
-            Arc,
             atomic::{AtomicBool, Ordering},
+            Arc,
         },
         thread,
         time::{Duration, Instant},
@@ -449,6 +450,16 @@ fn elapsed_us_since(start: Instant) -> u64 {
     start.elapsed().as_micros() as u64
 }
 
+fn spawn_channel_drain<T: Send + 'static>(
+    name: &'static str,
+    receiver: Receiver<T>,
+) -> thread::JoinHandle<usize> {
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || receiver.iter().count())
+        .expect("failed to spawn fixture output drain thread")
+}
+
 fn main() {
     let config = ReplayConfig::parse();
 
@@ -527,11 +538,18 @@ fn main() {
         packet_sender,
         validator_keypairs: _validator_keypairs,
         validator_ranks: _validator_ranks,
-        _repair_receiver,
-        _reward_receiver,
-        _pool_receiver,
-        _metrics_receiver,
+        _repair_receiver: repair_receiver,
+        _reward_receiver: reward_receiver,
+        _pool_receiver: pool_receiver,
+        _metrics_receiver: metrics_receiver,
     } = ctx;
+
+    let drain_threads = [
+        spawn_channel_drain("sigverify-fixture-repair-drain", repair_receiver),
+        spawn_channel_drain("sigverify-fixture-reward-drain", reward_receiver),
+        spawn_channel_drain("sigverify-fixture-pool-drain", pool_receiver),
+        spawn_channel_drain("sigverify-fixture-metrics-drain", metrics_receiver),
+    ];
 
     let exit = Arc::new(AtomicBool::new(false));
     let verifier_exit = Arc::clone(&exit);
@@ -601,6 +619,15 @@ fn main() {
         .join()
         .expect("verifier thread panicked during replay");
 
+    let drained_outputs: usize = drain_threads
+        .into_iter()
+        .map(|thread| {
+            thread
+                .join()
+                .expect("fixture output drain thread panicked during replay")
+        })
+        .sum();
+
     let timing_summary = timing.summary();
 
     let elapsed_us = elapsed_us_since(replay_start);
@@ -608,7 +635,7 @@ fn main() {
     eprintln!(
         "send schedule: scheduled_end_us={}, actual_send_end_us={}, send_lag_us={}, \
          max_schedule_lag_us={}, max_send_block_us={}, total_send_block_us={}, \
-         blocked_sends_over_100us={}",
+         blocked_sends_over_100us={}, drained_output_messages={}",
         scheduled_end_us,
         actual_send_end_us,
         actual_send_end_us.saturating_sub(scheduled_end_us),
@@ -616,6 +643,7 @@ fn main() {
         max_send_block_us,
         total_send_block_us,
         blocked_sends_over_100us,
+        drained_outputs,
     );
 
     let cert_ratio = if workload.total_packets == 0 {
