@@ -111,6 +111,7 @@ impl PerSlotTiming {
                 first_nonzero_index = Some(index);
             }
 
+            #[allow(clippy::arithmetic_side_effects)]
             let slot_us = ((elapsed_us as u128 * count as u128) / total_messages as u128) as u64;
 
             self.per_slot_us[index] = self.per_slot_us[index].saturating_add(slot_us);
@@ -142,6 +143,7 @@ impl PerSlotTiming {
             total_us,
             avg_us_per_slot: total_us as f64 / self.per_slot_us.len() as f64,
             max_us_per_slot,
+            #[allow(clippy::arithmetic_side_effects)]
             max_slot: self.base_slot + max_index as Slot,
         }
     }
@@ -465,6 +467,7 @@ impl SigVerifier {
                                 sender_bls_pubkey,
                                 sender_vote_account_pubkey,
                                 sender_identity_pubkey,
+                                prepared_payload: None,
                             },
                         );
                     }

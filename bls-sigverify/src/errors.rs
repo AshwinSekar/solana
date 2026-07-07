@@ -2,7 +2,7 @@ use thiserror::Error;
 
 /// Errors that the [`SigVerifier`] can experience.
 #[derive(Error, Debug)]
-pub(super) enum SigVerifyError {
+pub enum SigVerifyError {
     #[error("verifying votes failed with {0}")]
     SigverifyVotes(#[from] SigVerifyVoteError),
     #[error("verifying certs failed with {0}")]
@@ -12,7 +12,7 @@ pub(super) enum SigVerifyError {
 /// Different types of errors that sig verifying votes can fail with.
 #[derive(Debug, Error)]
 #[allow(clippy::enum_variant_names)]
-pub(super) enum SigVerifyVoteError {
+pub enum SigVerifyVoteError {
     #[error("channel to consensus pool disconnected")]
     ConsensusPoolChannelDisconnected,
     #[error("channel to rewards container disconnected")]
@@ -25,7 +25,7 @@ pub(super) enum SigVerifyVoteError {
 
 /// Different types of errors that sig verifying certs can fail with.
 #[derive(Debug, Error)]
-pub(super) enum SigVerifyCertError {
+pub enum SigVerifyCertError {
     #[error("channel to consensus pool disconnected")]
     ConsensusPoolChannelDisconnected,
 }

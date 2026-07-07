@@ -328,6 +328,8 @@ pub(super) struct SigVerifyVoteStats {
 
     /// Stats for [`verify_and_send_votes`].
     pub(super) fn_verify_and_send_votes_stats: WelfordStats,
+    /// Stats for [`verify_votes_optimistic`].
+    pub(super) fn_verify_votes_optimistic_stats: WelfordStats,
     /// Stats for [`verify_individual_votes`].
     pub(super) fn_verify_individual_votes_stats: WelfordStats,
 
@@ -353,6 +355,7 @@ impl SigVerifyVoteStats {
             pool_sent,
             pool_channel_full,
             fn_verify_and_send_votes_stats,
+            fn_verify_votes_optimistic_stats,
             fn_verify_individual_votes_stats,
             distinct_votes_stats,
         } = other;
@@ -372,6 +375,8 @@ impl SigVerifyVoteStats {
         self.pool_channel_full += pool_channel_full;
         self.fn_verify_and_send_votes_stats
             .merge(fn_verify_and_send_votes_stats);
+        self.fn_verify_votes_optimistic_stats
+            .merge(fn_verify_votes_optimistic_stats);
         self.fn_verify_individual_votes_stats
             .merge(fn_verify_individual_votes_stats);
         self.distinct_votes_stats.merge(distinct_votes_stats);
@@ -394,6 +399,7 @@ impl SigVerifyVoteStats {
             pool_sent,
             pool_channel_full,
             fn_verify_and_send_votes_stats,
+            fn_verify_votes_optimistic_stats,
             fn_verify_individual_votes_stats,
             distinct_votes_stats,
         } = self;
@@ -421,6 +427,16 @@ impl SigVerifyVoteStats {
             (
                 "fn_verify_and_send_votes_mean",
                 fn_verify_and_send_votes_stats.mean().unwrap_or(0),
+                i64
+            ),
+            (
+                "fn_verify_votes_optimistic_count",
+                fn_verify_votes_optimistic_stats.count(),
+                i64
+            ),
+            (
+                "fn_verify_votes_optimistic_mean",
+                fn_verify_votes_optimistic_stats.mean().unwrap_or(0),
                 i64
             ),
             (
