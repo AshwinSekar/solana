@@ -1802,6 +1802,113 @@ mod tests {
     }
 
     #[test]
+    fn test_same_type_certs_verify_until_first_valid() {
+        let mut ctx = TestContext::new();
+
+        let cert_type = CertificateType::Notarize(Block {
+            slot: 10,
+            block_id: Hash::new_unique(),
+        });
+        let cert1 = create_signed_certificate_message(
+            ctx.verifier.cluster_info.my_shred_version(),
+            &ctx.validator_keypairs,
+            cert_type,
+            &(0..7).collect::<Vec<_>>(),
+        );
+        let cert2 = create_signed_certificate_message(
+            ctx.verifier.cluster_info.my_shred_version(),
+            &ctx.validator_keypairs,
+            cert_type,
+            &(1..8).collect::<Vec<_>>(),
+        );
+        let packet_batches = messages_to_batches(
+            &[
+                ConsensusMessage::Certificate(cert1),
+                ConsensusMessage::Certificate(cert2),
+            ],
+            ctx.verifier.cluster_info.my_shred_version(),
+        );
+
+        ctx.verifier
+            .verify_and_send_batches(packet_batches)
+            .unwrap();
+
+        let batches = ctx.pool_receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(batches.len(), 1);
+        match &batches[0] {
+            SigVerifiedBatch::Certificates(certs) => assert_eq!(certs.len(), 1),
+            rest => panic!("unexpected type: {rest:?}"),
+        }
+        assert_eq!(ctx.verifier.stats.cert_stats.certs_to_sig_verify.0, 1);
+        assert_eq!(ctx.verifier.stats.cert_stats.sig_verified_certs.0, 1);
+        assert_eq!(ctx.verifier.stats.cert_stats.redundant_certs_skipped.0, 1);
+        assert_eq!(
+            ctx.verifier.stats.cert_stats.unnecessary_certs_verified.0,
+            0
+        );
+    }
+
+    #[test]
+    fn test_same_type_certs_try_next_candidate_after_failure() {
+        let mut ctx = TestContext::new();
+
+        let cert_type = CertificateType::Notarize(Block {
+            slot: 10,
+            block_id: Hash::new_unique(),
+        });
+        let num_signers = 7;
+        let mut bitmap = BitVec::<u8, Lsb0>::new();
+        bitmap.resize(num_signers, false);
+        for i in 0..num_signers {
+            bitmap.set(i, true);
+        }
+        let invalid_cert = Certificate {
+            cert_type,
+            signature: Signature([0; BLS_SIGNATURE_AFFINE_SIZE]),
+            bitmap: encode_base2(&bitmap).unwrap(),
+        };
+        let valid_cert = create_signed_certificate_message(
+            ctx.verifier.cluster_info.my_shred_version(),
+            &ctx.validator_keypairs,
+            cert_type,
+            &(0..num_signers).collect::<Vec<_>>(),
+        );
+        let invalid_sender = Pubkey::new_unique();
+        let valid_sender = Pubkey::new_unique();
+        let packet_batches = messages_to_batches_with_remote_pubkeys(
+            &[
+                (ConsensusMessage::Certificate(invalid_cert), invalid_sender),
+                (ConsensusMessage::Certificate(valid_cert), valid_sender),
+            ],
+            ctx.verifier.cluster_info.my_shred_version(),
+        );
+
+        ctx.verifier
+            .verify_and_send_batches(packet_batches)
+            .unwrap();
+
+        let batches = ctx.pool_receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(batches.len(), 1);
+        match &batches[0] {
+            SigVerifiedBatch::Certificates(certs) => assert_eq!(certs.len(), 1),
+            rest => panic!("unexpected type: {rest:?}"),
+        }
+        assert!(ctx.banlist.is_banned(&invalid_sender));
+        assert!(!ctx.banlist.is_banned(&valid_sender));
+        assert_eq!(ctx.verifier.stats.cert_stats.certs_to_sig_verify.0, 2);
+        assert_eq!(ctx.verifier.stats.cert_stats.sig_verified_certs.0, 1);
+        assert_eq!(
+            ctx.verifier
+                .stats
+                .cert_stats
+                .certificate_verification_failed
+                .0,
+            1
+        );
+        assert_eq!(ctx.verifier.stats.cert_stats.redundant_certs_skipped.0, 0);
+    }
+
+    #[test]
     fn test_banlist_not_updated_for_valid_vote_and_cert() {
         let mut ctx = TestContext::new();
 
