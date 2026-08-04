@@ -17,27 +17,33 @@ use {
         consensus_message::VoteMessage,
         metric_types::ConsensusMetricsEvent,
         sig_verified_messages::{SigVerifiedBatch, VoteAggregate},
-        unverified_vote_message::UnverifiedVoteMessage,
         vote::Vote,
         wire::VotePayloadToSign,
     },
     log::info,
     rayon::{
         ThreadPool, current_thread_index,
-        iter::{Either, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
+        iter::{
+            Either, IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+            ParallelIterator,
+        },
     },
     solana_bls_signatures::{
-        BlsError, PreparedHashedMessage, PubkeyProjective, SignatureProjective,
-        pubkey::{PopVerified, PubkeyAffine as BlsPubkeyAffine, VerifySignature},
+        BlsError, PreparedHashedMessage, PubkeyProjective, Signature as BLSSignature,
+        SignatureProjective,
+        pubkey::{PopVerified, VerifySignature},
     },
     solana_clock::{Epoch, Slot},
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::leader_schedule_cache::LeaderScheduleCache,
     solana_measure::{measure::Measure, measure_us},
     solana_pubkey::Pubkey,
-    solana_runtime::{bank::Bank, epoch_stakes::BLSPubkeyToRankMap},
+    solana_runtime::{
+        bank::Bank,
+        epoch_stakes::{BLSPubkeyStakeEntry, BLSPubkeyToRankMap},
+    },
     solana_streamer::nonblocking::simple_qos::SimpleQosBanlist,
-    std::{collections::HashMap, num::NonZero, sync::Arc},
+    std::{collections::HashMap, sync::Arc},
 };
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
@@ -46,38 +52,34 @@ struct VerifiedVotePayload {
     sender_vote_account_pubkeys: Vec<Pubkey>,
 }
 
-/// [`VoteMessage`] along with other information needed to sig verify it.
+/// Signatures and validator ranks for one distinct vote payload.
+///
+/// All validator metadata is resolved from the epoch rank map during verification.
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-#[derive(Clone, Debug)]
-pub(super) struct UnverifiedVotePayload {
-    pub vote_message: UnverifiedVoteMessage,
-    pub sender_bls_pubkey: PopVerified<BlsPubkeyAffine>,
-    pub sender_vote_account_pubkey: Pubkey,
-    pub sender_identity_pubkey: Pubkey,
-    pub rank: u16,
-    pub stake: NonZero<u64>,
+#[derive(Clone, Debug, Default)]
+pub(super) struct UnverifiedVoteGroup {
+    signatures: Vec<BLSSignature>,
+    ranks: Vec<u16>,
 }
 
-impl UnverifiedVotePayload {
-    fn verify(
-        &self,
-        max_validators: usize,
-        prepared_hashed_message: &PreparedHashedMessage,
-    ) -> Result<VerifiedVotePayload, BlsError> {
-        self.sender_bls_pubkey
-            .verify_signature_prepared(&self.vote_message.signature, prepared_hashed_message)?;
-        let vote_msg = VoteMessage {
-            vote: self.vote_message.vote,
-            signature: self.vote_message.signature,
-            rank: self.rank,
-            stake: self.stake,
-        };
-        let vote_aggregate = VoteAggregate::new_from_verified_vote(max_validators, vote_msg);
-        Ok(VerifiedVotePayload {
-            vote_aggregate,
-            sender_vote_account_pubkeys: vec![self.sender_vote_account_pubkey],
-        })
+impl UnverifiedVoteGroup {
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
+    pub(super) fn push(&mut self, signature: BLSSignature, rank: u16) {
+        self.signatures.push(signature);
+        self.ranks.push(rank);
     }
+
+    fn len(&self) -> usize {
+        debug_assert_eq!(self.signatures.len(), self.ranks.len());
+        self.signatures.len()
+    }
+}
+
+#[inline]
+fn get_entry_for_rank(rank_map: &BLSPubkeyToRankMap, rank: u16) -> &BLSPubkeyStakeEntry {
+    rank_map
+        .get_pubkey_stake_entry(usize::from(rank))
+        .expect("vote group rank must exist in the epoch rank map")
 }
 
 /// Verifies votes and sends the verified votes to the consensus pool; and sends the desired subset
@@ -85,7 +87,7 @@ impl UnverifiedVotePayload {
 ///
 /// Any vote that fails fallback individual signature verification will have its sender banlisted.
 pub(super) fn verify_and_send_votes(
-    unverified_votes: HashMap<VotePayloadToSign, Vec<UnverifiedVotePayload>>,
+    unverified_votes: HashMap<VotePayloadToSign, UnverifiedVoteGroup>,
     rank_map_cache: &HashMap<Epoch, Arc<BLSPubkeyToRankMap>>,
     root_bank: &Bank,
     cluster_info: &ClusterInfo,
@@ -108,9 +110,8 @@ pub(super) fn verify_and_send_votes(
         let vote_slot = vote_payload_to_sign.slot();
         let vote_epoch = root_bank.epoch_schedule().get_epoch(vote_slot);
         let rank_map = rank_map_cache.get(&vote_epoch).unwrap();
-        let max_validators = rank_map.len();
         let verified_votes = verify_votes(
-            max_validators,
+            rank_map,
             vote_payload_to_sign,
             unverified_votes,
             &mut stats,
@@ -208,15 +209,21 @@ fn process_verified_votes(
 
 /// Sig verifies `unverified_votes` and returns a `Vec` of votes that passed verification.
 fn verify_votes(
-    max_validators: usize,
+    rank_map: &BLSPubkeyToRankMap,
     vote_payload_to_sign: VotePayloadToSign,
-    unverified_votes: Vec<UnverifiedVotePayload>,
+    unverified_votes: UnverifiedVoteGroup,
     stats: &mut SigVerifyVoteStats,
     banlist: &SimpleQosBanlist,
     thread_pool: &ThreadPool,
 ) -> Vec<VerifiedVotePayload> {
     // Try optimistic verification - fast to verify, but cannot identify invalid votes
-    let res = verify_votes_optimistic(vote_payload_to_sign, &unverified_votes, stats, thread_pool);
+    let res = verify_votes_optimistic(
+        rank_map,
+        vote_payload_to_sign,
+        &unverified_votes,
+        stats,
+        thread_pool,
+    );
 
     match res {
         Either::Left(signature) => {
@@ -225,14 +232,18 @@ fn verify_votes(
                 .optimistic_batch
                 .add_sample(unverified_votes.len() as u64);
             let vote_aggregate = VoteAggregate::new_from_verified_votes(
-                max_validators,
+                rank_map.len(),
                 vote_payload_to_sign,
-                unverified_votes.iter().map(|v| (v.rank, v.stake)),
+                unverified_votes.ranks.iter().map(|&rank| {
+                    let entry = get_entry_for_rank(rank_map, rank);
+                    (rank, entry.stake)
+                }),
                 signature,
             );
             let sender_vote_account_pubkeys = unverified_votes
-                .into_iter()
-                .map(|v| v.sender_vote_account_pubkey)
+                .ranks
+                .iter()
+                .map(|&rank| get_entry_for_rank(rank_map, rank).vote_account_pubkey)
                 .collect();
             vec![VerifiedVotePayload {
                 vote_aggregate,
@@ -244,7 +255,8 @@ fn verify_votes(
             stats.optimistic_verification_failed += 1;
             let ((verified_votes, invalid_remote_pubkeys), time_us) =
                 measure_us!(verify_individual_votes(
-                    max_validators,
+                    rank_map,
+                    vote_payload_to_sign,
                     unverified_votes,
                     prepared_hash_msg,
                     thread_pool
@@ -270,27 +282,27 @@ fn verify_votes(
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 /// Attempts aggregate BLS verification across the full vote set.
 ///
-/// This fast path aggregates all vote signatures and the public keys for each
-/// distinct vote payload, minimizing the number of pairing operations needed
-/// for verification. When aggregation or aggregate verification fails, the
-/// caller falls back to individual vote verification so invalid votes can be
-/// identified precisely.
+/// This fast path aggregates all vote signatures and public keys for the shared
+/// payload, minimizing the number of pairing operations needed for verification.
+/// When aggregation or aggregate verification fails, the caller falls back to
+/// individual vote verification so invalid votes can be identified precisely.
 ///
-/// Returns the optimistic verification outcome together with the distinct vote
-/// messages and their prepared payloads, which can be reused by the fallback
-/// path.
+/// On success, returns the aggregate signature. On failure, returns the prepared
+/// message so the fallback path can reuse it.
 #[must_use]
 fn verify_votes_optimistic(
+    rank_map: &BLSPubkeyToRankMap,
     vote_payload_to_sign: VotePayloadToSign,
-    unverified_votes: &[UnverifiedVotePayload],
+    unverified_votes: &UnverifiedVoteGroup,
     stats: &mut SigVerifyVoteStats,
     thread_pool: &ThreadPool,
 ) -> Either<SignatureProjective, PreparedHashedMessage> {
     #[cfg(debug_assertions)]
     {
         let deduped = unverified_votes
+            .ranks
             .iter()
-            .map(|v| &v.vote_message)
+            .copied()
             .collect::<HashSet<_>>();
         assert_eq!(deduped.len(), unverified_votes.len());
     }
@@ -302,13 +314,13 @@ fn verify_votes_optimistic(
     //
     // However, the BLS verification formula allows us to:
     // 1. Aggregate all signatures into a single signature.
-    // 2. Aggregate public keys for each unique message.
+    // 2. Aggregate the public keys for the shared message.
     //
-    // By verifying the aggregated signature against the aggregated public keys,
-    // the number of pairings required is reduced to (1 + number of distinct messages).
+    // Verifying the aggregate signature against the aggregate public key requires
+    // only two pairings for the group.
     let (signature_result, (prepared_hash_msg, pubkey_result)) = thread_pool.join(
         || aggregate_signatures(unverified_votes),
-        || aggregate_pubkeys_by_payload(vote_payload_to_sign, unverified_votes),
+        || aggregate_pubkeys_by_payload(rank_map, vote_payload_to_sign, unverified_votes),
     );
 
     let Ok(aggregate_signature) = signature_result else {
@@ -335,9 +347,9 @@ fn verify_votes_optimistic(
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-fn aggregate_signatures(votes: &[UnverifiedVotePayload]) -> Result<SignatureProjective, BlsError> {
+fn aggregate_signatures(votes: &UnverifiedVoteGroup) -> Result<SignatureProjective, BlsError> {
     debug_assert!(current_thread_index().is_some());
-    let signatures = votes.par_iter().map(|v| &v.vote_message.signature);
+    let signatures = votes.signatures.par_iter();
     // TODO(sam): Currently, `par_aggregate` performs full validation
     // (on-curve + subgroup check) for every signature. Since the subgroup
     // check is expensive, we can use an `unchecked` deserialization here
@@ -349,8 +361,9 @@ fn aggregate_signatures(votes: &[UnverifiedVotePayload]) -> Result<SignatureProj
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 fn aggregate_pubkeys_by_payload(
+    rank_map: &BLSPubkeyToRankMap,
     vote_payload_to_sign: VotePayloadToSign,
-    votes: &[UnverifiedVotePayload],
+    votes: &UnverifiedVoteGroup,
 ) -> (
     PreparedHashedMessage,
     Result<PopVerified<PubkeyProjective>, BlsError>,
@@ -360,33 +373,96 @@ fn aggregate_pubkeys_by_payload(
     let prepared_hash_msg = PreparedHashedMessage::new(&serialized_vote);
     // converting aggregate pubkey to `PopVerified` is safe here
     // since the pubkeys are all PoP verified in the vote account
-    let pubkey =
-        PubkeyProjective::par_aggregate(votes.into_par_iter().map(|v| &v.sender_bls_pubkey))
-            .map(|agg| unsafe { PopVerified::new_unchecked(*agg) });
+    let pubkey = PubkeyProjective::par_aggregate(
+        votes
+            .ranks
+            .par_iter()
+            .map(|&rank| &get_entry_for_rank(rank_map, rank).bls_pubkey),
+    )
+    .map(|agg| unsafe { PopVerified::new_unchecked(*agg) });
     (prepared_hash_msg, pubkey)
 }
 
 /// Verifies votes individually on a thread pool.
 ///
 /// Returns:
-/// - `Vec<VotePayload>`: votes that passed verification.
-/// - `Vec<Pubkey>`: senders' identity pubkeys for votes that failed verification.
+/// - verified vote payloads for votes that passed verification.
+/// - canonical node pubkeys and errors for votes that failed verification.
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 fn verify_individual_votes(
-    max_validators: usize,
-    unverified_votes: Vec<UnverifiedVotePayload>,
+    rank_map: &BLSPubkeyToRankMap,
+    vote_payload_to_sign: VotePayloadToSign,
+    unverified_votes: UnverifiedVoteGroup,
     prepared_hash_msg: PreparedHashedMessage,
     thread_pool: &ThreadPool,
 ) -> (Vec<VerifiedVotePayload>, Vec<(Pubkey, BlsError)>) {
+    debug_assert_eq!(
+        unverified_votes.signatures.len(),
+        unverified_votes.ranks.len()
+    );
+    let UnverifiedVoteGroup { signatures, ranks } = unverified_votes;
     thread_pool.install(|| {
-        unverified_votes
+        signatures
             .into_par_iter()
-            .partition_map(|unverified_vote| {
-                let sender_identity_pubkey = unverified_vote.sender_identity_pubkey;
-                match unverified_vote.verify(max_validators, &prepared_hash_msg) {
-                    Ok(vote) => Either::Left(vote),
-                    Err(e) => Either::Right((sender_identity_pubkey, e)),
+            .zip(ranks.into_par_iter())
+            .partition_map(|(signature, rank)| {
+                let entry = get_entry_for_rank(rank_map, rank);
+                match entry
+                    .bls_pubkey
+                    .verify_signature_prepared(&signature, &prepared_hash_msg)
+                {
+                    Ok(()) => {
+                        let vote_message = VoteMessage {
+                            vote: vote_payload_to_sign.into(),
+                            signature,
+                            rank,
+                            stake: entry.stake,
+                        };
+                        Either::Left(VerifiedVotePayload {
+                            vote_aggregate: VoteAggregate::new_from_verified_vote(
+                                rank_map.len(),
+                                vote_message,
+                            ),
+                            sender_vote_account_pubkeys: vec![entry.vote_account_pubkey],
+                        })
+                    }
+                    Err(error) => Either::Right((entry.node_pubkey, error)),
                 }
             })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, solana_bls_signatures::BLS_SIGNATURE_AFFINE_SIZE, std::mem::size_of};
+
+    #[test]
+    fn test_unverified_vote_group_preserves_signature_rank_pairs() {
+        let expected = [
+            (BLSSignature([1; BLS_SIGNATURE_AFFINE_SIZE]), 7),
+            (BLSSignature([2; BLS_SIGNATURE_AFFINE_SIZE]), 3),
+            (BLSSignature([3; BLS_SIGNATURE_AFFINE_SIZE]), 11),
+        ];
+        let mut group = UnverifiedVoteGroup::default();
+        for &(signature, rank) in &expected {
+            group.push(signature, rank);
+        }
+
+        assert_eq!(group.len(), expected.len());
+        assert_eq!(group.signatures.len(), group.ranks.len());
+        assert_eq!(
+            group
+                .signatures
+                .iter()
+                .copied()
+                .zip(group.ranks.iter().copied())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            size_of::<BLSSignature>() + size_of::<u16>(),
+            BLS_SIGNATURE_AFFINE_SIZE + size_of::<u16>()
+        );
+        assert_eq!(BLS_SIGNATURE_AFFINE_SIZE + size_of::<u16>(), 194);
+    }
 }

@@ -3,7 +3,7 @@
 use {
     crate::{
         bls_cert_sigverify::{CertPayload, verify_and_send_certificates},
-        bls_vote_sigverify::{UnverifiedVotePayload, verify_and_send_votes},
+        bls_vote_sigverify::{UnverifiedVoteGroup, verify_and_send_votes},
         errors::SigVerifyError,
         generated_cert_types::GeneratedCertTypes,
         rewards::{RewardInput, rewards_wants_vote},
@@ -95,7 +95,7 @@ pub fn spawn_service(
 
 struct ExtractedMsgs {
     certs: HashMap<CertificateType, Vec<CertPayload>>,
-    votes: HashMap<VotePayloadToSign, Vec<UnverifiedVotePayload>>,
+    votes: HashMap<VotePayloadToSign, UnverifiedVoteGroup>,
 }
 
 struct SigVerifier {
@@ -285,7 +285,7 @@ impl SigVerifier {
     ) -> ExtractedMsgs {
         let root_slot = root_bank.slot();
         let mut cert_groups = HashMap::<CertificateType, Vec<CertPayload>>::new();
-        let mut votes: HashMap<VotePayloadToSign, Vec<UnverifiedVotePayload>> = HashMap::new();
+        let mut votes: HashMap<VotePayloadToSign, UnverifiedVoteGroup> = HashMap::new();
         let mut num_pkts = 0u64;
         let my_shred_version = self.cluster_info.my_shred_version();
         for packet in batches.iter().flatten() {
@@ -311,14 +311,17 @@ impl SigVerifier {
 
             match decoded_msg {
                 DecodedWireConsensusMessage::Vote(unverified_vote) => {
-                    if let Some(payload) =
-                        self.keep_vote(unverified_vote, sender_identity_pubkey, root_bank)
+                    if let Some(rank) =
+                        self.keep_vote(&unverified_vote, sender_identity_pubkey, root_bank)
                     {
                         let vote_payload_to_sign = VotePayloadToSign::new_from_vote(
-                            payload.vote_message.vote,
-                            payload.vote_message.shred_version,
+                            unverified_vote.vote,
+                            unverified_vote.shred_version,
                         );
-                        votes.entry(vote_payload_to_sign).or_default().push(payload);
+                        votes
+                            .entry(vote_payload_to_sign)
+                            .or_default()
+                            .push(unverified_vote.signature, rank);
                     }
                 }
                 DecodedWireConsensusMessage::Certificate(cert) => {
@@ -365,13 +368,13 @@ impl SigVerifier {
         }
     }
 
-    /// If this vote should be verified, then returns the [`UnverifiedVotePayload`].
+    /// If this vote should be verified, returns the sender's validator rank.
     fn keep_vote(
         &mut self,
-        msg: UnverifiedVoteMessage,
+        msg: &UnverifiedVoteMessage,
         sender_identity_pubkey: Pubkey,
         root_bank: &Bank,
-    ) -> Option<UnverifiedVotePayload> {
+    ) -> Option<u16> {
         // votes from self take a different pathway.
         if sender_identity_pubkey == self.cluster_info.id() {
             return None;
@@ -413,21 +416,14 @@ impl SigVerifier {
                 entry.insert(rank_map.clone())
             }
         };
-        let (rank, entry) = rank_map
+        let (rank, _) = rank_map
             .get_ranked_entry_for_node(&sender_identity_pubkey)
             .or_else(|| {
                 self.stats.discard_vote_invalid_rank += 1;
                 None
             })?;
-        match self.vote_pool.try_add_vote(&msg, rank, rank_map.len()) {
-            Ok(()) => Some(UnverifiedVotePayload {
-                vote_message: msg,
-                sender_bls_pubkey: entry.bls_pubkey,
-                sender_vote_account_pubkey: entry.vote_account_pubkey,
-                sender_identity_pubkey,
-                stake: entry.stake,
-                rank,
-            }),
+        match self.vote_pool.try_add_vote(msg, rank, rank_map.len()) {
+            Ok(()) => Some(rank),
             Err(VotePoolError::Duplicate) => None,
             Err(VotePoolError::Invalid) => {
                 self.stats.invalid_vote_banning_validator += 1;
@@ -1076,6 +1072,11 @@ mod tests {
         let vote = Vote::new_skip_vote(42);
         let vote_payload =
             get_vote_payload_to_sign(vote, ctx.verifier.cluster_info.my_shred_version());
+        let root_bank = ctx.verifier.sharable_banks.root();
+        let rank_map = root_bank.get_rank_map(vote.slot()).unwrap();
+        let expected_stake = (0..num_votes)
+            .map(|rank| rank_map.get_pubkey_stake_entry(rank).unwrap().stake.get())
+            .sum::<u64>();
 
         for (i, validator_keypair) in ctx.validator_keypairs.iter().enumerate().take(num_votes) {
             let rank = i as u16;
@@ -1104,6 +1105,10 @@ mod tests {
             SigVerifiedBatch::Votes(aggregates) => {
                 assert_eq!(aggregates.len(), 1);
                 assert_eq!(aggregates[0].num_votes(), num_votes);
+                assert_eq!(aggregates[0].stake().get(), expected_stake);
+                for rank in 0..rank_map.len() {
+                    assert_eq!(aggregates[0].ranks()[rank], rank < num_votes);
+                }
             }
             rest => panic!("unexpected type: {rest:?}"),
         }
