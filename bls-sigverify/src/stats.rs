@@ -562,6 +562,7 @@ pub(crate) struct SenderStats {
     name: &'static str,
     pub(super) sent: Saturating<u64>,
     pub(super) channel_full: Saturating<u64>,
+    pub(super) blocking_us: WelfordStats,
 }
 
 impl SenderStats {
@@ -570,6 +571,7 @@ impl SenderStats {
             name,
             sent: Saturating(0),
             channel_full: Saturating(0),
+            blocking_us: WelfordStats::default(),
         }
     }
 
@@ -578,9 +580,11 @@ impl SenderStats {
             sent,
             channel_full,
             name: _,
+            blocking_us,
         } = other;
         self.sent += sent;
         self.channel_full += channel_full;
+        self.blocking_us.merge(blocking_us);
     }
 
     pub(super) fn report(&self) {
@@ -588,11 +592,15 @@ impl SenderStats {
             sent,
             channel_full,
             name,
+            blocking_us,
         } = self;
         datapoint_info!(
             name,
             ("sent", sent.0, i64),
             ("channel_full", channel_full.0, i64),
+            ("blocking_us_count", blocking_us.count(), i64),
+            ("blocking_us_mean", blocking_us.mean::<u64>(), Option<i64>),
+            ("blocking_us_max", blocking_us.maximum::<u64>(), Option<i64>),
         );
     }
 }

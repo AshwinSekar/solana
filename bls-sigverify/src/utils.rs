@@ -12,6 +12,7 @@ use {
     crossbeam_channel::{Sender, TrySendError},
     log::{error, info, warn},
     solana_clock::Slot,
+    solana_measure::measure_us,
     solana_pubkey::Pubkey,
     std::{collections::HashMap, time::Instant},
 };
@@ -84,7 +85,9 @@ pub(super) fn send_sig_verified_batch_to_pool(
         Err(TrySendError::Full(msgs)) => {
             stats.pool_sender.channel_full += 1;
             error!("{my_pubkey}: channel \"{POOL_CHANNEL}\" is full.  Doing a blocking send.");
-            match channel.send(msgs) {
+            let (res, blocking_time) = measure_us!(channel.send(msgs));
+            stats.pool_sender.blocking_us.add_sample(blocking_time);
+            match res {
                 Ok(()) => {
                     info!("{my_pubkey}: channel \"{POOL_CHANNEL}\" has space again");
                     stats.pool_sender.sent += len as u64;
