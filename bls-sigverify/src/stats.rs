@@ -396,6 +396,11 @@ impl VoteVerificationStats {
                 optimistic_batch.mean().unwrap_or(0),
                 i64
             ),
+            (
+                "optimistic_batch_max",
+                optimistic_batch.maximum().unwrap_or(0),
+                i64
+            ),
             ("num_individual_verified", num_individual_verified.0, i64),
             ("banning_validator", banning_validator.0, i64),
             (
