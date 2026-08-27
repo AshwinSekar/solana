@@ -9,8 +9,7 @@ use {
         rewards::rewards_wants_vote,
         stats::{SigVerifyVoteStats, VoteSenderStats, VoteVerificationStats},
         utils::{
-            send_sig_verified_batch_to_pool, send_votes_to_metrics, send_votes_to_repair,
-            send_votes_to_rewards,
+            send_votes_to_metrics, send_votes_to_pool, send_votes_to_repair, send_votes_to_rewards,
         },
     },
     agave_votor_messages::{
@@ -44,7 +43,7 @@ use {
 struct ProcessedVotes {
     reward_msg: Vec<VoteAggregate>,
     repair_msg: HashMap<Pubkey, Vec<Slot>>,
-    vote_aggregates_for_pool: Vec<VoteAggregate>,
+    vote_aggregates_for_pool: HashMap<VotePayloadToSign, Vec<VoteAggregate>>,
     metrics_msg: Vec<ConsensusMetricsEvent>,
 }
 
@@ -111,8 +110,13 @@ fn verify_vote_batch(
         thread_pool,
     );
 
-    let processed_votes =
-        process_verified_votes(verified_votes, root_bank, cluster_info, leader_schedule);
+    let processed_votes = process_verified_votes(
+        vote_payload_to_sign,
+        verified_votes,
+        root_bank,
+        cluster_info,
+        leader_schedule,
+    );
     (
         unverified_votes_len,
         vote_verification_stats,
@@ -212,6 +216,7 @@ fn inspect_for_repair(
 /// In particular, collects and returns the relevant messages for the consensus pool; rewards;
 /// repair; and metrics;
 fn process_verified_votes(
+    vote_payload_to_sign: VotePayloadToSign,
     verified_votes: Vec<VerifiedVotePayload>,
     root_bank: &Bank,
     cluster_info: &ClusterInfo,
@@ -219,7 +224,8 @@ fn process_verified_votes(
 ) -> ProcessedVotes {
     let mut votes_for_reward = Vec::with_capacity(verified_votes.len());
     let mut msgs_for_repair = HashMap::new();
-    let mut vote_aggregates_for_pool = Vec::with_capacity(verified_votes.len());
+    let mut vote_aggregates_for_pool: HashMap<VotePayloadToSign, Vec<VoteAggregate>> =
+        HashMap::new();
     let mut votes_for_metrics = Vec::with_capacity(verified_votes.len());
     for payload in verified_votes {
         inspect_for_repair(&payload, &mut msgs_for_repair);
@@ -238,7 +244,10 @@ fn process_verified_votes(
         ) {
             votes_for_reward.push(payload.vote_aggregate.clone());
         }
-        vote_aggregates_for_pool.push(payload.vote_aggregate);
+        vote_aggregates_for_pool
+            .entry(vote_payload_to_sign)
+            .or_default()
+            .push(payload.vote_aggregate);
     }
     let msgs_for_repair = msgs_for_repair
         .into_iter()
@@ -263,7 +272,7 @@ fn send_msgs(
 ) -> Result<VoteSenderStats, SigVerifyVoteError> {
     let mut sender_stats = VoteSenderStats::default();
     for vote in processed_votes {
-        send_sig_verified_batch_to_pool(
+        send_votes_to_pool(
             my_pubkey,
             SigVerifiedBatch::Votes(vote.vote_aggregates_for_pool),
             &channels.channel_to_pool,

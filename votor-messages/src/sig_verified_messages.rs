@@ -7,7 +7,7 @@ use {
     },
     bitvec::vec::BitVec,
     solana_bls_signatures::{Signature as BLSSignature, SignatureProjective},
-    std::num::NonZero,
+    std::{collections::HashMap, num::NonZero},
 };
 
 /// A batch of vote or cert being sent within the node.  They were either sig verified before being
@@ -15,27 +15,9 @@ use {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SigVerifiedBatch {
     /// Batch of votes.
-    Votes(Vec<VoteAggregate>),
+    Votes(HashMap<VotePayloadToSign, Vec<VoteAggregate>>),
     /// Batch of certs.
     Certificates(Vec<Certificate>),
-}
-
-impl SigVerifiedBatch {
-    /// Returns the length of the batch
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Votes(aggregates) => aggregates.len(),
-            Self::Certificates(certs) => certs.len(),
-        }
-    }
-
-    /// Returns true if the batch is empty.
-    pub fn is_empty(&self) -> bool {
-        match self {
-            Self::Votes(aggregates) => aggregates.is_empty(),
-            Self::Certificates(certs) => certs.is_empty(),
-        }
-    }
 }
 
 /// A batch of identical votes that have been sigverified

@@ -209,6 +209,32 @@ impl VotePools {
         pool
     }
 
+    pub(super) fn take_vote_pool(&mut self, slot: Slot, max_validators: usize) -> VotePool {
+        let diff = slot.checked_sub(self.root_slot).unwrap() as usize;
+        assert!(diff < NUM_VOTE_POOLS);
+        let ind = self.offset.saturating_add(diff).rem_euclid(NUM_VOTE_POOLS);
+        {
+            let entry = &mut self.pools[ind];
+            if let MaybeVotePool::None(accumulators) = entry {
+                let pool = VotePool::new(max_validators, std::mem::take(accumulators));
+                *entry = MaybeVotePool::Some(pool);
+            }
+        }
+        let mut ret = MaybeVotePool::None(HashMap::new());
+        std::mem::swap(&mut self.pools[ind], &mut ret);
+        let MaybeVotePool::Some(pool) = ret else {
+            unimplemented!()
+        };
+        pool
+    }
+
+    pub(super) fn return_vote_pool(&mut self, slot: Slot, vote_pool: VotePool) {
+        let diff = slot.checked_sub(self.root_slot).unwrap() as usize;
+        assert!(diff < NUM_VOTE_POOLS);
+        let ind = self.offset.saturating_add(diff).rem_euclid(NUM_VOTE_POOLS);
+        self.pools[ind] = MaybeVotePool::Some(vote_pool);
+    }
+
     /// Prunes the `VotePool`s that are no longer needed.
     pub(super) fn prune(&mut self, root_slot: Slot) {
         let diff = root_slot.checked_sub(self.root_slot).unwrap();
