@@ -64,7 +64,7 @@ pub(super) struct SigVerifierStats {
     /// Stats on how long [`extract_and_filter_msgs`] took.
     pub(super) extract_filter_msgs_us: WelfordStats,
     /// Number of packets received.
-    pub(super) num_pkts: WelfordStats,
+    pub(super) num_pkts: Saturating<u64>,
     /// Number of times we failed to deserialize a packet.
     pub(super) num_malformed_pkts: Saturating<u64>,
     /// Number of votes discarded due to an invalid rank.
@@ -95,7 +95,7 @@ impl SigVerifierStats {
             vote_stats: SigVerifyVoteStats::default(),
             cert_stats: SigVerifyCertStats::default(),
             extract_filter_msgs_us: WelfordStats::default(),
-            num_pkts: WelfordStats::default(),
+            num_pkts: Saturating(0),
             discard_vote_invalid_rank: Saturating(0),
             num_malformed_pkts: Saturating(0),
             discard_vote_no_epoch_stakes: Saturating(0),
@@ -216,9 +216,7 @@ impl SigVerifierStats {
             ),
             ("num_keep_vote_failed", num_keep_vote_failed.0, i64),
             ("vote_pool_duplicate", vote_pool_duplicate.0, i64),
-            ("num_pkts_max", num_pkts.maximum().unwrap_or(0), i64),
-            ("num_pkts_mean", num_pkts.mean().unwrap_or(0), i64),
-            ("num_pkts_count", num_pkts.count(), i64),
+            ("num_pkts", num_pkts.0, i64),
         );
     }
 }

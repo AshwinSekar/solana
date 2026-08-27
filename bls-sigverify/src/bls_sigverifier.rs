@@ -411,7 +411,7 @@ impl SigVerifier {
             };
             self.add_certificate_to_group(&mut cert_groups, certificate, sender_identity_pubkey);
         }
-        self.stats.num_pkts.add_sample(num_pkts);
+        self.stats.num_pkts += num_pkts;
         ExtractedMsgs {
             certs: cert_groups,
             votes,
