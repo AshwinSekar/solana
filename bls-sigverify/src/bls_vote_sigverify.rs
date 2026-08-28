@@ -9,11 +9,11 @@ use {
         rewards::rewards_wants_vote,
         stats::{SigVerifyVoteStats, VoteSenderStats, VoteVerificationStats},
         utils::{
-            send_votes_to_metrics, send_votes_to_pool, send_votes_to_repair, send_votes_to_rewards,
+            send_sig_verified_batch_to_pool, send_votes_to_metrics, send_votes_to_repair,
+            send_votes_to_rewards,
         },
     },
     agave_votor_messages::{
-        consensus_message::VoteMessage,
         metric_types::ConsensusMetricsEvent,
         sig_verified_messages::{SigVerifiedBatch, VoteAggregate},
         unverified_vote_message::UnverifiedVoteMessage,
@@ -29,6 +29,7 @@ use {
     solana_bls_signatures::{
         BlsError, PreparedHashedMessage, PubkeyProjective, SignatureProjective,
         pubkey::{PopVerified, PubkeyAffine as BlsPubkeyAffine, VerifySignature},
+        signature::{AsSignatureAffine, SignatureAffine},
     },
     solana_clock::{Epoch, Slot},
     solana_gossip::cluster_info::ClusterInfo,
@@ -36,15 +37,42 @@ use {
     solana_measure::{measure::Measure, measure_us},
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, epoch_stakes::BLSPubkeyToRankMap},
-    std::{collections::HashMap, num::NonZero, sync::Arc},
+    std::{
+        collections::{HashMap, hash_map::Entry},
+        num::NonZero,
+        sync::Arc,
+    },
 };
 
 #[derive(Default)]
 struct ProcessedVotes {
     reward_msg: Vec<VoteAggregate>,
     repair_msg: HashMap<Pubkey, Vec<Slot>>,
-    vote_aggregates_for_pool: HashMap<VotePayloadToSign, Vec<VoteAggregate>>,
+    vote_aggregates_for_pool: Vec<VoteAggregate>,
     metrics_msg: Vec<ConsensusMetricsEvent>,
+}
+
+impl ProcessedVotes {
+    fn merge(&mut self, other: Self) {
+        let Self {
+            mut reward_msg,
+            repair_msg,
+            mut vote_aggregates_for_pool,
+            mut metrics_msg,
+        } = other;
+        self.reward_msg.append(&mut reward_msg);
+        for (pubkey, mut slots) in repair_msg {
+            match self.repair_msg.entry(pubkey) {
+                Entry::Vacant(e) => {
+                    e.insert(slots);
+                }
+                Entry::Occupied(e) => e.into_mut().append(&mut slots),
+            }
+        }
+        self.vote_aggregates_for_pool
+            .append(&mut vote_aggregates_for_pool);
+        self.metrics_msg.append(&mut metrics_msg);
+    }
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
@@ -53,7 +81,7 @@ struct VerifiedVotePayload {
     sender_vote_account_pubkeys: Vec<Pubkey>,
 }
 
-/// [`VoteMessage`] along with other information needed to sig verify it.
+/// [`UnverifiedVoteMessage`] along with other information needed to sig verify it.
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 #[derive(Clone, Debug)]
 pub(super) struct UnverifiedVotePayload {
@@ -71,15 +99,16 @@ impl UnverifiedVotePayload {
         max_validators: usize,
         prepared_hashed_message: &PreparedHashedMessage,
     ) -> Result<VerifiedVotePayload, BlsError> {
+        let signature = self.vote_message.signature.try_as_affine()?;
         self.sender_bls_pubkey
-            .verify_signature_prepared(&self.vote_message.signature, prepared_hashed_message)?;
-        let vote_msg = VoteMessage {
-            vote: self.vote_message.vote,
-            signature: self.vote_message.signature,
-            rank: self.rank,
-            stake: self.stake,
-        };
-        let vote_aggregate = VoteAggregate::new_from_verified_vote(max_validators, vote_msg);
+            .verify_signature_prepared(&signature, prepared_hashed_message)?;
+        let vote_aggregate = VoteAggregate::new_from_verified_affine_vote(
+            max_validators,
+            self.vote_message.vote,
+            signature,
+            self.rank,
+            self.stake,
+        );
         Ok(VerifiedVotePayload {
             vote_aggregate,
             sender_vote_account_pubkeys: vec![self.sender_vote_account_pubkey],
@@ -110,13 +139,8 @@ fn verify_vote_batch(
         thread_pool,
     );
 
-    let processed_votes = process_verified_votes(
-        vote_payload_to_sign,
-        verified_votes,
-        root_bank,
-        cluster_info,
-        leader_schedule,
-    );
+    let processed_votes =
+        process_verified_votes(verified_votes, root_bank, cluster_info, leader_schedule);
     (
         unverified_votes_len,
         vote_verification_stats,
@@ -151,7 +175,13 @@ pub(super) fn verify_and_send_votes(
         unverified_votes
             .into_par_iter()
             .fold(
-                || (0u64, VoteVerificationStats::default(), vec![]),
+                || {
+                    (
+                        0u64,
+                        VoteVerificationStats::default(),
+                        ProcessedVotes::default(),
+                    )
+                },
                 |(mut acc_total_votes, mut acc_verification_stats, mut acc_processed_votes),
                  (vote_payload_to_sign, unverified_votes)| {
                     let (unverified_votes_len, vote_verification_stats, processed_votes) =
@@ -167,16 +197,22 @@ pub(super) fn verify_and_send_votes(
                         );
                     acc_total_votes = acc_total_votes.saturating_add(unverified_votes_len);
                     acc_verification_stats.merge(vote_verification_stats);
-                    acc_processed_votes.push(processed_votes);
+                    acc_processed_votes.merge(processed_votes);
                     (acc_total_votes, acc_verification_stats, acc_processed_votes)
                 },
             )
             .reduce(
-                || (0, VoteVerificationStats::default(), vec![]),
-                |mut left, mut right| {
+                || {
+                    (
+                        0,
+                        VoteVerificationStats::default(),
+                        ProcessedVotes::default(),
+                    )
+                },
+                |mut left, right| {
                     left.0 = left.0.saturating_add(right.0);
                     left.1.merge(right.1);
-                    left.2.append(&mut right.2);
+                    left.2.merge(right.2);
                     left
                 },
             )
@@ -216,7 +252,6 @@ fn inspect_for_repair(
 /// In particular, collects and returns the relevant messages for the consensus pool; rewards;
 /// repair; and metrics;
 fn process_verified_votes(
-    vote_payload_to_sign: VotePayloadToSign,
     verified_votes: Vec<VerifiedVotePayload>,
     root_bank: &Bank,
     cluster_info: &ClusterInfo,
@@ -224,8 +259,7 @@ fn process_verified_votes(
 ) -> ProcessedVotes {
     let mut votes_for_reward = Vec::with_capacity(verified_votes.len());
     let mut msgs_for_repair = HashMap::new();
-    let mut vote_aggregates_for_pool: HashMap<VotePayloadToSign, Vec<VoteAggregate>> =
-        HashMap::new();
+    let mut vote_aggregates_for_pool = Vec::with_capacity(verified_votes.len());
     let mut votes_for_metrics = Vec::with_capacity(verified_votes.len());
     for payload in verified_votes {
         inspect_for_repair(&payload, &mut msgs_for_repair);
@@ -244,10 +278,7 @@ fn process_verified_votes(
         ) {
             votes_for_reward.push(payload.vote_aggregate.clone());
         }
-        vote_aggregates_for_pool
-            .entry(vote_payload_to_sign)
-            .or_default()
-            .push(payload.vote_aggregate);
+        vote_aggregates_for_pool.push(payload.vote_aggregate);
     }
     let msgs_for_repair = msgs_for_repair
         .into_iter()
@@ -268,35 +299,33 @@ fn process_verified_votes(
 fn send_msgs(
     my_pubkey: &Pubkey,
     channels: &SigVerifierChannels,
-    processed_votes: Vec<ProcessedVotes>,
+    processed_votes: ProcessedVotes,
 ) -> Result<VoteSenderStats, SigVerifyVoteError> {
     let mut sender_stats = VoteSenderStats::default();
-    for vote in processed_votes {
-        send_votes_to_pool(
-            my_pubkey,
-            SigVerifiedBatch::Votes(vote.vote_aggregates_for_pool),
-            &channels.channel_to_pool,
-            &mut sender_stats,
-        )?;
-        send_votes_to_repair(
-            my_pubkey,
-            vote.repair_msg,
-            &channels.channel_to_repair,
-            &mut sender_stats,
-        );
-        send_votes_to_rewards(
-            my_pubkey,
-            vote.reward_msg,
-            &channels.channel_to_reward,
-            &mut sender_stats,
-        );
-        send_votes_to_metrics(
-            my_pubkey,
-            vote.metrics_msg,
-            &channels.channel_to_metrics,
-            &mut sender_stats,
-        );
-    }
+    send_sig_verified_batch_to_pool(
+        my_pubkey,
+        SigVerifiedBatch::Votes(processed_votes.vote_aggregates_for_pool),
+        &channels.channel_to_pool,
+        &mut sender_stats,
+    )?;
+    send_votes_to_repair(
+        my_pubkey,
+        processed_votes.repair_msg,
+        &channels.channel_to_repair,
+        &mut sender_stats,
+    );
+    send_votes_to_rewards(
+        my_pubkey,
+        processed_votes.reward_msg,
+        &channels.channel_to_reward,
+        &mut sender_stats,
+    );
+    send_votes_to_metrics(
+        my_pubkey,
+        processed_votes.metrics_msg,
+        &channels.channel_to_metrics,
+        &mut sender_stats,
+    );
     Ok(sender_stats)
 }
 
@@ -323,7 +352,7 @@ fn verify_votes(
             stats
                 .optimistic_batch
                 .add_sample(unverified_votes.len() as u64);
-            let vote_aggregate = VoteAggregate::new_from_verified_votes(
+            let vote_aggregate = VoteAggregate::new_from_verified_affine_votes(
                 max_validators,
                 vote_payload_to_sign,
                 unverified_votes.iter().map(|v| (v.rank, v.stake)),
@@ -384,7 +413,7 @@ fn verify_votes_optimistic(
     unverified_votes: &[UnverifiedVotePayload],
     stats: &mut VoteVerificationStats,
     thread_pool: &ThreadPool,
-) -> Either<SignatureProjective, PreparedHashedMessage> {
+) -> Either<SignatureAffine, PreparedHashedMessage> {
     #[cfg(debug_assertions)]
     {
         let deduped = unverified_votes
@@ -413,6 +442,7 @@ fn verify_votes_optimistic(
     let Ok(aggregate_signature) = signature_result else {
         return Either::Right(prepared_hash_msg);
     };
+    let aggregate_signature = SignatureAffine::from(aggregate_signature);
 
     let Ok(aggregate_pubkey) = pubkey_result else {
         return Either::Right(prepared_hash_msg);

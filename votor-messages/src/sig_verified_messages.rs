@@ -6,8 +6,11 @@ use {
         wire::VotePayloadToSign,
     },
     bitvec::vec::BitVec,
-    solana_bls_signatures::{Signature as BLSSignature, SignatureProjective},
-    std::{collections::HashMap, num::NonZero},
+    solana_bls_signatures::{
+        BlsError, SignatureProjective,
+        signature::{AsSignatureAffine, SignatureAffine},
+    },
+    std::num::NonZero,
 };
 
 /// A batch of vote or cert being sent within the node.  They were either sig verified before being
@@ -15,21 +18,39 @@ use {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SigVerifiedBatch {
     /// Batch of votes.
-    Votes(HashMap<VotePayloadToSign, Vec<VoteAggregate>>),
+    Votes(Vec<VoteAggregate>),
     /// Batch of certs.
     Certificates(Vec<Certificate>),
+}
+
+impl SigVerifiedBatch {
+    /// Returns the length of the batch
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Votes(aggregates) => aggregates.len(),
+            Self::Certificates(certs) => certs.len(),
+        }
+    }
+
+    /// Returns true if the batch is empty.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Votes(aggregates) => aggregates.is_empty(),
+            Self::Certificates(certs) => certs.is_empty(),
+        }
+    }
 }
 
 /// A batch of identical votes that have been sigverified
 ///
 /// NOTE: the fields should not be exposed outside of the crate so that users use approved paths to
 /// build it to ensure signature verification takes place.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoteAggregate {
     /// The type of vote in the batch.
     vote: Vote,
     /// The aggregate signature of the votes in the batch.
-    signature: BLSSignature,
+    signature: SignatureAffine,
     /// The total stake in the batch.
     stake: NonZero<u64>,
     /// Ranks of the various validators whose votes are in the batch.
@@ -37,18 +58,46 @@ pub struct VoteAggregate {
 }
 
 impl VoteAggregate {
-    /// Creates a sig verified vote batch from a VoteMessage.
+    /// Creates a sig verified vote batch from a [`VoteMessage`], validating the signature's point
+    /// encoding and subgroup membership.
     ///
-    /// WARN: this is only public to enable handling already verified votes that are sent within
-    /// the validator.  Think carefully before using this in production code.
-    pub fn new_from_verified_vote(max_validators: usize, msg: VoteMessage) -> Self {
-        assert!((msg.rank as usize) < max_validators);
+    /// This does not verify that the signature is bound to `msg.vote`; the caller must have already
+    /// performed that verification. This is only public to enable handling already verified votes
+    /// that are sent within the validator.
+    pub fn new_from_verified_vote(
+        max_validators: usize,
+        msg: VoteMessage,
+    ) -> Result<Self, BlsError> {
+        let signature = msg.signature.try_as_affine()?;
+        Ok(Self::new_from_verified_affine_vote(
+            max_validators,
+            msg.vote,
+            signature,
+            msg.rank,
+            msg.stake,
+        ))
+    }
+
+    /// Creates a sig verified vote batch from an already validated affine signature.
+    ///
+    /// WARN: `signature` must have already been verified against `vote`. [`SignatureAffine`]
+    /// guarantees subgroup membership, but not that message binding. This is only public to avoid
+    /// validating the same signature again when passing verified votes between crates within the
+    /// validator.
+    pub fn new_from_verified_affine_vote(
+        max_validators: usize,
+        vote: Vote,
+        signature: SignatureAffine,
+        rank: u16,
+        stake: NonZero<u64>,
+    ) -> Self {
+        assert!((rank as usize) < max_validators);
         let mut ranks = BitVec::repeat(false, max_validators);
-        ranks.set(msg.rank as usize, true);
+        ranks.set(rank as usize, true);
         Self {
-            vote: msg.vote,
-            signature: msg.signature,
-            stake: msg.stake,
+            vote,
+            signature,
+            stake,
             ranks,
         }
     }
@@ -65,6 +114,26 @@ impl VoteAggregate {
         ranks_and_stakes_iter: impl Iterator<Item = (u16, NonZero<u64>)>,
         aggregate_signature: SignatureProjective,
     ) -> Self {
+        Self::new_from_verified_affine_votes(
+            max_validators,
+            vote_payload_to_sign,
+            ranks_and_stakes_iter,
+            aggregate_signature.into(),
+        )
+    }
+
+    /// Creates a sig verified vote batch from a list of verified votes and their already validated
+    /// aggregate affine signature.
+    ///
+    /// WARN: this function assumes that there are no duplicate ranks, every rank is less than
+    /// `max_validators`, and `aggregate_signature` has already been verified against the vote and
+    /// covers exactly those ranks.
+    pub fn new_from_verified_affine_votes(
+        max_validators: usize,
+        vote_payload_to_sign: VotePayloadToSign,
+        ranks_and_stakes_iter: impl Iterator<Item = (u16, NonZero<u64>)>,
+        aggregate_signature: SignatureAffine,
+    ) -> Self {
         let mut ranks = BitVec::repeat(false, max_validators);
         let mut total_stake = None;
         for (rank, stake) in ranks_and_stakes_iter {
@@ -79,7 +148,7 @@ impl VoteAggregate {
         let vote = Vote::from(vote_payload_to_sign);
         Self {
             vote,
-            signature: aggregate_signature.into(),
+            signature: aggregate_signature,
             stake: total_stake.unwrap(),
             ranks,
         }
@@ -96,7 +165,7 @@ impl VoteAggregate {
     }
 
     /// Accessor for the signature.
-    pub fn signature(&self) -> &BLSSignature {
+    pub fn signature(&self) -> &SignatureAffine {
         &self.signature
     }
 
@@ -108,5 +177,66 @@ impl VoteAggregate {
     /// Returns number of votes in the aggregate.
     pub fn num_votes(&self) -> usize {
         self.ranks.count_ones()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::wire::get_vote_payload_to_sign,
+        solana_bls_signatures::{
+            BLS_SIGNATURE_AFFINE_SIZE, Keypair as BlsKeypair, Signature as BLSSignature,
+        },
+    };
+
+    #[test]
+    fn verified_vote_retains_validated_affine_signature() {
+        let max_validators = 4;
+        let rank = 2;
+        let stake = NonZero::new(42).unwrap();
+        let shred_version = 7;
+        let vote = Vote::new_skip_vote(11);
+        let keypair = BlsKeypair::new();
+        let signature = keypair.sign(&get_vote_payload_to_sign(vote, shred_version));
+        let signature_affine = SignatureAffine::from(signature);
+        let msg = VoteMessage {
+            vote,
+            signature: signature.into(),
+            rank,
+            stake,
+        };
+
+        let from_vote = VoteAggregate::new_from_verified_vote(max_validators, msg).unwrap();
+        let from_affine = VoteAggregate::new_from_verified_affine_votes(
+            max_validators,
+            VotePayloadToSign::new_from_vote(vote, shred_version),
+            std::iter::once((rank, stake)),
+            signature_affine,
+        );
+        let from_projective = VoteAggregate::new_from_verified_votes(
+            max_validators,
+            VotePayloadToSign::new_from_vote(vote, shred_version),
+            std::iter::once((rank, stake)),
+            signature,
+        );
+
+        assert_eq!(from_vote, from_affine);
+        assert_eq!(from_vote, from_projective);
+        assert_eq!(from_vote.signature(), &signature_affine);
+        assert_eq!(from_vote.num_votes(), 1);
+        assert_eq!(from_vote.stake(), stake);
+    }
+
+    #[test]
+    fn malformed_verified_vote_signature_is_rejected() {
+        let msg = VoteMessage {
+            vote: Vote::new_skip_vote(11),
+            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
+            rank: 0,
+            stake: NonZero::new(1).unwrap(),
+        };
+
+        assert!(VoteAggregate::new_from_verified_vote(1, msg).is_err());
     }
 }

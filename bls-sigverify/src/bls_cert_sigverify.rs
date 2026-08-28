@@ -70,8 +70,7 @@ pub(super) fn verify_and_send_certificates(
         ban_sender,
         thread_pool,
     );
-    // TODO fix this.
-    // stats.sig_verified_certs += messages.len() as u64;
+    stats.sig_verified_certs += messages.len() as u64;
     send_certs_to_pool(my_pubkey, messages, channel_to_pool, &mut stats.pool_sender)?;
 
     measure.stop();

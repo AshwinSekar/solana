@@ -491,7 +491,6 @@ dependencies = [
  "log",
  "parking_lot 0.12.3",
  "rand 0.9.4",
- "rayon",
  "serde",
  "serde_bytes",
  "smallvec",

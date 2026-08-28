@@ -46,7 +46,6 @@ crossbeam-channel = { workspace = true }
 itertools = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
-rayon = { workspace = true }
 serde = { workspace = true, optional = true }
 serde_bytes = { workspace = true, optional = true }
 smallvec = { workspace = true }

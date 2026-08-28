@@ -167,7 +167,7 @@ mod tests {
             rank: rank.try_into().unwrap(),
             stake,
         };
-        let aggregate = VoteAggregate::new_from_verified_vote(keypairs.len(), vote_msg);
+        let aggregate = VoteAggregate::new_from_verified_vote(keypairs.len(), vote_msg).unwrap();
         (aggregate, vec![Pubkey::new_unique()])
     }
 

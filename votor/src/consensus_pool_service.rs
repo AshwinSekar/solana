@@ -27,7 +27,6 @@ use {
         migration::MigrationStatus,
         sig_verified_messages::{SigVerifiedBatch, VoteAggregate},
         vote::Vote,
-        wire::VotePayloadToSign,
     },
     crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, select_biased},
     smallvec::SmallVec,
@@ -43,7 +42,7 @@ use {
     solana_validator_exit::Exit,
     stats::ConsensusPoolServiceStats,
     std::{
-        collections::{HashMap, HashSet},
+        collections::HashSet,
         sync::{
             Arc, RwLock,
             atomic::{AtomicBool, Ordering},
@@ -55,7 +54,6 @@ use {
 
 pub(crate) enum PoolVote {
     Own(VoteMessage),
-    #[allow(dead_code)]
     External(VoteAggregate),
 }
 
@@ -69,8 +67,7 @@ impl PoolVote {
 }
 
 pub(crate) enum PoolMessage {
-    OwnVotes(Vec<PoolVote>),
-    BlsVotes(HashMap<VotePayloadToSign, Vec<VoteAggregate>>),
+    Votes(Vec<PoolVote>),
     Certificates(Vec<Certificate>),
 }
 
@@ -569,7 +566,7 @@ impl ConsensusPoolService {
                 .take(ADDITIONAL_MESSAGES_PER_RECEIVE as usize),
         ) {
             own_votes_received = own_votes_received.saturating_add(1);
-            let pool_msg = PoolMessage::OwnVotes(vec![PoolVote::Own(msg)]);
+            let pool_msg = PoolMessage::Votes(vec![PoolVote::Own(msg)]);
             let root_bank = ctx.sharable_banks.root();
             let (new_finalized_slot, mut new_certs_to_send) = Self::add_pool_msg(
                 &root_bank,
@@ -658,7 +655,7 @@ impl ConsensusPoolService {
                 SigVerifiedBatch::Votes(votes) => {
                     stats.vote_aggregates_received += votes.len() as u64;
                     msgs_received = msgs_received.saturating_add(votes.len() as u64);
-                    PoolMessage::BlsVotes(votes)
+                    PoolMessage::Votes(votes.into_iter().map(PoolVote::External).collect())
                 }
                 SigVerifiedBatch::Certificates(certs) => {
                     stats.certs_received += certs.len() as u64;
@@ -873,9 +870,9 @@ mod tests {
                 stake,
             };
             let pool_msg = if my_rank == 0 {
-                PoolMessage::OwnVotes(vec![PoolVote::Own(vote_msg)])
+                PoolMessage::Votes(vec![PoolVote::Own(vote_msg)])
             } else {
-                PoolMessage::OwnVotes(vec![PoolVote::External(new_vote_aggregate(
+                PoolMessage::Votes(vec![PoolVote::External(new_vote_aggregate(
                     &root_bank, vote_msg,
                 ))])
             };

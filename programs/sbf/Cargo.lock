@@ -394,7 +394,6 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "parking_lot 0.12.2",
- "rayon",
  "smallvec",
  "solana-bls-signatures",
  "solana-clock",

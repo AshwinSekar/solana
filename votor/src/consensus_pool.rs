@@ -6,7 +6,7 @@ use {
             parent_ready_tracker::{ParentReady, ParentReadyTracker},
             slot_stake_counters::SlotStakeCounters,
             stats::ConsensusPoolStats,
-            vote_pool::VotePools,
+            vote_pool::VotePool,
         },
         consensus_pool_service::{PoolMessage, PoolVote},
         event::VotorEvent,
@@ -20,22 +20,15 @@ use {
         consensus_message::Block,
         finalized_slot::FinalizedSlot,
         migration::MigrationStatus,
-        sig_verified_messages::VoteAggregate,
-        vote::Vote,
-        wire::VotePayloadToSign,
     },
     log::trace,
-    rayon::iter::{IntoParallelIterator, ParallelIterator},
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_runtime::{
         bank::Bank, epoch_stakes::BLSPubkeyToRankMap,
         validated_block_finalization::ValidatedBlockFinalizationCert,
     },
-    std::{
-        collections::{BTreeMap, HashMap},
-        sync::Arc,
-    },
+    std::{collections::BTreeMap, sync::Arc},
     thiserror::Error,
 };
 
@@ -71,7 +64,7 @@ fn get_rank_map(bank: &Bank, slot: Slot) -> Result<&BLSPubkeyToRankMap, AddVoteE
 pub(crate) struct ConsensusPool {
     cluster_info: Arc<ClusterInfo>,
     // Vote pools to do bean counting for votes.
-    vote_pools: VotePools,
+    vote_pools: BTreeMap<Slot, VotePool>,
     /// Completed certificates
     completed_certificates: BTreeMap<CertificateType, Arc<Certificate>>,
     /// Set of certs that the pool has generated itself.  Used to inform the bls sigverifier so it
@@ -107,13 +100,12 @@ impl ConsensusPool {
         migration_status: Arc<MigrationStatus>,
         initial_parent_ready: ParentReady,
     ) -> Self {
-        let root_slot = root.slot();
         let parent_ready_tracker =
-            ParentReadyTracker::new(cluster_info.clone(), root_slot, initial_parent_ready);
+            ParentReadyTracker::new(cluster_info.clone(), root.slot(), initial_parent_ready);
 
         Self {
             cluster_info,
-            vote_pools: VotePools::new(root_slot),
+            vote_pools: BTreeMap::new(),
             completed_certificates: BTreeMap::new(),
             highest_finalized_slot_cert: None,
             parent_ready_tracker,
@@ -132,7 +124,10 @@ impl ConsensusPool {
         msg: &PoolVote,
     ) -> Result<(u64, Option<Certificate>), AddVoteError> {
         let slot = msg.vote().slot();
-        let pool = self.vote_pools.get_vote_pool(slot, rank_map.len());
+        let pool = self
+            .vote_pools
+            .entry(slot)
+            .or_insert_with(|| VotePool::new(rank_map.len()));
         pool.add_pool_vote(rank_map.total_stake(), msg, &self.completed_certificates)
             .map_err(AddVoteError::VotePoolAddVote)
     }
@@ -263,7 +258,7 @@ impl ConsensusPool {
     ) -> (Option<Slot>, Vec<Arc<Certificate>>) {
         let current_highest_finalized_slot = self.highest_finalized_slot();
         let new_certficates_to_send = match msg {
-            PoolMessage::OwnVotes(msgs) => {
+            PoolMessage::Votes(msgs) => {
                 let mut new_certs = vec![];
                 for msg in msgs {
                     let vote = *msg.vote();
@@ -284,7 +279,6 @@ impl ConsensusPool {
                 new_certs
             }
             PoolMessage::Certificates(certs) => self.add_certs(root_bank, certs, events),
-            PoolMessage::BlsVotes(votes) => self.add_bls_votes(root_bank, votes, events),
         };
         // If we have a new highest finalized slot, return it
         let new_finalized_slot = if self.highest_finalized_slot() > current_highest_finalized_slot {
@@ -296,88 +290,6 @@ impl ConsensusPool {
             new_finalized_slot.map(|s| s.slot()),
             new_certficates_to_send,
         )
-    }
-
-    fn add_bls_votes(
-        &mut self,
-        root_bank: &Bank,
-        votes_map: HashMap<VotePayloadToSign, Vec<VoteAggregate>>,
-        events: &mut Vec<VotorEvent>,
-    ) -> Vec<Arc<Certificate>> {
-        let vote_pools = votes_map
-            .keys()
-            .map(|v| {
-                let vote_slot = v.slot();
-                let rank_map = get_rank_map(root_bank, vote_slot).unwrap();
-                (
-                    v,
-                    rank_map.total_stake(),
-                    self.vote_pools.take_vote_pool(vote_slot, rank_map.len()),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let (map, certs) = vote_pools
-            .into_par_iter()
-            .fold(
-                || (HashMap::new(), vec![]),
-                |(mut entry_stake_hash_map, mut certs),
-                 (vote_payload_to_sign, total_stake, mut vote_pool)| {
-                    let votes = votes_map.get(vote_payload_to_sign).unwrap();
-                    let mut entry_stake = 0;
-                    for vote in votes {
-                        let pool_vote = PoolVote::External(vote.clone());
-                        let (stake, cert) = vote_pool
-                            .add_pool_vote(total_stake, &pool_vote, &self.completed_certificates)
-                            .unwrap();
-                        entry_stake = stake;
-                        if let Some(c) = cert {
-                            certs.push(c);
-                        }
-                    }
-                    entry_stake_hash_map
-                        .insert(*vote_payload_to_sign, (entry_stake, total_stake, vote_pool));
-                    (entry_stake_hash_map, certs)
-                },
-            )
-            .reduce(
-                || (HashMap::new(), vec![]),
-                |mut left, mut right| {
-                    left.0.extend(right.0);
-                    left.1.append(&mut right.1);
-                    left
-                },
-            );
-
-        for (vote_payload_to_sign, (entry_stake, total_stake, vote_pool)) in map {
-            let vote_slot = vote_payload_to_sign.slot();
-            self.vote_pools.return_vote_pool(vote_slot, vote_pool);
-            let fallback_vote_counters = self
-                .slot_stake_counters_map
-                .entry(vote_slot)
-                .or_insert_with(|| SlotStakeCounters::new(total_stake));
-            let vote = Vote::from(vote_payload_to_sign);
-
-            fallback_vote_counters.add_vote(
-                &vote,
-                entry_stake,
-                false,
-                events,
-                &mut self.pending_safe_to_notar,
-                &mut self.stats,
-            );
-        }
-
-        certs
-            .into_iter()
-            .map(|cert| {
-                let cert = Arc::new(cert);
-                self.insert_certificate(root_bank, cert.clone(), events);
-                self.generated_cert_types.insert_cert(cert.cert_type);
-                self.stats.incr_generated_cert(&cert.cert_type);
-                cert
-            })
-            .collect()
     }
 
     fn add_pool_vote(
@@ -614,7 +526,7 @@ impl ConsensusPool {
         self.completed_certificates
             .retain(|c, _| c.slot() >= root_slot);
         self.generated_cert_types.prune(root_slot);
-        self.vote_pools.prune(root_slot);
+        self.vote_pools = self.vote_pools.split_off(&root_slot);
         self.slot_stake_counters_map = self.slot_stake_counters_map.split_off(&root_slot);
         self.parent_ready_tracker.set_root(root_slot);
         self.pending_safe_to_notar
@@ -671,7 +583,8 @@ mod tests {
         },
         bitvec::vec::BitVec,
         solana_bls_signatures::{
-            BLS_SIGNATURE_AFFINE_SIZE, Signature as BLSSignature, keypair::Keypair as BLSKeypair,
+            BLS_SIGNATURE_AFFINE_SIZE, Signature as BLSSignature, VerifiableSignature,
+            keypair::Keypair as BLSKeypair,
         },
         solana_clock::Slot,
         solana_hash::Hash,
@@ -694,7 +607,7 @@ mod tests {
             .unwrap()
             .bls_pubkey_to_rank_map();
         let max_validators = rank_map.len();
-        VoteAggregate::new_from_verified_vote(max_validators, msg)
+        VoteAggregate::new_from_verified_vote(max_validators, msg).unwrap()
     }
 
     fn dummy_bitmap() -> Vec<u8> {
@@ -774,45 +687,44 @@ mod tests {
 
         fn add_batch(
             &mut self,
-            _batch: SigVerifiedBatch,
+            batch: SigVerifiedBatch,
         ) -> (Option<Slot>, Vec<Arc<Certificate>>, Vec<VotorEvent>) {
-            unimplemented!()
-            // let bank = self.bank_forks.read().unwrap().root_bank();
-            // let current_highest_finalized_slot = self.pool.highest_finalized_slot();
-            // let (new_certficates_to_send, events) = match batch {
-            //     SigVerifiedBatch::Votes(aggregates) => {
-            //         let mut new_certs = vec![];
-            //         let mut events = vec![];
-            //         for aggregate in aggregates {
-            //             let pool_vote = PoolVote::External(aggregate);
-            //             let cert = self
-            //                 .pool
-            //                 .add_pool_vote(&bank, pool_vote, &mut events)
-            //                 .unwrap();
-            //             if let Some(c) = cert {
-            //                 new_certs.push(c);
-            //             }
-            //         }
-            //         (new_certs, events)
-            //     }
-            //     SigVerifiedBatch::Certificates(certs) => {
-            //         let mut events = vec![];
-            //         let new_certs = self.pool.add_certs(&bank, certs, &mut events);
-            //         (new_certs, events)
-            //     }
-            // };
-            // // If we have a new highest finalized slot, return it
-            // let new_finalized_slot =
-            //     if self.pool.highest_finalized_slot() > current_highest_finalized_slot {
-            //         self.pool.highest_finalized_slot()
-            //     } else {
-            //         None
-            //     };
-            // (
-            //     new_finalized_slot.map(|s| s.slot()),
-            //     new_certficates_to_send,
-            //     events,
-            // )
+            let bank = self.bank_forks.read().unwrap().root_bank();
+            let current_highest_finalized_slot = self.pool.highest_finalized_slot();
+            let (new_certficates_to_send, events) = match batch {
+                SigVerifiedBatch::Votes(aggregates) => {
+                    let mut new_certs = vec![];
+                    let mut events = vec![];
+                    for aggregate in aggregates {
+                        let pool_vote = PoolVote::External(aggregate);
+                        let cert = self
+                            .pool
+                            .add_pool_vote(&bank, pool_vote, &mut events)
+                            .unwrap();
+                        if let Some(c) = cert {
+                            new_certs.push(c);
+                        }
+                    }
+                    (new_certs, events)
+                }
+                SigVerifiedBatch::Certificates(certs) => {
+                    let mut events = vec![];
+                    let new_certs = self.pool.add_certs(&bank, certs, &mut events);
+                    (new_certs, events)
+                }
+            };
+            // If we have a new highest finalized slot, return it
+            let new_finalized_slot =
+                if self.pool.highest_finalized_slot() > current_highest_finalized_slot {
+                    self.pool.highest_finalized_slot()
+                } else {
+                    None
+                };
+            (
+                new_finalized_slot.map(|s| s.slot()),
+                new_certficates_to_send,
+                events,
+            )
         }
 
         fn new_vote_msg(&self, rank: usize, vote: Vote) -> VoteMessage {
@@ -844,7 +756,7 @@ mod tests {
         }
 
         fn add_own_vote_msg(&mut self, rank: usize, vote: Vote) -> Vec<VotorEvent> {
-            let msg = PoolMessage::OwnVotes(vec![PoolVote::Own(self.new_vote_msg(rank, vote))]);
+            let msg = PoolMessage::Votes(vec![PoolVote::Own(self.new_vote_msg(rank, vote))]);
             let root_bank = self.bank_forks.read().unwrap().root_bank();
             let mut events = vec![];
             self.pool.add_pool_msg(&root_bank, msg, &mut events);
@@ -853,20 +765,19 @@ mod tests {
     }
 
     fn new_vote_aggregate_batch(
-        _bank: &Bank,
-        _keypairs: &[ValidatorVoteKeypairs],
-        _shred_version: u16,
-        _vote: &Vote,
-        _rank: usize,
+        bank: &Bank,
+        keypairs: &[ValidatorVoteKeypairs],
+        shred_version: u16,
+        vote: &Vote,
+        rank: usize,
     ) -> SigVerifiedBatch {
-        unimplemented!()
-        // SigVerifiedBatch::Votes(vec![new_vote_aggregate(
-        //     bank,
-        //     keypairs,
-        //     shred_version,
-        //     vote,
-        //     rank,
-        // )])
+        SigVerifiedBatch::Votes(vec![new_vote_aggregate(
+            bank,
+            keypairs,
+            shred_version,
+            vote,
+            rank,
+        )])
     }
 
     fn new_vote_aggregate(
@@ -2109,35 +2020,35 @@ mod tests {
         );
     }
 
-    // #[test]
-    // fn test_vote_message_signature_verification() {
-    //     let ctx = TestContext::new();
-    //     let bank = ctx.bank_forks.read().unwrap().root_bank();
-    //     let rank_to_test = 3;
-    //     let vote = Vote::new_unique_notar(42);
+    #[test]
+    fn test_vote_message_signature_verification() {
+        let ctx = TestContext::new();
+        let bank = ctx.bank_forks.read().unwrap().root_bank();
+        let rank_to_test = 3;
+        let vote = Vote::new_unique_notar(42);
 
-    //     let batch = new_vote_aggregate_batch(
-    //         &bank,
-    //         &ctx.validators,
-    //         ctx.pool.cluster_info.my_shred_version(),
-    //         &vote,
-    //         rank_to_test,
-    //     );
-    //     let SigVerifiedBatch::Votes(aggregates) = batch else {
-    //         panic!("Expected Vote message")
-    //     };
+        let batch = new_vote_aggregate_batch(
+            &bank,
+            &ctx.validators,
+            ctx.pool.cluster_info.my_shred_version(),
+            &vote,
+            rank_to_test,
+        );
+        let SigVerifiedBatch::Votes(aggregates) = batch else {
+            panic!("Expected Vote message")
+        };
 
-    //     let validator_vote_keypair = &ctx.validators[rank_to_test].vote_keypair;
-    //     let bls_keypair =
-    //         BLSKeypair::derive_from_signer(validator_vote_keypair, BLS_KEYPAIR_DERIVE_SEED)
-    //             .unwrap();
+        let validator_vote_keypair = &ctx.validators[rank_to_test].vote_keypair;
+        let bls_keypair =
+            BLSKeypair::derive_from_signer(validator_vote_keypair, BLS_KEYPAIR_DERIVE_SEED)
+                .unwrap();
 
-    //     let payload = get_vote_payload_to_sign(vote, ctx.pool.cluster_info.my_shred_version());
-    //     aggregates[0]
-    //         .signature()
-    //         .verify(&bls_keypair.public, &payload)
-    //         .expect("vote message signature should verify");
-    // }
+        let payload = get_vote_payload_to_sign(vote, ctx.pool.cluster_info.my_shred_version());
+        aggregates[0]
+            .signature()
+            .verify(&bls_keypair.public, &payload)
+            .expect("vote message signature should verify");
+    }
 
     #[test]
     fn received_certs_do_not_set_generated_certs() {

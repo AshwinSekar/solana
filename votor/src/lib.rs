@@ -46,7 +46,7 @@ mod tests {
             .unwrap()
             .bls_pubkey_to_rank_map();
         let max_validators = rank_map.len();
-        VoteAggregate::new_from_verified_vote(max_validators, msg)
+        VoteAggregate::new_from_verified_vote(max_validators, msg).unwrap()
     }
 
     pub(crate) fn get_cluster_info(keypair: Keypair) -> Arc<ClusterInfo> {
