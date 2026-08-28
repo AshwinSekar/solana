@@ -151,7 +151,7 @@ fn verify_vote_batch(
 /// Verifies votes and sends the verified votes to the consensus pool; and sends the desired subset
 /// to rewards container and repair.
 ///
-/// Any vote that fails fallback individual signature verification will have its sender banlisted.
+/// Any vote that fails individual signature verification will have its sender banlisted.
 pub(super) fn verify_and_send_votes(
     unverified_votes: HashMap<VotePayloadToSign, Vec<UnverifiedVotePayload>>,
     rank_map_cache: &HashMap<Epoch, Arc<BLSPubkeyToRankMap>>,
@@ -338,6 +338,37 @@ fn verify_votes(
     thread_pool: &ThreadPool,
 ) -> (Vec<VerifiedVotePayload>, VoteVerificationStats) {
     let mut stats = VoteVerificationStats::default();
+
+    // The outer payload map is already processed in parallel. Avoid the projective signature and
+    // pubkey aggregation, nested Rayon join, and affine conversion for the common singleton case.
+    if unverified_votes.len() == 1 {
+        let ((verification_result, sender_identity_pubkey), time_us) = measure_us!({
+            let serialized_vote = wincode::serialize(&vote_payload_to_sign).unwrap();
+            let prepared_hash_msg = PreparedHashedMessage::new(&serialized_vote);
+            let unverified_vote = unverified_votes
+                .into_iter()
+                .next()
+                .expect("singleton vote group must contain one vote");
+            let sender_identity_pubkey = unverified_vote.sender_identity_pubkey;
+            (
+                unverified_vote.verify(max_validators, &prepared_hash_msg),
+                sender_identity_pubkey,
+            )
+        });
+        stats.fn_verify_singleton_vote_stats.add_sample(time_us);
+        return match verification_result {
+            Ok(verified_vote) => {
+                stats.singleton_verification_succeeded += 1;
+                (vec![verified_vote], stats)
+            }
+            Err(error) => {
+                stats.singleton_verification_failed += 1;
+                ban_invalid_vote_sender(ban_sender, &mut stats, sender_identity_pubkey, error);
+                (Vec::new(), stats)
+            }
+        };
+    }
+
     // Try optimistic verification - fast to verify, but cannot identify invalid votes
     let res = verify_votes_optimistic(
         vote_payload_to_sign,
@@ -382,17 +413,26 @@ fn verify_votes(
                 ));
             stats.num_individual_verified += verified_votes.len() as u64;
             for (sender_identity_pubkey, error) in invalid_remote_pubkeys {
-                stats.banning_validator += 1;
-                ban_sender.ban(sender_identity_pubkey, BAN_TIMEOUT);
-                info!(
-                    "bls_vote_sigverify: banned sender={sender_identity_pubkey} due to failed \
-                     verification {error:?}"
-                );
+                ban_invalid_vote_sender(ban_sender, &mut stats, sender_identity_pubkey, error);
             }
             stats.fn_verify_individual_votes_stats.add_sample(time_us);
             (verified_votes, stats)
         }
     }
+}
+
+fn ban_invalid_vote_sender(
+    ban_sender: &BanSender,
+    stats: &mut VoteVerificationStats,
+    sender_identity_pubkey: Pubkey,
+    error: BlsError,
+) {
+    stats.banning_validator += 1;
+    ban_sender.ban(sender_identity_pubkey, BAN_TIMEOUT);
+    info!(
+        "bls_vote_sigverify: banned sender={sender_identity_pubkey} due to failed verification \
+         {error:?}"
+    );
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]

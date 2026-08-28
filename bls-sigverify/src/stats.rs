@@ -330,16 +330,22 @@ impl Default for SigVerifyCertStats {
 #[derive(Debug, Default)]
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 pub(super) struct VoteVerificationStats {
+    /// Number of singleton votes that passed direct verification.
+    pub(super) singleton_verification_succeeded: Saturating<u64>,
+    /// Number of singleton votes that failed direct verification.
+    pub(super) singleton_verification_failed: Saturating<u64>,
     /// Number of times optimistic verification succeeded
     pub(super) optimistic_verification_succeeded: Saturating<u64>,
     /// Number of times optimistic verification failed
     pub(super) optimistic_verification_failed: Saturating<u64>,
     /// Stats on how many votes were in the batch when it succeeded.
     pub(super) optimistic_batch: WelfordStats,
-    /// Number of votes that were individually verified.
+    /// Number of votes that passed fallback individual verification.
     pub(super) num_individual_verified: Saturating<u64>,
     /// Number of times we are banning a validator.
     pub(super) banning_validator: Saturating<u64>,
+    /// Stats for directly verifying singleton vote groups.
+    pub(super) fn_verify_singleton_vote_stats: WelfordStats,
     /// Stats for [`verify_votes_optimistic`].
     pub(super) fn_verify_votes_optimistic_stats: WelfordStats,
     /// Stats for [`verify_individual_votes`].
@@ -349,19 +355,26 @@ pub(super) struct VoteVerificationStats {
 impl VoteVerificationStats {
     pub(super) fn merge(&mut self, other: Self) {
         let Self {
+            singleton_verification_succeeded,
+            singleton_verification_failed,
             optimistic_verification_succeeded,
             optimistic_verification_failed,
             optimistic_batch,
             num_individual_verified,
             banning_validator,
+            fn_verify_singleton_vote_stats,
             fn_verify_votes_optimistic_stats,
             fn_verify_individual_votes_stats,
         } = other;
+        self.singleton_verification_succeeded += singleton_verification_succeeded;
+        self.singleton_verification_failed += singleton_verification_failed;
         self.optimistic_verification_succeeded += optimistic_verification_succeeded;
         self.optimistic_verification_failed += optimistic_verification_failed;
         self.optimistic_batch.merge(optimistic_batch);
         self.num_individual_verified += num_individual_verified;
         self.banning_validator += banning_validator;
+        self.fn_verify_singleton_vote_stats
+            .merge(fn_verify_singleton_vote_stats);
         self.fn_verify_votes_optimistic_stats
             .merge(fn_verify_votes_optimistic_stats);
         self.fn_verify_individual_votes_stats
@@ -370,16 +383,29 @@ impl VoteVerificationStats {
 
     pub(super) fn report(&self) {
         let Self {
+            singleton_verification_succeeded,
+            singleton_verification_failed,
             optimistic_verification_succeeded,
             optimistic_verification_failed,
             optimistic_batch,
             num_individual_verified,
             banning_validator,
+            fn_verify_singleton_vote_stats,
             fn_verify_votes_optimistic_stats,
             fn_verify_individual_votes_stats,
         } = self;
         datapoint_info!(
             "bls_vote_sigverify_verification_stats",
+            (
+                "singleton_verification_succeeded",
+                singleton_verification_succeeded.0,
+                i64
+            ),
+            (
+                "singleton_verification_failed",
+                singleton_verification_failed.0,
+                i64
+            ),
             (
                 "optimistic_verification_succeeded",
                 optimistic_verification_succeeded.0,
@@ -403,6 +429,16 @@ impl VoteVerificationStats {
             ),
             ("num_individual_verified", num_individual_verified.0, i64),
             ("banning_validator", banning_validator.0, i64),
+            (
+                "fn_verify_singleton_vote_count",
+                fn_verify_singleton_vote_stats.count(),
+                i64
+            ),
+            (
+                "fn_verify_singleton_vote_mean",
+                fn_verify_singleton_vote_stats.mean().unwrap_or(0),
+                i64
+            ),
             (
                 "fn_verify_votes_optimistic_count",
                 fn_verify_votes_optimistic_stats.count(),

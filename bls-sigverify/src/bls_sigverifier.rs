@@ -1100,6 +1100,124 @@ mod tests {
     }
 
     #[test]
+    fn test_blssigverifier_verify_singleton_vote_valid() {
+        let mut ctx = TestContext::new();
+        let rank = 0;
+        let sender = ctx.validator_keypairs[rank].node_keypair.pubkey();
+        let vote_message = create_signed_vote_message(
+            &ctx.verifier.sharable_banks.root(),
+            &ctx.validator_keypairs,
+            ctx.verifier.cluster_info.my_shred_version(),
+            Vote::new_skip_vote(42),
+            rank,
+        );
+
+        ctx.verifier
+            .verify_and_send_datagrams(messages_to_datagrams(
+                &[(ConsensusMessage::Vote(vote_message), sender)],
+                ctx.verifier.cluster_info.my_shred_version(),
+            ))
+            .unwrap();
+
+        let batch = ctx.pool_receiver.try_recv().unwrap();
+        expect_no_receive(&ctx.pool_receiver);
+        match batch {
+            SigVerifiedBatch::Votes(aggregates) => {
+                assert_eq!(aggregates.len(), 1);
+                assert_eq!(aggregates[0].num_votes(), 1);
+                assert!(aggregates[0].ranks()[rank]);
+            }
+            rest => panic!("unexpected type: {rest:?}"),
+        }
+
+        let stats = &ctx.verifier.stats.vote_stats.vote_verification_stats;
+        assert_eq!(stats.singleton_verification_succeeded.0, 1);
+        assert_eq!(stats.singleton_verification_failed.0, 0);
+        assert_eq!(stats.fn_verify_singleton_vote_stats.count(), 1);
+        assert_eq!(stats.optimistic_verification_succeeded.0, 0);
+        assert_eq!(stats.optimistic_verification_failed.0, 0);
+        assert_eq!(stats.optimistic_batch.count(), 0);
+        assert_eq!(stats.fn_verify_votes_optimistic_stats.count(), 0);
+        assert!(ctx.banned_pubkeys().is_empty());
+    }
+
+    #[test]
+    fn test_blssigverifier_verify_singleton_vote_invalid_bans_sender() {
+        let mut ctx = TestContext::new();
+        let rank = 0;
+        let sender = ctx.validator_keypairs[rank].node_keypair.pubkey();
+        let vote = Vote::new_skip_vote(42);
+        let invalid_payload = get_vote_payload_to_sign(
+            Vote::new_skip_vote(99),
+            ctx.verifier.cluster_info.my_shred_version(),
+        );
+        let signature = ctx.validator_keypairs[rank]
+            .bls_keypair
+            .sign(&invalid_payload)
+            .into();
+        let vote_message = VoteMessage {
+            vote,
+            signature,
+            rank: rank as u16,
+            stake: NonZero::new(123).unwrap(),
+        };
+
+        ctx.verifier
+            .verify_and_send_datagrams(messages_to_datagrams(
+                &[(ConsensusMessage::Vote(vote_message), sender)],
+                ctx.verifier.cluster_info.my_shred_version(),
+            ))
+            .unwrap();
+
+        expect_no_receive(&ctx.pool_receiver);
+        let stats = &ctx.verifier.stats.vote_stats.vote_verification_stats;
+        assert_eq!(stats.singleton_verification_succeeded.0, 0);
+        assert_eq!(stats.singleton_verification_failed.0, 1);
+        assert_eq!(stats.fn_verify_singleton_vote_stats.count(), 1);
+        assert_eq!(stats.optimistic_verification_succeeded.0, 0);
+        assert_eq!(stats.optimistic_verification_failed.0, 0);
+        assert_eq!(stats.optimistic_batch.count(), 0);
+        assert_eq!(stats.fn_verify_votes_optimistic_stats.count(), 0);
+        assert_eq!(stats.fn_verify_individual_votes_stats.count(), 0);
+        assert_eq!(stats.banning_validator.0, 1);
+
+        let banned = ctx.banned_pubkeys();
+        assert_eq!(banned.len(), 1);
+        assert!(banned.contains(&sender));
+    }
+
+    #[test]
+    fn test_blssigverifier_verify_singleton_vote_malformed_signature_bans_sender() {
+        let mut ctx = TestContext::new();
+        let rank = 0;
+        let sender = ctx.validator_keypairs[rank].node_keypair.pubkey();
+        let vote_message = VoteMessage {
+            vote: Vote::new_skip_vote(42),
+            signature: Signature([0; BLS_SIGNATURE_AFFINE_SIZE]),
+            rank: rank as u16,
+            stake: NonZero::new(123).unwrap(),
+        };
+
+        ctx.verifier
+            .verify_and_send_datagrams(messages_to_datagrams(
+                &[(ConsensusMessage::Vote(vote_message), sender)],
+                ctx.verifier.cluster_info.my_shred_version(),
+            ))
+            .unwrap();
+
+        expect_no_receive(&ctx.pool_receiver);
+        let stats = &ctx.verifier.stats.vote_stats.vote_verification_stats;
+        assert_eq!(stats.singleton_verification_succeeded.0, 0);
+        assert_eq!(stats.singleton_verification_failed.0, 1);
+        assert_eq!(stats.fn_verify_singleton_vote_stats.count(), 1);
+        assert_eq!(stats.banning_validator.0, 1);
+
+        let banned = ctx.banned_pubkeys();
+        assert_eq!(banned.len(), 1);
+        assert!(banned.contains(&sender));
+    }
+
+    #[test]
     fn test_blssigverifier_verify_votes_all_valid() {
         let mut ctx = TestContext::new();
 
@@ -1142,7 +1260,7 @@ mod tests {
     fn test_blssigverifier_verify_votes_two_distinct_messages() {
         let mut ctx = TestContext::new();
 
-        let num_votes_group1 = 3;
+        let num_votes_group1 = 1;
         let num_votes_group2 = 4;
         let num_votes = num_votes_group1 + num_votes_group2;
         let mut packets = Vec::with_capacity(num_votes);
@@ -1223,6 +1341,13 @@ mod tests {
                 .unwrap(),
             2
         );
+        let verification_stats = &ctx.verifier.stats.vote_stats.vote_verification_stats;
+        assert_eq!(verification_stats.singleton_verification_succeeded.0, 1);
+        assert_eq!(verification_stats.singleton_verification_failed.0, 0);
+        assert_eq!(verification_stats.fn_verify_singleton_vote_stats.count(), 1);
+        assert_eq!(verification_stats.optimistic_verification_succeeded.0, 1);
+        assert_eq!(verification_stats.optimistic_verification_failed.0, 0);
+        assert_eq!(verification_stats.optimistic_batch.count(), 1);
     }
 
     #[test]
