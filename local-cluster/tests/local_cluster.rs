@@ -4,7 +4,6 @@ use {
         SnapshotArchiveKind, SnapshotInterval, paths as snapshot_paths,
         snapshot_archive_info::SnapshotArchiveInfoGetter, snapshot_config::SnapshotConfig,
     },
-    agave_votor_messages::migration::MIGRATION_SLOT_OFFSET,
     arc_swap::ArcSwap,
     assert_matches::assert_matches,
     crossbeam_channel::{Receiver, bounded},
@@ -6189,6 +6188,8 @@ fn test_alpenglow_basic_equivocation() {
     );
 }
 
+const TEST_MIGRATION_SLOT_OFFSET: Slot = 32;
+
 fn test_alpenglow_migration(
     num_nodes: usize,
     num_listeners: u64,
@@ -6220,7 +6221,7 @@ fn test_alpenglow_migration(
 
     // We want the epochs to be as short as possible to reduce test time without being flaky.
     let slots_per_epoch = 4 * MINIMUM_SLOTS_PER_EPOCH;
-    assert!(slots_per_epoch > MIGRATION_SLOT_OFFSET);
+    assert!(slots_per_epoch > TEST_MIGRATION_SLOT_OFFSET);
     let mut cluster_config = ClusterConfig {
         validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
         validator_keys: Some(keys.clone().into_iter().zip(iter::repeat(true)).collect()),
@@ -6228,6 +6229,7 @@ fn test_alpenglow_migration(
         num_listeners,
         slots_per_epoch,
         stakers_slot_offset: slots_per_epoch,
+        alpenglow_migration_slot_offset: Some(TEST_MIGRATION_SLOT_OFFSET),
         // So we don't have to wait so long
         skip_warmup_slots: false,
         ..ClusterConfig::default()
@@ -6272,7 +6274,7 @@ fn test_alpenglow_migration(
     }
 
     // The migration happens at a fixed offset from feature activation
-    let migration_slot = activation_slot + MIGRATION_SLOT_OFFSET;
+    let migration_slot = activation_slot + TEST_MIGRATION_SLOT_OFFSET;
     info!("Waiting for migration slot {migration_slot}");
 
     loop {

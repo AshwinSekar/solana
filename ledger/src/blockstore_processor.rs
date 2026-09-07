@@ -2552,6 +2552,8 @@ pub mod tests {
         trees::tr,
     };
 
+    const TEST_MIGRATION_SLOT_OFFSET: Slot = 32;
+
     /// Generate a dummy alpenglow genesis certificate
     fn genesis_certificate(block: Block) -> Arc<GenesisCert> {
         Arc::new(GenesisCert {
@@ -6139,12 +6141,18 @@ pub mod tests {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
-        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config(10_000);
+        genesis_utils::set_alpenglow_migration_slot_offset(
+            &mut genesis_config,
+            TEST_MIGRATION_SLOT_OFFSET,
+        );
         let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
         let bank0 = bank_forks.read().unwrap().get(0).unwrap();
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank0);
 
-        let migration_status = MigrationStatus::default();
+        let migration_status = bank_forks.read().unwrap().migration_status();
         let migration_slot = migration_status.record_feature_activation(0);
         let pre_migration_slot = migration_slot.checked_sub(1).unwrap();
         let child_slots = [pre_migration_slot, migration_slot, migration_slot + 1];
@@ -6194,6 +6202,10 @@ pub mod tests {
         } = create_genesis_config(10_000);
         let ticks_per_slot = 1;
         genesis_config.ticks_per_slot = ticks_per_slot;
+        genesis_utils::set_alpenglow_migration_slot_offset(
+            &mut genesis_config,
+            TEST_MIGRATION_SLOT_OFFSET,
+        );
         genesis_utils::activate_feature(&mut genesis_config, agave_feature_set::alpenglow::id());
 
         let (ledger_path, blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);

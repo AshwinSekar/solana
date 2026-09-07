@@ -47,6 +47,7 @@ use {
         genesis_utils::{
             GenesisConfigInfo, ValidatorVoteKeypairs,
             create_genesis_config_with_vote_accounts_and_cluster_type,
+            set_alpenglow_migration_slot_offset,
         },
     },
     solana_shred_version::compute_shred_version,
@@ -113,6 +114,8 @@ pub struct ClusterConfig {
     pub cluster_type: ClusterType,
     pub poh_config: PohConfig,
     pub additional_accounts: Vec<(Pubkey, AccountSharedData)>,
+    /// Optional Alpenglow migration slot offset to include in the genesis config.
+    pub alpenglow_migration_slot_offset: Option<Slot>,
     pub vote_use_quic: bool,
 }
 
@@ -150,6 +153,7 @@ impl Default for ClusterConfig {
             poh_config: PohConfig::default(),
             skip_warmup_slots: false,
             additional_accounts: vec![],
+            alpenglow_migration_slot_offset: None,
             vote_use_quic: DEFAULT_VOTE_USE_QUIC,
         }
     }
@@ -334,6 +338,9 @@ impl LocalCluster {
                 .drain(..)
                 .map(|(key, account)| (key, Account::from(account))),
         );
+        if let Some(migration_slot_offset) = config.alpenglow_migration_slot_offset {
+            set_alpenglow_migration_slot_offset(&mut genesis_config, migration_slot_offset);
+        }
         genesis_config.ticks_per_slot = config.ticks_per_slot;
         genesis_config.epoch_schedule = EpochSchedule::custom(
             config.slots_per_epoch,

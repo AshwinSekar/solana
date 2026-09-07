@@ -65,15 +65,10 @@ use {
     },
 };
 
-/// The slot offset post feature flag activation to begin the migration.
+/// The default slot offset post feature flag activation to begin the migration.
 /// Epoch boundaries induce heavy computation often resulting in forks. It's best to decouple the migration period
 /// from the boundary. We require that a root is made between the epoch boundary and this migration slot offset.
-#[cfg(not(feature = "dev-context-only-utils"))]
-pub const MIGRATION_SLOT_OFFSET: Slot = 5000;
-
-/// Small offset for tests
-#[cfg(feature = "dev-context-only-utils")]
-pub const MIGRATION_SLOT_OFFSET: Slot = 32;
+pub const DEFAULT_MIGRATION_SLOT_OFFSET: Slot = 5000;
 
 /// A marker for vote accounts' epoch credit to indicate migration from tower to alpenwlow
 pub const AG_MIGRATION_EPOCH_CREDIT: (Epoch, u64, u64) = (Epoch::MAX, u64::MAX, u64::MAX);
@@ -94,6 +89,16 @@ pub const GENESIS_VOTE_REFRESH: Duration = Duration::from_millis(400);
 pub static GENESIS_CERTIFICATE_ACCOUNT: LazyLock<Address> = LazyLock::new(|| {
     let (address, _) =
         Address::find_program_address(&[b"carlgration"], &agave_feature_set::alpenglow::id());
+    address
+});
+
+/// The off-curve account where a genesis-configured migration slot offset is stored as a
+/// little-endian [`Slot`].
+pub static MIGRATION_SLOT_OFFSET_ACCOUNT: LazyLock<Address> = LazyLock::new(|| {
+    let (address, _) = Address::find_program_address(
+        &[b"migration_slot_offset"],
+        &agave_feature_set::alpenglow::id(),
+    );
     address
 });
 
@@ -317,6 +322,9 @@ pub struct MigrationStatus {
     /// The current phase of the migration we are in
     phase: RwLock<MigrationPhase>,
 
+    /// The slot offset post feature flag activation to begin the migration.
+    migration_slot_offset: Slot,
+
     /// Used to notify threads that are waiting for Poh to be shutdown and alpenglow to be enabled
     migration_wait: (Mutex<bool>, Condvar),
 }
@@ -324,7 +332,10 @@ pub struct MigrationStatus {
 impl Default for MigrationStatus {
     /// Create an empty MigrationStatus corresponding to pre Alpenglow ff activation
     fn default() -> Self {
-        Self::new(MigrationPhase::PreFeatureActivation)
+        Self::new(
+            MigrationPhase::PreFeatureActivation,
+            DEFAULT_MIGRATION_SLOT_OFFSET,
+        )
     }
 }
 
@@ -341,13 +352,14 @@ macro_rules! dispatch {
 
 impl MigrationStatus {
     /// Create a new MigrationStatus with a default pubkey at the appropriate phase
-    fn new(phase: MigrationPhase) -> Self {
+    fn new(phase: MigrationPhase, migration_slot_offset: Slot) -> Self {
         let is_alpenglow_enabled = phase.is_alpenglow_enabled();
         Self {
             my_pubkey: RwLock::default(),
             shutdown_poh: AtomicBool::new(is_alpenglow_enabled),
             poh_service_started: AtomicBool::new(false),
             phase: RwLock::new(phase),
+            migration_slot_offset,
             migration_wait: (Mutex::new(is_alpenglow_enabled), Condvar::new()),
         }
     }
@@ -365,9 +377,12 @@ impl MigrationStatus {
                 bitmap: vec![],
             },
         };
-        Self::new(MigrationPhase::AlpenglowEnabled {
-            genesis_cert: Arc::new(genesis_certificate),
-        })
+        Self::new(
+            MigrationPhase::AlpenglowEnabled {
+                genesis_cert: Arc::new(genesis_certificate),
+            },
+            DEFAULT_MIGRATION_SLOT_OFFSET,
+        )
     }
 
     /// Enable alpenglow for testing code
@@ -392,6 +407,7 @@ impl MigrationStatus {
         ff_activation_slot: Option<Slot>,
         genesis_cert: Option<GenesisCert>,
         epoch_schedule: &EpochSchedule,
+        migration_slot_offset: Slot,
     ) -> Self {
         let phase = match (genesis_cert, ff_activation_slot) {
             (None, None) => {
@@ -401,7 +417,7 @@ impl MigrationStatus {
             (None, Some(activation_slot)) => {
                 // In the mixed migration epoch yet to enable alpenglow
                 MigrationPhase::Migration {
-                    migration_slot: activation_slot.saturating_add(MIGRATION_SLOT_OFFSET),
+                    migration_slot: activation_slot.saturating_add(migration_slot_offset),
                     genesis_block: None,
                     genesis_cert: None,
                 }
@@ -409,7 +425,7 @@ impl MigrationStatus {
             (Some(cert), Some(activation_slot)) => {
                 // Alpenglow is active, check if we're still in the mixed migration epoch
                 let migration_epoch =
-                    epoch_schedule.get_epoch(activation_slot.saturating_add(MIGRATION_SLOT_OFFSET));
+                    epoch_schedule.get_epoch(activation_slot.saturating_add(migration_slot_offset));
                 if root_epoch > migration_epoch {
                     MigrationPhase::FullAlpenglowEpoch {
                         full_alpenglow_epoch: migration_epoch.saturating_add(1),
@@ -427,7 +443,7 @@ impl MigrationStatus {
         };
 
         info!("Pre startup initializing alpenglow migration from root bank: {phase:?}");
-        Self::new(phase)
+        Self::new(phase, migration_slot_offset)
     }
 
     /// For use in logging, set the pubkey
@@ -481,7 +497,7 @@ impl MigrationStatus {
     pub fn record_feature_activation(&self, slot: Slot) -> Slot {
         let mut phase = self.phase.write().unwrap();
         assert!(matches!(*phase, MigrationPhase::PreFeatureActivation));
-        let migration_slot = slot.saturating_add(MIGRATION_SLOT_OFFSET);
+        let migration_slot = slot.saturating_add(self.migration_slot_offset);
         *phase = MigrationPhase::Migration {
             migration_slot,
             genesis_block: None,

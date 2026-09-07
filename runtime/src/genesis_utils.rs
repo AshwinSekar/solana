@@ -10,7 +10,7 @@ use {
     agave_votor_messages::{
         self,
         consensus_message::{BLS_KEYPAIR_DERIVE_SEED, Block},
-        migration::GENESIS_CERTIFICATE_ACCOUNT,
+        migration::{GENESIS_CERTIFICATE_ACCOUNT, MIGRATION_SLOT_OFFSET_ACCOUNT},
         wire::{WireBlockCertMessage, WireCertSignature},
     },
     bincode::serialize,
@@ -23,7 +23,7 @@ use {
         BLS_SIGNATURE_AFFINE_SIZE, Pubkey as BLSPubkey, Signature as BLSSignature,
         keypair::Keypair as BLSKeypair, pubkey::PubkeyCompressed as BLSPubkeyCompressed,
     },
-    solana_clock::Epoch,
+    solana_clock::{Epoch, Slot},
     solana_cluster_type::ClusterType,
     solana_config_interface::state::ConfigKeys,
     solana_feature_gate_interface::{self as feature, Feature},
@@ -335,6 +335,20 @@ pub fn activate_all_features_alpenglow(genesis_config: &mut GenesisConfig) {
 pub fn activate_alpenglow_at_genesis(genesis_config: &mut GenesisConfig) {
     activate_feature(genesis_config, agave_feature_set::alpenglow::id());
     configure_alpenglow_at_genesis(genesis_config);
+}
+
+/// Stores the Alpenglow migration slot offset in the genesis accounts.
+pub fn set_alpenglow_migration_slot_offset(
+    genesis_config: &mut GenesisConfig,
+    migration_slot_offset: Slot,
+) {
+    let data = migration_slot_offset.to_le_bytes();
+    let lamports = genesis_config.rent.minimum_balance(data.len()).max(1);
+    let mut account = Account::new(lamports, data.len(), &system_program::ID);
+    account.data = data.to_vec();
+    genesis_config
+        .accounts
+        .insert(*MIGRATION_SLOT_OFFSET_ACCOUNT, account);
 }
 
 fn configure_alpenglow_at_genesis(genesis_config: &mut GenesisConfig) {

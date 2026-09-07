@@ -9,9 +9,12 @@ use {
         snapshot_controller::SnapshotController,
     },
     agave_feature_set,
-    agave_votor_messages::migration::MigrationStatus,
+    agave_votor_messages::migration::{
+        DEFAULT_MIGRATION_SLOT_OFFSET, MIGRATION_SLOT_OFFSET_ACCOUNT, MigrationStatus,
+    },
     arc_swap::ArcSwap,
     log::*,
+    solana_account::ReadableAccount,
     solana_clock::{BankId, Slot},
     solana_hash::Hash,
     solana_measure::measure::Measure,
@@ -152,8 +155,22 @@ impl BankForks {
             .feature_set
             .activated_slot(&agave_feature_set::alpenglow::id());
         let genesis_cert = root_bank.get_alpenglow_genesis_certificate();
+        let migration_slot_offset = root_bank
+            .get_account(&MIGRATION_SLOT_OFFSET_ACCOUNT)
+            .filter(|account| {
+                account.owner() == &solana_sdk_ids::system_program::ID && !account.executable()
+            })
+            .and_then(|account| account.data().try_into().ok())
+            .map(Slot::from_le_bytes)
+            .unwrap_or(DEFAULT_MIGRATION_SLOT_OFFSET);
 
-        MigrationStatus::initialize(root_epoch, ff_activation_slot, genesis_cert, epoch_schedule)
+        MigrationStatus::initialize(
+            root_epoch,
+            ff_activation_slot,
+            genesis_cert,
+            epoch_schedule,
+            migration_slot_offset,
+        )
     }
 
     pub fn banks(&self) -> &HashMap<Slot, BankWithScheduler> {
@@ -775,6 +792,7 @@ mod tests {
             block_component_processor::vote_reward::epoch_inflation_account_state::EpochInflationAccountState,
             genesis_utils::{
                 GenesisConfigInfo, create_genesis_config, create_genesis_config_with_leader,
+                set_alpenglow_migration_slot_offset,
             },
             installed_scheduler_pool::{
                 InstalledScheduler, ResultWithTimings, ScheduleResult, SchedulerId,
@@ -786,7 +804,7 @@ mod tests {
         agave_votor_messages::{
             certificate::{CertSignature, GenesisCert},
             consensus_message::Block,
-            migration::{GENESIS_CERTIFICATE_ACCOUNT, MIGRATION_SLOT_OFFSET},
+            migration::GENESIS_CERTIFICATE_ACCOUNT,
             wire::{WireBlockCertMessage, WireCertSignature},
         },
         assert_matches::assert_matches,
@@ -984,11 +1002,16 @@ mod tests {
         root_slot: Slot,
         ff_activation_slot: Option<Slot>,
         genesis_cert: Option<GenesisCert>,
+        migration_slot_offset: Option<Slot>,
     ) -> Bank {
         let GenesisConfigInfo {
             mut genesis_config, ..
         } = create_genesis_config(10_000);
         genesis_config.epoch_schedule = EpochSchedule::new(32);
+
+        if let Some(migration_slot_offset) = migration_slot_offset {
+            set_alpenglow_migration_slot_offset(&mut genesis_config, migration_slot_offset);
+        }
 
         if let Some(genesis_cert) = genesis_cert {
             let cert = WireBlockCertMessage {
@@ -1042,22 +1065,45 @@ mod tests {
             },
         };
 
-        let root_bank = make_root_bank_for_migration_status_test(0, None, None);
+        let root_bank = make_root_bank_for_migration_status_test(0, None, None, None);
         let migration_status = BankForks::initialize_migration_status(&root_bank);
         assert!(migration_status.is_pre_feature_activation());
 
-        let root_bank = make_root_bank_for_migration_status_test(0, Some(ff_activation_slot), None);
+        let root_bank =
+            make_root_bank_for_migration_status_test(0, Some(ff_activation_slot), None, None);
         let migration_status = BankForks::initialize_migration_status(&root_bank);
         assert!(migration_status.is_in_migration());
         assert_eq!(
             migration_status.migration_slot(),
-            Some(ff_activation_slot + MIGRATION_SLOT_OFFSET)
+            Some(ff_activation_slot + DEFAULT_MIGRATION_SLOT_OFFSET)
+        );
+
+        let migration_slot_offset = 32;
+        let root_bank =
+            make_root_bank_for_migration_status_test(0, None, None, Some(migration_slot_offset));
+        let migration_status = BankForks::initialize_migration_status(&root_bank);
+        assert_eq!(
+            migration_status.record_feature_activation(ff_activation_slot),
+            ff_activation_slot + migration_slot_offset
+        );
+
+        let root_bank = make_root_bank_for_migration_status_test(
+            0,
+            Some(ff_activation_slot),
+            None,
+            Some(migration_slot_offset),
+        );
+        let migration_status = BankForks::initialize_migration_status(&root_bank);
+        assert_eq!(
+            migration_status.migration_slot(),
+            Some(ff_activation_slot + migration_slot_offset)
         );
 
         let root_bank = make_root_bank_for_migration_status_test(
             10,
             Some(ff_activation_slot),
             Some(genesis_cert.clone()),
+            Some(migration_slot_offset),
         );
         assert_eq!(
             root_bank.get_alpenglow_genesis_certificate().unwrap(),
@@ -1068,9 +1114,10 @@ mod tests {
         assert!(!migration_status.is_full_alpenglow_epoch());
 
         let root_bank = make_root_bank_for_migration_status_test(
-            ff_activation_slot + MIGRATION_SLOT_OFFSET,
+            ff_activation_slot + migration_slot_offset,
             Some(ff_activation_slot),
             Some(genesis_cert.clone()),
+            Some(migration_slot_offset),
         );
         let migration_status = BankForks::initialize_migration_status(&root_bank);
         assert!(migration_status.is_alpenglow_enabled());
@@ -1080,6 +1127,7 @@ mod tests {
             64,
             Some(ff_activation_slot),
             Some(genesis_cert),
+            Some(migration_slot_offset),
         );
         assert!(root_bank.get_alpenglow_genesis_certificate().is_some());
         let migration_status = BankForks::initialize_migration_status(&root_bank);
