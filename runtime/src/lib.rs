@@ -58,6 +58,12 @@ pub mod validated_block_finalization;
 pub mod validated_reward_certificate;
 pub mod vote_sender_types;
 
+/// Returns whether this crate was built with development-only utilities enabled.
+#[inline]
+pub fn dev_context_only_utils_enabled() -> bool {
+    cfg!(feature = "dev-context-only-utils")
+}
+
 #[macro_use]
 extern crate solana_metrics;
 

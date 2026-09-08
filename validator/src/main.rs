@@ -15,6 +15,11 @@ use {
 static GLOBAL: Jemalloc = Jemalloc;
 
 pub fn main() {
+    assert!(
+        !solana_runtime::dev_context_only_utils_enabled(),
+        "agave-validator was built with `dev-context-only-utils` enabled; refusing to start, please use scripts/cargo-install-all.sh to properly build the binary"
+    );
+
     let default_args = DefaultArgs::new();
     let solana_version = solana_version::version!();
     let cli_app = app(solana_version, &default_args);
