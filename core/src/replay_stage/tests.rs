@@ -756,7 +756,10 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
     // A root replay didn't apply is never published to the commitment cache.
     assert!(votor_commitment_receiver.is_empty());
 
-    let block_id = bank_forks.read().unwrap().block_id(1).unwrap();
+    let (block_id, bank_id) = {
+        let bank = bank_forks.read().unwrap().get(1).unwrap();
+        (bank.block_id().unwrap(), bank.bank_id())
+    };
     let matching_command = SetRootCommand {
         new_root: Block { slot: 1, block_id },
     };
@@ -773,6 +776,7 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
         CommitmentAggregationData {
             commitment_type: CommitmentType::Rooted,
             slot: 1,
+            bank_id,
         }
     );
     assert!(votor_commitment_receiver.is_empty());

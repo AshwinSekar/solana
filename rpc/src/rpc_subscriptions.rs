@@ -2554,6 +2554,7 @@ pub(crate) mod tests {
                 slot: bank1.slot(),
                 ..CommitmentSlots::default()
             },
+            bank1.bank_id(),
         );
 
         let exit = Arc::new(AtomicBool::new(false));
