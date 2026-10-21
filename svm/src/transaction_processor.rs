@@ -182,7 +182,7 @@ pub fn get_mock_transaction_processing_environment() -> TransactionProcessingEnv
     TransactionProcessingEnvironment {
         blockhash: Hash::default(),
         blockhash_lamports_per_signature: 0,
-        alpenglow_migration_succeeded: false,
+        alpenglow_migration_succeeded: true,
         epoch_total_stake: 0,
         feature_set: SVMFeatureSet::default(),
         program_runtime_environments: ProgramRuntimeEnvironments::mock(),

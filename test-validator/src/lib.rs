@@ -1538,7 +1538,6 @@ mod test {
         [
             agave_feature_set::deprecate_rewards_sysvar::id(),
             agave_feature_set::disable_fees_sysvar::id(),
-            agave_feature_set::alpenglow::id(),
             agave_feature_set::bls_pubkey_management_in_vote_account::id(),
             agave_feature_set::vote_account_initialize_v2::id(),
         ]

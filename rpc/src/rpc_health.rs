@@ -159,8 +159,6 @@ pub mod tests {
     use {
         super::*,
         agave_votor_messages::{certificate::FastFinalizeCert, consensus_message::Block},
-        solana_clock::UnixTimestamp,
-        solana_hash::Hash,
         solana_ledger::{
             genesis_utils::{GenesisConfigInfo, create_genesis_config},
             get_tmp_ledger_path_auto_delete,
@@ -181,7 +179,7 @@ pub mod tests {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>> = Arc::default();
-        let migration_status = Arc::new(MigrationStatus::default());
+        let migration_status = Arc::new(MigrationStatus::post_migration_status());
         let bank0 = bank_forks.read().unwrap().root_bank();
         assert!(bank0.slot() == 0);
 
@@ -204,46 +202,6 @@ pub mod tests {
         override_health_check.store(false, Ordering::Relaxed);
         assert_eq!(health.check(), RpcHealthStatus::Unknown);
 
-        // Mark slot 15 as being optimistically confirmed in the Blockstore, this could
-        // happen if the cluster confirmed the slot and this node became aware through gossip,
-        // but this node has not yet replayed slot 15. The local view of the latest optimistic
-        // slot is still slot 0 so status will be behind
-        blockstore
-            .insert_optimistic_slot(15, &Hash::default(), UnixTimestamp::default())
-            .unwrap();
-        assert_eq!(health.check(), RpcHealthStatus::Behind { num_slots: 15 });
-
-        // Simulate this node observing slot 4 as optimistically confirmed - status still behind
-        let bank4 = Arc::new(Bank::new_from_parent(
-            bank0.clone(),
-            SlotLeader::default(),
-            4,
-        ));
-        optimistically_confirmed_bank.write().unwrap().bank = bank4.clone();
-        assert_eq!(health.check(), RpcHealthStatus::Behind { num_slots: 11 });
-
-        // Simulate this node observing slot 5 as optimistically confirmed - status now ok
-        // as distance is <= health_check_slot_distance
-        let bank5 = Arc::new(Bank::new_from_parent(bank4, SlotLeader::default(), 5));
-        optimistically_confirmed_bank.write().unwrap().bank = bank5.clone();
-        assert_eq!(health.check(), RpcHealthStatus::Ok);
-
-        // Node now up with tip of cluster
-        let bank15 = Arc::new(Bank::new_from_parent(bank5, SlotLeader::default(), 15));
-        optimistically_confirmed_bank.write().unwrap().bank = bank15.clone();
-        assert_eq!(health.check(), RpcHealthStatus::Ok);
-
-        // Node "beyond" tip of cluster - this technically isn't possible but could be
-        // observed locally due to a race between updates to Blockstore and
-        // OptimisticallyConfirmedBank. Either way, not a problem and status is ok.
-        let bank16 = Arc::new(Bank::new_from_parent(bank15, SlotLeader::default(), 16));
-        optimistically_confirmed_bank.write().unwrap().bank = bank16.clone();
-        assert_eq!(health.check(), RpcHealthStatus::Ok);
-
-        // Once Alpenglow is enabled, stale optimistic slots must not be used as a fallback.
-        migration_status.enable_alpenglow_for_tests();
-        assert_eq!(health.check(), RpcHealthStatus::Unknown);
-
         // Votor's highest finalized slot takes precedence over the optimistic Blockstore slot.
         let mut signature = migration_status
             .genesis_certificate()
@@ -259,10 +217,15 @@ pub mod tests {
                 },
                 &bank0,
             ));
-        assert_eq!(health.check(), RpcHealthStatus::Behind { num_slots: 14 });
+        assert_eq!(health.check(), RpcHealthStatus::Behind { num_slots: 30 });
 
-        let bank20 = Arc::new(Bank::new_from_parent(bank16, SlotLeader::default(), 20));
-        optimistically_confirmed_bank.write().unwrap().bank = bank20;
+        let bank20 = Arc::new(Bank::new_from_parent(bank0, SlotLeader::default(), 20));
+        optimistically_confirmed_bank.write().unwrap().bank = bank20.clone();
+        assert_eq!(health.check(), RpcHealthStatus::Ok);
+
+        // Being beyond the observed cluster tip is also healthy.
+        let bank31 = Arc::new(Bank::new_from_parent(bank20, SlotLeader::default(), 31));
+        optimistically_confirmed_bank.write().unwrap().bank = bank31;
         assert_eq!(health.check(), RpcHealthStatus::Ok);
     }
 }

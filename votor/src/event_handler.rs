@@ -1205,7 +1205,7 @@ mod tests {
             event_sender,
             exit,
             Arc::default(),
-            Arc::new(MigrationStatus::default()),
+            Arc::new(MigrationStatus::post_migration_status()),
         )));
         let blockstore = Arc::new(
             Blockstore::open_with_options(

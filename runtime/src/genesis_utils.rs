@@ -157,23 +157,6 @@ pub fn create_genesis_config_with_vote_accounts(
     )
 }
 
-#[cfg(feature = "dev-context-only-utils")]
-pub fn create_genesis_config_with_tower_vote_accounts(
-    mint_lamports: u64,
-    voting_keypairs: &[impl Borrow<ValidatorVoteKeypairs>],
-    stakes: Vec<u64>,
-) -> GenesisConfigInfo {
-    let mut feature_set = FeatureSet::all_enabled();
-    feature_set.deactivate(&agave_feature_set::alpenglow::id());
-    create_genesis_config_with_vote_accounts_and_cluster_type(
-        mint_lamports,
-        voting_keypairs,
-        stakes,
-        ClusterType::Development,
-        feature_set,
-    )
-}
-
 pub fn create_genesis_config_with_vote_accounts_and_cluster_type(
     mint_lamports: u64,
     voting_keypairs: &[impl Borrow<ValidatorVoteKeypairs>],
@@ -277,24 +260,6 @@ pub fn create_genesis_config_with_leader(
         mint_lamports,
         validator_pubkey,
         validator_stake_lamports,
-    )
-}
-
-#[cfg(feature = "dev-context-only-utils")]
-pub fn create_genesis_config_with_tower_leader(
-    mint_lamports: u64,
-    validator_pubkey: &Pubkey,
-    validator_stake_lamports: u64,
-) -> GenesisConfigInfo {
-    let mint_keypair = Keypair::from_seed(&MINT_KEYPAIR_SEED).unwrap();
-    let mut feature_set = FeatureSet::all_enabled();
-    feature_set.deactivate(&agave_feature_set::alpenglow::id());
-    create_genesis_config_with_leader_with_mint_keypair_and_feature_set(
-        mint_keypair,
-        mint_lamports,
-        validator_pubkey,
-        validator_stake_lamports,
-        &feature_set,
     )
 }
 
@@ -757,24 +722,6 @@ mod tests {
         assert!(genesis_config.poh_config.hashes_per_tick.is_none());
     }
 
-    fn assert_tower_genesis(genesis_config: &GenesisConfig) {
-        assert!(
-            !genesis_config
-                .accounts
-                .contains_key(&agave_feature_set::alpenglow::id())
-        );
-        assert!(
-            genesis_config
-                .accounts
-                .contains_key(&agave_feature_set::alpenglow_fast_leader_handover::id())
-        );
-        assert!(
-            !genesis_config
-                .accounts
-                .contains_key(&GENESIS_CERTIFICATE_ACCOUNT)
-        );
-    }
-
     #[test]
     fn test_default_genesis_is_alpenglow() {
         assert_alpenglow_genesis(&create_genesis_config(1_000_000).genesis_config);
@@ -794,23 +741,5 @@ mod tests {
         let mut genesis_config = GenesisConfig::default();
         activate_all_features(&mut genesis_config);
         assert_alpenglow_genesis(&genesis_config);
-    }
-
-    #[test]
-    fn test_tower_genesis_helpers_disable_alpenglow() {
-        let validator = ValidatorVoteKeypairs::new_rand();
-        let vote_account_genesis =
-            create_genesis_config_with_tower_vote_accounts(1_000_000, &[validator], vec![1])
-                .genesis_config;
-        assert_tower_genesis(&vote_account_genesis);
-
-        let leader_genesis =
-            create_genesis_config_with_tower_leader(1_000_000, &Pubkey::new_unique(), 1)
-                .genesis_config;
-        assert_tower_genesis(&leader_genesis);
-
-        let mut activated_genesis = GenesisConfig::default();
-        activate_all_features_tower(&mut activated_genesis);
-        assert_tower_genesis(&activated_genesis);
     }
 }

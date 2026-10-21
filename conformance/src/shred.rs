@@ -123,9 +123,10 @@ pub fn execute_shred_parse(ctx: &ShredParseContext) -> ShredParseEffects {
     // Bank at the root slot: drives the filter/recovery slot bounds, verify_ticks
     // tick params, and the dup feature gate.
     // FD: resolver + sched config (shred_version, advance_slot_old(root_slot)).
-    let feature_set = FeatureSet::default();
+    let mut feature_set = FeatureSet::default();
+    feature_set.activate(&agave_feature_set::alpenglow::id(), 0);
     let bank = build_root_bank(root_slot, feature_set);
-    let migration = MigrationStatus::default();
+    let migration = MigrationStatus::post_migration_status();
 
     // Step 1: parse each shred; record whether it's a chained Merkle shred.
     // FD: fd_shred_parse + fd_shred_is_chained. should_discard_shred only gates accumulation.

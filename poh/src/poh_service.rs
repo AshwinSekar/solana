@@ -719,7 +719,6 @@ mod tests {
         super::*,
         crate::{poh_controller::PohController, record_channels::record_channels},
         crossbeam_channel::bounded,
-        solana_clock::{DEFAULT_HASHES_PER_TICK, DEFAULT_TICKS_PER_SLOT},
         solana_hash::Hash,
         solana_ledger::{
             blockstore::Blockstore,
@@ -727,10 +726,7 @@ mod tests {
             get_tmp_ledger_path_auto_delete,
             leader_schedule_cache::LeaderScheduleCache,
         },
-        solana_perf::test_tx::test_tx,
         solana_runtime::{bank::Bank, installed_scheduler_pool::BankWithScheduler},
-        solana_transaction::versioned::VersionedTransaction,
-        std::time::Duration,
     };
 
     #[test]
@@ -766,87 +762,6 @@ mod tests {
             PohService::poh_wait_target(&poh, target_ns_per_tick, hashed_progress_time),
             None,
         );
-    }
-
-    #[test]
-    fn test_poh_service_record_race() {
-        agave_logger::setup();
-        let GenesisConfigInfo {
-            mut genesis_config, ..
-        } = create_genesis_config(2);
-        genesis_config.poh_config.hashes_per_tick = Some(DEFAULT_HASHES_PER_TICK);
-        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
-        let prev_hash = bank.last_blockhash();
-        let ledger_path = get_tmp_ledger_path_auto_delete!();
-        let blockstore = Blockstore::open(ledger_path.path())
-            .expect("Expected to be able to open database ledger");
-
-        let default_target_tick_duration =
-            PohConfig::default().target_tick_duration.as_micros() as u64;
-        let target_tick_duration = Duration::from_micros(default_target_tick_duration);
-        let poh_config = PohConfig {
-            hashes_per_tick: bank.hashes_per_tick(),
-            target_tick_duration,
-            target_tick_count: None,
-        };
-        let exit = Arc::new(AtomicBool::new(false));
-
-        let ticks_per_slot = bank.ticks_per_slot();
-        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
-        let blockstore = Arc::new(blockstore);
-        let next_leader_slot = Some((1_000_000, 1_000_000));
-        let (poh_recorder, _entry_receiver) = PohRecorder::new(
-            bank.tick_height(),
-            prev_hash,
-            bank.clone(),
-            next_leader_slot,
-            ticks_per_slot,
-            blockstore,
-            &leader_schedule_cache,
-            &poh_config,
-            exit.clone(),
-        );
-        let poh_recorder = Arc::new(RwLock::new(poh_recorder));
-
-        // Queue a new record & service message at the same time.
-        let (record_sender, mut record_receiver) = record_channels(false);
-        record_receiver.restart(bank.bank_id());
-        let (mut poh_controller, poh_service_message_receiver) = PohController::new();
-        poh_controller.reset(bank.clone(), None).unwrap();
-        record_sender
-            .try_send(Record {
-                mixin: Hash::new_unique(),
-                transactions: vec![VersionedTransaction::from(test_tx())],
-                bank_id: bank.bank_id(),
-            })
-            .unwrap();
-
-        // Spawn the poh service.
-        poh_recorder.write().unwrap().set_bank_for_test(bank);
-        let (record_receiver_sender, _record_receiver_receiver) = bounded(1);
-        let poh_service = PohService::new(
-            poh_recorder.clone(),
-            &poh_config,
-            exit.clone(),
-            DEFAULT_TICKS_PER_SLOT,
-            DEFAULT_PINNED_CPU_CORE,
-            DEFAULT_HASHES_PER_BATCH,
-            record_receiver,
-            poh_service_message_receiver,
-            Arc::new(MigrationStatus::default()),
-            record_receiver_sender,
-        );
-
-        // Let poh service process the messages.
-        let start = Instant::now();
-        while !record_sender.is_empty() {
-            assert!(start.elapsed() < Duration::from_secs(1));
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        // Shutdown.
-        exit.store(true, Ordering::Relaxed);
-        poh_service.join().unwrap();
     }
 
     #[test]

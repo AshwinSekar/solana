@@ -900,7 +900,7 @@ pub mod test {
             bank_forks,
             StandardBroadcastRun::new(
                 0,
-                Arc::new(MigrationStatus::default()),
+                Arc::new(MigrationStatus::post_migration_status()),
                 votor_event_sender,
                 leader_schedule_cache,
             ),

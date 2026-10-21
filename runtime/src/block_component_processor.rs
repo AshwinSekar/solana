@@ -819,7 +819,7 @@ mod tests {
         crate::{
             bank::{Bank, SlotLeader},
             bank_forks::BankForks,
-            genesis_utils::{create_genesis_config, create_genesis_config_with_tower_leader},
+            genesis_utils::create_genesis_config,
         },
         agave_votor_messages::consensus_message::BlockId,
         bytes::Bytes,
@@ -831,10 +831,7 @@ mod tests {
         },
         solana_hash::Hash,
         solana_leader_schedule::NUM_CONSECUTIVE_LEADER_SLOTS,
-        std::{
-            assert_matches,
-            sync::{Arc, RwLock},
-        },
+        std::sync::{Arc, RwLock},
         test_case::test_case,
     };
 
@@ -842,12 +839,6 @@ mod tests {
 
     fn create_test_bank() -> (Arc<Bank>, Arc<RwLock<BankForks>>) {
         let genesis_config_info = create_genesis_config(10_000);
-        Bank::new_with_bank_forks_for_tests(&genesis_config_info.genesis_config)
-    }
-
-    fn create_test_bank_tower() -> (Arc<Bank>, Arc<RwLock<BankForks>>) {
-        let genesis_config_info =
-            create_genesis_config_with_tower_leader(10_000, &Pubkey::new_unique(), 0);
         Bank::new_with_bank_forks_for_tests(&genesis_config_info.genesis_config)
     }
 
@@ -873,110 +864,11 @@ mod tests {
         }
     }
 
-    fn post_migration_status_with_genesis_slot(genesis_slot: Slot) -> MigrationStatus {
-        let migration_status = MigrationStatus::default();
-        let migration_slot = migration_status.record_feature_activation(0);
-        assert!(genesis_slot < migration_slot);
-
-        let genesis_block = Block::new_unique(genesis_slot);
-        migration_status.set_genesis_block(genesis_block);
-        let cert = Arc::new(GenesisCert {
-            block: genesis_block,
-            signature: CertSignature {
-                signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
-                bitmap: vec![],
-            },
-        });
-        migration_status.set_genesis_certificate(cert);
-        migration_status.enable_alpenglow_during_startup();
-
-        migration_status
-    }
-
     fn processor_after_header() -> BlockComponentProcessor {
         BlockComponentProcessor {
             stage: BlockComponentStage::AcceptingGenesisOrEntries,
             ..BlockComponentProcessor::default()
         }
-    }
-
-    fn processor_after_footer() -> BlockComponentProcessor {
-        BlockComponentProcessor {
-            stage: BlockComponentStage::AcceptingAlpentick,
-            ..BlockComponentProcessor::default()
-        }
-    }
-
-    #[test]
-    fn test_first_alpenglow_block_requires_genesis_certificate_marker() {
-        let migration_status = post_migration_status_with_genesis_slot(1);
-        let processor = processor_after_footer();
-
-        let result = processor.on_final(&migration_status, 2, 1);
-        assert!(matches!(
-            result,
-            Err(BlockComponentProcessorError::MissingGenesisCertificateMarker)
-        ));
-    }
-
-    #[test]
-    fn test_first_alpenglow_block_with_genesis_certificate_marker_succeeds() {
-        let migration_status = post_migration_status_with_genesis_slot(1);
-        let (genesis_bank, bank_forks) = create_test_bank_tower();
-        let parent = create_child_bank(&bank_forks, &genesis_bank, 1);
-        let parent_block_id = BlockId::new_unique();
-        parent.set_block_id(Some(parent_block_id));
-        let bank = create_child_bank(&bank_forks, &parent, 2);
-        let genesis_marker = GenesisCertBlockMarker {
-            slot: parent.slot(),
-            block_id: parent_block_id,
-            bls_signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
-            bitmap: vec![],
-        };
-        let mut processor = processor_after_header();
-        bank.set_hashes_per_tick(Some(42));
-        assert!(bank.hashes_per_tick().is_some());
-
-        processor
-            .on_genesis_cert_block_marker_leader(bank.clone(), genesis_marker, &migration_status)
-            .unwrap();
-        assert!(bank.hashes_per_tick().is_none());
-        processor.stage = BlockComponentStage::Done;
-        assert!(processor.on_final(&migration_status, 2, 1).is_ok());
-    }
-
-    #[test]
-    fn test_genesis_certificate_marker_aborts_tower_bank_during_migration() {
-        let migration_status = MigrationStatus::default();
-        migration_status.record_feature_activation(0);
-        let (genesis_bank, bank_forks) = create_test_bank_tower();
-        let parent = create_child_bank(&bank_forks, &genesis_bank, 1);
-        let parent_block_id = BlockId::new_unique();
-        parent.set_block_id(Some(parent_block_id));
-        let bank = create_child_bank(&bank_forks, &parent, 2);
-        let genesis_marker = GenesisCertBlockMarker {
-            slot: parent.slot(),
-            block_id: parent_block_id,
-            bls_signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
-            bitmap: vec![],
-        };
-        let mut processor = processor_after_header();
-        bank.set_hashes_per_tick(Some(42));
-        let tower_hashes_per_tick = bank.hashes_per_tick();
-        assert!(tower_hashes_per_tick.is_some());
-
-        assert_matches!(
-            processor.on_genesis_cert_block_marker_leader(
-                bank.clone(),
-                genesis_marker,
-                &migration_status,
-            ),
-            Err(BlockComponentProcessorError::AlpenglowMigrationTransition)
-        );
-
-        assert!(migration_status.is_ready_to_enable());
-        assert_eq!(bank.hashes_per_tick(), tower_hashes_per_tick);
-        assert!(bank.get_alpenglow_genesis_certificate().is_some());
     }
 
     #[test]
@@ -1305,11 +1197,6 @@ mod tests {
         >;
 
         let post_migration = MigrationStatus::post_migration_status();
-        let pre_migration = MigrationStatus::default();
-        // Feature activated but migration not yet complete
-        let in_migration = MigrationStatus::default();
-        in_migration.record_feature_activation(0);
-
         let (parent, bank_forks) = create_test_bank();
         // First slot of a leader window so UpdateParent passes the window check
         let slot = NUM_CONSECUTIVE_LEADER_SLOTS.get() as Slot;
@@ -1459,33 +1346,6 @@ mod tests {
 
         #[rustfmt::skip]
         let cases: Vec<(&MigrationStatus, Vec<Step>, Result<(), E>)> = vec![
-            // - Pre migration
-            (&pre_migration, vec![entries(), tick(true)], Ok(())),
-            (&pre_migration, vec![entries(), tick(false)], Ok(())),
-            (&pre_migration, vec![tick(false)], Ok(())),
-            (&pre_migration, vec![tick(true), entries()], Ok(())),
-            (&pre_migration, vec![entries(), entries(), tick(false), tick(true)], Ok(())),
-            (&pre_migration, vec![header()], Err(E::BlockComponentPreMigration)),
-            (&pre_migration, vec![genesis_cert()], Err(E::BlockComponentPreMigration)),
-            (&pre_migration, vec![footer()], Err(E::BlockComponentPreMigration)),
-            (&pre_migration, vec![update_parent(false)], Err(E::BlockComponentPreMigration)),
-            (&pre_migration, vec![update_parent(true)], Err(E::BlockComponentPreMigration)),
-
-            // - In migration
-            // header and genesis cert are processed so a slow node can catch up,
-            // other markers are still rejected
-            (&in_migration, vec![entries(), tick(true)], Ok(())),
-            (&in_migration, vec![header()], Err(E::BlockComponentPreMigration)),
-            // genesis cert reaches the stage check instead of the migration gate
-            (&in_migration, vec![genesis_cert()], Err(E::MissingParentMarker)),
-            // header passes on_marker: the genesis cert reaches deep validation
-            (&in_migration, vec![header(), genesis_cert()], Err(E::GenesisCertificateInAlpenglowCluster)),
-            (&in_migration, vec![footer()], Err(E::BlockComponentPreMigration)),
-            (&in_migration, vec![update_parent(false)], Err(E::BlockComponentPreMigration)),
-            (&in_migration, vec![update_parent(true)], Err(E::BlockComponentPreMigration)),
-
-            // - Post migration
-
             // Valid block
             // a valid genesis cert block needs a parent slot != 0, covered by
             // test_first_alpenglow_block_with_genesis_certificate_marker_succeeds

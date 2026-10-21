@@ -85,11 +85,6 @@ pub struct RecordSender {
 }
 
 impl RecordSender {
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.sender.is_empty()
-    }
-
     pub fn try_send(&self, record: Record) -> Result<Option<usize>, RecordSenderError> {
         let num_transactions = record.transactions.len();
         assert!(num_transactions > 0);

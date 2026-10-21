@@ -957,7 +957,7 @@ mod test {
         let (votor_event_sender, _votor_event_receiver) = bounded(1024);
         let mut standard_broadcast_run = StandardBroadcastRun::new(
             0,
-            Arc::new(MigrationStatus::default()),
+            Arc::new(MigrationStatus::post_migration_status()),
             votor_event_sender,
             test_leader_schedule_cache(&bank),
         );
@@ -988,7 +988,7 @@ mod test {
         let bank = Bank::new_for_tests(&create_genesis_config(10_000).genesis_config);
         let mut run = StandardBroadcastRun::new(
             0,
-            Arc::new(MigrationStatus::default()),
+            Arc::new(MigrationStatus::post_migration_status()),
             votor_event_sender,
             test_leader_schedule_cache(&bank),
         );
@@ -1022,7 +1022,6 @@ mod test {
         assert!(shred.verify(&keypair.pubkey()));
     }
 
-    #[test_case(MigrationStatus::default(), 1 ; "pre_migration")]
     #[test_case(MigrationStatus::post_migration_status(), 2 ; "alpenglow_enabled")]
     fn test_slot_interrupt(migration_status: MigrationStatus, shred_multiplier: u64) {
         // Setup
@@ -1197,7 +1196,7 @@ mod test {
         let mut last_tick_height = bank.tick_height();
         let mut standard_broadcast_run = StandardBroadcastRun::new(
             0,
-            Arc::new(MigrationStatus::default()),
+            Arc::new(MigrationStatus::post_migration_status()),
             votor_event_sender,
             test_leader_schedule_cache(&bank),
         );
@@ -1272,7 +1271,7 @@ mod test {
         let (votor_event_sender, _votor_event_receiver) = bounded(1024);
         let mut standard_broadcast_run = StandardBroadcastRun::new(
             0,
-            Arc::new(MigrationStatus::default()),
+            Arc::new(MigrationStatus::post_migration_status()),
             votor_event_sender,
             test_leader_schedule_cache(&bank),
         );
@@ -1318,7 +1317,7 @@ mod test {
         let (votor_event_sender, _votor_event_receiver) = bounded(1024);
         let mut standard_broadcast_run = StandardBroadcastRun::new(
             0,
-            Arc::new(MigrationStatus::default()),
+            Arc::new(MigrationStatus::post_migration_status()),
             votor_event_sender,
             test_leader_schedule_cache(&bank1),
         );
@@ -1438,7 +1437,7 @@ mod test {
         let bank = Bank::new_for_tests(&create_genesis_config(10_000).genesis_config);
         let mut bs = StandardBroadcastRun::new(
             0,
-            Arc::new(MigrationStatus::default()),
+            Arc::new(MigrationStatus::post_migration_status()),
             votor_event_sender,
             test_leader_schedule_cache(&bank),
         );
