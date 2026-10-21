@@ -37,6 +37,9 @@ Release channels have their own copy of this changelog:
 * `agave-validator repair-shred-from-peer` now requires `--pubkey`, and the `repairShredFromPeer`
   admin RPC now requires `pubkey`. Sampling repair peers when no pubkey is given is no longer supported
   due to the Alpenglow migration. The request now returns an error if the peer has no valid repair socket.
+* Removed the obsolete TowerBFT-only validator startup arguments `--require-tower`,
+  `--vote-use-quic`, and `--no-wait-for-vote-to-start-leader`. The
+  `set-identity --require-tower` safety check remains available.
 
 #### Changes
 
@@ -45,10 +48,6 @@ Release channels have their own copy of this changelog:
 * The default full snapshot interval is now 200,000 slots.
 * XDP interface, address, and transmitter setup failures now report startup errors instead of
   panicking.
-
-#### Deprecations
-
-* `--vote-use-quic` is deprecated - it only applied to TowerBFT quic-vote path.
 
 ### CLI
 

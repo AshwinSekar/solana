@@ -11,20 +11,19 @@ pub(crate) mod tower_vote_state;
 pub mod tree_diff;
 pub mod vote_stake_tracker;
 
+#[cfg(any(test, feature = "dev-context-only-utils"))]
+use self::progress_map::LockoutIntervals;
 use {
     self::{
         heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
         latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
-        progress_map::{LockoutIntervals, ProgressMap},
+        progress_map::{LockoutInterval, ProgressMap},
         tower_storage::{SavedTower, SavedTowerVersions, TowerStorage},
         tower_vote_state::TowerVoteState,
         tower1_7_14::Tower1_7_14,
         tower1_14_11::Tower1_14_11,
     },
-    crate::{consensus::progress_map::LockoutInterval, replay_stage::DUPLICATE_THRESHOLD},
-    agave_votor_messages::{
-        consensus_message::BlockId, fraction::Fraction, migration::GENESIS_VOTE_THRESHOLD,
-    },
+    agave_votor_messages::consensus_message::BlockId,
     chrono::prelude::*,
     solana_clock::{Slot, UnixTimestamp},
     solana_hash::Hash,
@@ -35,7 +34,7 @@ use {
         blockstore::{self, Blockstore},
     },
     solana_pubkey::Pubkey,
-    solana_runtime::{bank::Bank, bank_forks::BankForks, commitment::VOTE_THRESHOLD_SIZE},
+    solana_runtime::{bank::Bank, commitment::VOTE_THRESHOLD_SIZE},
     solana_slot_history::{Check, SlotHistory},
     solana_vote::{vote_account::VoteAccountsHashMap, vote_transaction::VoteTransaction},
     solana_vote_program::{
@@ -46,8 +45,6 @@ use {
     std::{
         cmp::Ordering,
         collections::{HashMap, HashSet},
-        num::NonZeroU64,
-        ops::Deref,
     },
     thiserror::Error,
 };
@@ -160,21 +157,19 @@ impl SwitchForkDecision {
 const VOTE_THRESHOLD_DEPTH_SHALLOW: usize = 4;
 pub const VOTE_THRESHOLD_DEPTH: usize = 8;
 pub const SWITCH_FORK_THRESHOLD: f64 = 0.38;
+const DUPLICATE_LIVENESS_THRESHOLD: f64 = 0.1;
+pub const DUPLICATE_THRESHOLD: f64 = 1.0 - SWITCH_FORK_THRESHOLD - DUPLICATE_LIVENESS_THRESHOLD;
 
 pub type Result<T> = std::result::Result<T, TowerError>;
 
 pub type Stake = u64;
 pub type VotedStakes = HashMap<Slot, Stake, ahash::RandomState>;
-pub type PubkeyVotes = Vec<(Pubkey, Slot)>;
 
+#[cfg(any(test, feature = "dev-context-only-utils"))]
 pub(crate) struct ComputedBankState {
     pub voted_stakes: VotedStakes,
     pub total_stake: Stake,
     pub fork_stake: Stake,
-
-    /// For Alpenglow migration - a block in `N` is super OC when there is at least
-    /// 82% of stake voting for `N` in `N + 1`
-    pub parent_is_super_oc: bool,
 
     /// Flat list of intervals of lockouts of the form {voter, start, end}
     /// ([`crate::consensus::progress_map::LockoutInterval`]).
@@ -205,6 +200,9 @@ impl TowerVersions {
 }
 
 #[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
+// Tower storage is still consumed by validator administration until that configuration surface is
+// removed in its own PR. Keep decoding its persisted blockhash state in this focused replay split.
+#[allow(dead_code)]
 #[derive(PartialEq, Eq, Debug, Default, Clone, Copy)]
 pub(crate) enum BlockhashStatus {
     /// No vote since restart
@@ -378,40 +376,10 @@ impl Tower {
         }
     }
 
-    pub fn new_from_bankforks(
-        bank_forks: &BankForks,
-        node_pubkey: &Pubkey,
-        vote_account: &Pubkey,
-    ) -> Self {
-        let root_bank = bank_forks.root_bank();
-        let frozen_banks: Vec<_> = bank_forks
-            .frozen_banks()
-            .map(|(_slot, bank)| bank)
-            .collect();
-        let (_progress, heaviest_subtree_fork_choice) =
-            crate::replay_stage::ReplayStage::initialize_progress_and_fork_choice(
-                root_bank.deref(),
-                frozen_banks,
-                node_pubkey,
-                vote_account,
-                vec![],
-            );
-        let root = root_bank.slot();
-
-        let (best_slot, best_hash) = heaviest_subtree_fork_choice.best_overall_slot();
-        let heaviest_bank = bank_forks
-            .get_with_checked_hash((best_slot, best_hash))
-            .expect(
-                "The best overall slot must be one of `frozen_banks` which all exist in bank_forks",
-            );
-
-        Self::new(node_pubkey, vote_account, root, &heaviest_bank)
-    }
-
+    #[cfg(any(test, feature = "dev-context-only-utils"))]
     pub(crate) fn collect_vote_lockouts(
         vote_account_pubkey: &Pubkey,
         bank_slot: Slot,
-        parent_slot: Slot,
         root_slot: Slot,
         vote_accounts: &VoteAccountsHashMap,
         ancestors: &HashMap<Slot, HashSet<Slot>>,
@@ -423,7 +391,6 @@ impl Tower {
         vote_slots.reserve(total_slots);
         let mut voted_stakes =
             HashMap::with_capacity_and_hasher(total_slots, ahash::RandomState::default());
-        let mut super_oc_stake = 0;
         let mut total_stake = 0;
 
         let total_votes = vote_accounts
@@ -481,11 +448,6 @@ impl Tower {
                     get_frozen_hash(last_landed_voted_slot),
                     true,
                 );
-
-                // For migration - a block is super OC there are 82% of votes for slot N in N + 1
-                if last_landed_voted_slot == parent_slot {
-                    super_oc_stake += voted_stake;
-                }
             }
 
             vote_state.process_next_vote_slot(bank_slot);
@@ -546,10 +508,6 @@ impl Tower {
         }
 
         debug_assert!(total_stake > 0);
-        let parent_is_super_oc = bank_slot == parent_slot + 1
-            && Fraction::new(super_oc_stake, NonZeroU64::new(total_stake).unwrap())
-                >= GENESIS_VOTE_THRESHOLD;
-
         // TODO: populate_ancestor_voted_stakes only adds zeros. Comment why
         // that is necessary (if so).
         Self::populate_ancestor_voted_stakes(
@@ -579,7 +537,6 @@ impl Tower {
             voted_stakes,
             total_stake,
             fork_stake,
-            parent_is_super_oc,
             lockout_intervals,
             my_latest_landed_vote,
         }
@@ -598,24 +555,8 @@ impl Tower {
             .unwrap_or(false)
     }
 
-    pub(crate) fn is_slot_duplicate_confirmed(
-        &self,
-        slot: Slot,
-        voted_stakes: &VotedStakes,
-        total_stake: Stake,
-    ) -> bool {
-        voted_stakes
-            .get(&slot)
-            .map(|stake| (*stake as f64 / total_stake as f64) > DUPLICATE_THRESHOLD)
-            .unwrap_or(false)
-    }
-
     pub fn tower_slots(&self) -> Vec<Slot> {
         self.vote_state.tower()
-    }
-
-    pub(crate) fn last_vote_tx_blockhash(&self) -> BlockhashStatus {
-        self.last_vote_tx_blockhash
     }
 
     pub fn refresh_last_vote_timestamp(&mut self, heaviest_slot_on_same_fork: Slot) {
@@ -659,14 +600,6 @@ impl Tower {
 
     pub fn refresh_last_vote_tx_blockhash(&mut self, new_vote_tx_blockhash: Hash) {
         self.last_vote_tx_blockhash = BlockhashStatus::Blockhash(new_vote_tx_blockhash);
-    }
-
-    pub(crate) fn mark_last_vote_tx_blockhash_non_voting(&mut self) {
-        self.last_vote_tx_blockhash = BlockhashStatus::NonVoting;
-    }
-
-    pub(crate) fn mark_last_vote_tx_blockhash_hot_spare(&mut self) {
-        self.last_vote_tx_blockhash = BlockhashStatus::HotSpare;
     }
 
     pub fn last_voted_slot_in_bank(bank: &Bank, vote_account_pubkey: &Pubkey) -> Option<Slot> {
@@ -1415,6 +1348,7 @@ impl Tower {
     }
 
     /// Update lockouts for all the ancestors
+    #[cfg(any(test, feature = "dev-context-only-utils"))]
     pub(crate) fn populate_ancestor_voted_stakes(
         voted_stakes: &mut VotedStakes,
         vote_slots: impl IntoIterator<Item = Slot>,
@@ -1435,6 +1369,7 @@ impl Tower {
 
     /// Update stake for all the ancestors.
     /// Note, stake is the same for all the ancestor.
+    #[cfg(any(test, feature = "dev-context-only-utils"))]
     fn update_ancestor_voted_stakes(
         voted_stakes: &mut VotedStakes,
         voted_slot: Slot,
@@ -1852,10 +1787,10 @@ pub mod test {
         super::*,
         crate::{
             consensus::{
-                fork_choice::ForkChoice, heaviest_subtree_fork_choice::SlotHashKey,
+                fork_choice::{ForkChoice, HeaviestForkFailures},
+                heaviest_subtree_fork_choice::SlotHashKey,
                 tower_storage::FileTowerStorage,
             },
-            replay_stage::HeaviestForkFailures,
             vote_simulator::VoteSimulator,
         },
         itertools::Itertools,
@@ -2574,7 +2509,6 @@ pub mod test {
             &Pubkey::default(),
             1,
             0,
-            0,
             &accounts,
             &ancestors,
             |_| Some(Hash::default()),
@@ -2625,7 +2559,6 @@ pub mod test {
         } = Tower::collect_vote_lockouts(
             &Pubkey::default(),
             MAX_LOCKOUT_HISTORY as u64,
-            (MAX_LOCKOUT_HISTORY - 1) as Slot,
             0,
             &accounts,
             &ancestors,
@@ -2689,27 +2622,6 @@ pub mod test {
         let tower = Tower::new_for_tests(1, 0.67);
         let stakes = vec![(0, 2)].into_iter().collect();
         assert!(tower.is_slot_confirmed(0, &stakes, 2));
-    }
-
-    #[test]
-    fn test_is_slot_duplicate_confirmed_not_enough_stake_failure() {
-        let tower = Tower::new_for_tests(1, 0.67);
-        let stakes = vec![(0, 52)].into_iter().collect();
-        assert!(!tower.is_slot_duplicate_confirmed(0, &stakes, 100));
-    }
-
-    #[test]
-    fn test_is_slot_duplicate_confirmed_unknown_slot() {
-        let tower = Tower::new_for_tests(1, 0.67);
-        let stakes = HashMap::default();
-        assert!(!tower.is_slot_duplicate_confirmed(0, &stakes, 100));
-    }
-
-    #[test]
-    fn test_is_slot_duplicate_confirmed_pass() {
-        let tower = Tower::new_for_tests(1, 0.67);
-        let stakes = vec![(0, 53)].into_iter().collect();
-        assert!(tower.is_slot_duplicate_confirmed(0, &stakes, 100));
     }
 
     #[test]
@@ -2949,7 +2861,6 @@ pub mod test {
         } = Tower::collect_vote_lockouts(
             &Pubkey::default(),
             vote_to_evaluate,
-            vote_to_evaluate - 1,
             0,
             &accounts,
             &ancestors,
@@ -2974,7 +2885,6 @@ pub mod test {
         } = Tower::collect_vote_lockouts(
             &Pubkey::default(),
             vote_to_evaluate,
-            vote_to_evaluate - 1,
             0,
             &accounts,
             &ancestors,

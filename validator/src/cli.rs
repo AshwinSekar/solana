@@ -219,14 +219,6 @@ fn deprecated_arguments() -> Vec<DeprecatedArg> {
             .help("No-op; initial accounts cleaning is no longer performed"),
         usage_warning: "Initial accounts cleaning is no longer performed.",
     );
-    add_arg!(
-        // deprecated in v4.5.0
-        Arg::with_name("vote_use_quic")
-            .long("vote-use-quic")
-            .takes_value(true)
-            .help("No-op, towerBFT only concept"),
-        usage_warning: "TowerBFT-only argument.",
-    );
     res
 }
 

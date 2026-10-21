@@ -23,7 +23,6 @@ pub mod epoch_specs;
 pub mod fetch_stage;
 pub mod forwarding_stage;
 pub mod gen_keys;
-pub mod next_leader;
 pub mod optimistic_confirmation_verifier;
 pub mod repair;
 pub mod replay_stage;
@@ -43,11 +42,8 @@ pub mod tpu;
 mod tpu_entry_notifier;
 mod transaction_priority;
 pub mod tvu;
-pub mod unfrozen_gossip_verified_vote_hashes;
 pub mod validator;
 pub mod vote_simulator;
-pub mod voting_service;
-pub mod warm_quic_cache_service;
 pub mod window_service;
 
 #[macro_use]

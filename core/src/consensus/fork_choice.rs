@@ -1,12 +1,9 @@
 use {
     super::heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
-    crate::{
-        consensus::{
-            SWITCH_FORK_THRESHOLD, SwitchForkDecision, ThresholdDecision, Tower,
-            latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
-            progress_map::ProgressMap,
-        },
-        replay_stage::HeaviestForkFailures,
+    crate::consensus::{
+        SWITCH_FORK_THRESHOLD, SwitchForkDecision, ThresholdDecision, Tower,
+        latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
+        progress_map::ProgressMap,
     },
     solana_clock::Slot,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
@@ -15,6 +12,27 @@ use {
         sync::{Arc, RwLock},
     },
 };
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum HeaviestForkFailures {
+    LockedOut(u64),
+    FailedThreshold(
+        Slot,
+        /* vote depth */ u64,
+        /* Observed stake */ u64,
+        /* Total stake */ u64,
+    ),
+    FailedSwitchThreshold(
+        Slot,
+        /* Observed stake */ u64,
+        /* Total stake */ u64,
+    ),
+    NoPropagatedConfirmation(
+        Slot,
+        /* Observed stake */ u64,
+        /* Total stake */ u64,
+    ),
+}
 
 pub struct SelectVoteAndResetForkResult {
     pub vote_bank: Option<(Arc<Bank>, SwitchForkDecision)>,

@@ -842,6 +842,7 @@ fn apply_state_changes(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 pub(crate) fn check_slot_agrees_with_cluster(
     slot: Slot,
     root: Slot,
@@ -948,7 +949,7 @@ pub(crate) fn check_slot_agrees_with_cluster(
 mod test {
     use {
         super::*,
-        crate::{consensus::progress_map::ProgressMap, replay_stage::tests::setup_forks_from_tree},
+        crate::{consensus::progress_map::ProgressMap, vote_simulator::setup_forks_from_tree},
         crossbeam_channel::bounded,
         solana_runtime::bank_forks::BankForks,
         std::{

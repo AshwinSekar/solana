@@ -1,9 +1,8 @@
 use {
     crate::{
         banking_trace::BankingPacketSender,
-        consensus::vote_stake_tracker::VoteStakeTracker,
+        consensus::{DUPLICATE_THRESHOLD, vote_stake_tracker::VoteStakeTracker},
         optimistic_confirmation_verifier::OptimisticConfirmationVerifier,
-        replay_stage::DUPLICATE_THRESHOLD,
         result::{Error, Result},
         sigverify_stage::GossipSigVerifyHandle,
     },
@@ -93,10 +92,6 @@ pub struct SlotVoteTracker {
 }
 
 impl SlotVoteTracker {
-    pub(crate) fn get_voted_slot_updates(&mut self) -> Option<Vec<Pubkey>> {
-        self.voted_slot_updates.take()
-    }
-
     fn add_optimistic_vote(
         &mut self,
         hash: Hash,

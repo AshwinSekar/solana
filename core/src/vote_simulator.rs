@@ -1,24 +1,17 @@
 #![cfg(feature = "dev-context-only-utils")]
 use {
-    crate::{
-        cluster_info_vote_listener::VoteTracker,
-        cluster_slots_service::cluster_slots::ClusterSlots,
-        consensus::{
-            Tower,
-            fork_choice::{SelectVoteAndResetForkResult, select_vote_and_reset_forks},
-            heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
-            latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
-            progress_map::{ForkProgress, LockoutInterval, ProgressMap},
-            tower_vote_state::TowerVoteState,
+    crate::consensus::{
+        ComputedBankState, Tower,
+        fork_choice::{
+            ForkChoice, HeaviestForkFailures, SelectVoteAndResetForkResult,
+            select_vote_and_reset_forks,
         },
-        repair::cluster_slot_state_verifier::{
-            DuplicateConfirmedSlots, DuplicateSlotsTracker, EpochSlotsFrozenSlots,
-        },
-        replay_stage::{HeaviestForkFailures, ReplayStage, TowerBFTStructures},
-        unfrozen_gossip_verified_vote_hashes::UnfrozenGossipVerifiedVoteHashes,
+        heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
+        latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
+        progress_map::{ForkProgress, LockoutInterval, ProgressMap},
+        tower_vote_state::TowerVoteState,
     },
     agave_votor_messages::consensus_message::BlockId,
-    crossbeam_channel::bounded,
     solana_clock::Slot,
     solana_epoch_schedule::EpochSchedule,
     solana_hash::Hash,
@@ -34,13 +27,27 @@ use {
     },
     solana_signer::Signer,
     solana_vote::vote_transaction,
-    solana_vote_program::vote_state::{Lockout, TowerSync},
+    solana_vote_program::vote_state::{Lockout, MAX_LOCKOUT_HISTORY, TowerSync},
     std::{
         collections::{HashMap, HashSet, VecDeque},
         sync::{Arc, RwLock},
     },
     trees::{Tree, TreeWalk, tr},
 };
+#[cfg(test)]
+use {
+    solana_accounts_db::accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsDbConfig},
+    solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path},
+};
+
+/// Tower fork-choice state retained by the consensus test fixture.
+///
+/// The production replay stage no longer owns Tower state, but the repair and
+/// consensus tests built on `VoteSimulator` still exercise the legacy fork
+/// choice directly.
+pub struct VoteSimulatorForkChoice {
+    pub heaviest_subtree_fork_choice: HeaviestSubtreeForkChoice,
+}
 
 pub struct VoteSimulator {
     pub validator_keypairs: HashMap<Pubkey, ValidatorVoteKeypairs>,
@@ -49,7 +56,65 @@ pub struct VoteSimulator {
     pub bank_forks: Arc<RwLock<BankForks>>,
     pub progress: ProgressMap,
     pub latest_validator_votes_for_frozen_banks: LatestValidatorVotesForFrozenBanks,
-    pub tbft_structs: TowerBFTStructures,
+    pub tbft_structs: VoteSimulatorForkChoice,
+}
+
+#[cfg(test)]
+pub(crate) type GenerateVotes = Box<dyn Fn(Vec<Pubkey>) -> HashMap<Pubkey, Vec<Slot>>>;
+
+/// Tower-based bank-forks fixture retained for consensus and repair tests.
+#[cfg(test)]
+pub(crate) fn setup_forks_from_tree(
+    tree: Tree<Slot>,
+    num_keys: usize,
+    generate_votes: Option<GenerateVotes>,
+) -> (VoteSimulator, Blockstore) {
+    let ledger_path = get_tmp_ledger_path!();
+    let mut vote_simulator = VoteSimulator::new_with(
+        num_keys,
+        BankTestConfig {
+            accounts_db_config: AccountsDbConfig {
+                bank_hash_details_dir: ledger_path.clone(),
+                ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+            },
+        },
+    );
+    let pubkeys = vote_simulator
+        .validator_keypairs
+        .values()
+        .map(|keypairs| keypairs.node_keypair.pubkey())
+        .collect();
+    let cluster_votes = generate_votes
+        .map(|generate_votes| generate_votes(pubkeys))
+        .unwrap_or_default();
+    vote_simulator.fill_bank_forks(tree.clone(), &cluster_votes, true);
+    let blockstore = Blockstore::open(&ledger_path).unwrap();
+    blockstore.add_tree(tree, false, true, 2, Hash::default());
+    (vote_simulator, blockstore)
+}
+
+/// Shared components used by repair tests that still exercise Tower fork choice.
+#[cfg(test)]
+pub(crate) struct ReplayBlockstoreComponents {
+    pub(crate) blockstore: Arc<Blockstore>,
+    pub(crate) vote_simulator: VoteSimulator,
+}
+
+#[cfg(test)]
+pub(crate) fn replay_blockstore_components(
+    forks: Option<Tree<Slot>>,
+    num_validators: usize,
+    generate_votes: Option<GenerateVotes>,
+) -> ReplayBlockstoreComponents {
+    let (vote_simulator, blockstore) = setup_forks_from_tree(
+        forks.unwrap_or_else(|| tr(0)),
+        num_validators,
+        generate_votes,
+    );
+    ReplayBlockstoreComponents {
+        blockstore: Arc::new(blockstore),
+        vote_simulator,
+    }
 }
 
 impl VoteSimulator {
@@ -73,12 +138,8 @@ impl VoteSimulator {
             bank_forks,
             progress,
             latest_validator_votes_for_frozen_banks: LatestValidatorVotesForFrozenBanks::default(),
-            tbft_structs: TowerBFTStructures {
+            tbft_structs: VoteSimulatorForkChoice {
                 heaviest_subtree_fork_choice,
-                duplicate_slots_tracker: DuplicateSlotsTracker::default(),
-                duplicate_confirmed_slots: DuplicateConfirmedSlots::default(),
-                unfrozen_gossip_verified_vote_hashes: UnfrozenGossipVerifiedVoteHashes::default(),
-                epoch_slots_frozen_slots: EpochSlotsFrozenSlots::default(),
             },
         }
     }
@@ -194,22 +255,7 @@ impl VoteSimulator {
             .frozen_banks()
             .map(|(_slot, bank)| bank)
             .collect();
-        let mut vote_slots = HashSet::default();
-        let migration_status = self.bank_forks.read().unwrap().migration_status();
-        let _ = ReplayStage::compute_bank_stats(
-            my_pubkey,
-            &ancestors,
-            &mut frozen_banks,
-            tower,
-            &mut self.progress,
-            &VoteTracker::default(),
-            &ClusterSlots::default_for_tests(),
-            &self.bank_forks,
-            &mut self.tbft_structs.heaviest_subtree_fork_choice,
-            &mut self.latest_validator_votes_for_frozen_banks,
-            &mut vote_slots,
-            migration_status.as_ref(),
-        );
+        self.compute_bank_stats(my_pubkey, &ancestors, &mut frozen_banks, tower);
 
         let vote_bank = self
             .bank_forks
@@ -248,20 +294,187 @@ impl VoteSimulator {
         vec![]
     }
 
-    pub fn set_root(&mut self, my_pubkey: &Pubkey, new_root: Slot) {
-        let (drop_bank_sender, _drop_bank_receiver) = bounded(1024);
-        ReplayStage::handle_new_root(
-            my_pubkey,
-            new_root,
-            &self.bank_forks,
-            &mut self.progress,
-            None, // snapshot_controller
-            None,
-            &mut true,
-            &mut Vec::new(),
-            &drop_bank_sender,
-            &mut self.tbft_structs,
-        )
+    fn compute_bank_stats(
+        &mut self,
+        my_vote_pubkey: &Pubkey,
+        ancestors: &HashMap<Slot, HashSet<Slot>>,
+        frozen_banks: &mut [Arc<Bank>],
+        tower: &mut Tower,
+    ) {
+        frozen_banks.sort_by_key(|bank| bank.slot());
+        let mut vote_slots = HashSet::default();
+        for bank in frozen_banks.iter() {
+            let bank_slot = bank.slot();
+            let is_computed = self
+                .progress
+                .get_fork_stats_mut(bank_slot)
+                .expect("All frozen banks must exist in the Progress map")
+                .computed;
+            if !is_computed {
+                Self::adopt_on_chain_tower_if_behind(
+                    my_vote_pubkey,
+                    ancestors,
+                    frozen_banks,
+                    tower,
+                    &mut self.progress,
+                    bank,
+                    &self.bank_forks,
+                );
+
+                let root_slot = self.bank_forks.read().unwrap().root();
+                let computed_bank_state = Tower::collect_vote_lockouts(
+                    my_vote_pubkey,
+                    bank_slot,
+                    root_slot,
+                    &bank.vote_accounts(),
+                    ancestors,
+                    |slot| self.progress.get_hash(slot),
+                    &mut self.latest_validator_votes_for_frozen_banks,
+                    &mut vote_slots,
+                );
+                self.tbft_structs
+                    .heaviest_subtree_fork_choice
+                    .compute_bank_stats(
+                        bank,
+                        tower,
+                        &mut self.latest_validator_votes_for_frozen_banks,
+                    );
+
+                let ComputedBankState {
+                    voted_stakes,
+                    total_stake,
+                    fork_stake,
+                    lockout_intervals,
+                    my_latest_landed_vote,
+                    ..
+                } = computed_bank_state;
+                let stats = self
+                    .progress
+                    .get_fork_stats_mut(bank_slot)
+                    .expect("All frozen banks must exist in the Progress map");
+                stats.fork_stake = fork_stake;
+                stats.total_stake = total_stake;
+                stats.voted_stakes = voted_stakes;
+                stats.lockout_intervals = lockout_intervals;
+                stats.block_height = bank.block_height();
+                stats.my_latest_landed_vote = my_latest_landed_vote;
+                stats.computed = true;
+            }
+
+            Self::cache_tower_stats(&mut self.progress, tower, bank_slot, ancestors);
+        }
+
+        vote_slots.shrink_to(MAX_LOCKOUT_HISTORY + 1);
+    }
+
+    fn adopt_on_chain_tower_if_behind(
+        my_vote_pubkey: &Pubkey,
+        ancestors: &HashMap<Slot, HashSet<Slot>>,
+        frozen_banks: &[Arc<Bank>],
+        tower: &mut Tower,
+        progress: &mut ProgressMap,
+        bank: &Arc<Bank>,
+        bank_forks: &RwLock<BankForks>,
+    ) {
+        let Some(vote_account) = bank.get_vote_account(my_vote_pubkey) else {
+            return;
+        };
+        let mut bank_vote_state = TowerVoteState::from(vote_account.vote_state_view());
+        if bank_vote_state.last_voted_slot() <= tower.vote_state.last_voted_slot() {
+            return;
+        }
+
+        if let Some(local_root) = tower.vote_state.root_slot
+            && bank_vote_state
+                .root_slot
+                .map(|bank_root| local_root > bank_root)
+                .unwrap_or(true)
+        {
+            bank_vote_state.root_slot = Some(local_root);
+            bank_vote_state
+                .votes
+                .retain(|lockout| lockout.slot() > local_root);
+
+            if let Some(first_vote) = bank_vote_state.votes.front() {
+                assert!(
+                    ancestors
+                        .get(&first_vote.slot())
+                        .expect(
+                            "Ancestors map must contain an entry for all slots on this fork \
+                             greater than the local root and less than the bank slot",
+                        )
+                        .contains(&local_root)
+                );
+            }
+        }
+
+        tower.vote_state = bank_vote_state;
+        let last_voted_slot = tower.vote_state.last_voted_slot().unwrap_or_else(|| {
+            tower
+                .vote_state
+                .root_slot
+                .expect("root_slot cannot be None here")
+        });
+        let block_id = bank_forks
+            .read()
+            .unwrap()
+            .get(last_voted_slot)
+            .expect("Last voted slot that we are adopting must exist in bank forks")
+            .block_id()
+            .unwrap_or_default();
+        tower.update_last_vote_from_vote_state(
+            progress
+                .get_hash(last_voted_slot)
+                .expect("Must exist for us to have frozen descendant"),
+            block_id.to_hash(),
+        );
+
+        for slot in frozen_banks.iter().map(|bank| bank.slot()) {
+            if !progress
+                .get_fork_stats(slot)
+                .expect("All frozen banks must exist in fork stats")
+                .computed
+            {
+                continue;
+            }
+            Self::cache_tower_stats(progress, tower, slot, ancestors);
+        }
+    }
+
+    fn cache_tower_stats(
+        progress: &mut ProgressMap,
+        tower: &Tower,
+        slot: Slot,
+        ancestors: &HashMap<Slot, HashSet<Slot>>,
+    ) {
+        let stats = progress
+            .get_fork_stats_mut(slot)
+            .expect("All frozen banks must exist in the Progress map");
+        stats.vote_threshold =
+            tower.check_vote_stake_thresholds(slot, &stats.voted_stakes, stats.total_stake);
+        stats.is_locked_out = tower.is_locked_out(
+            slot,
+            ancestors
+                .get(&slot)
+                .expect("Ancestors map should contain slot for is_locked_out() check"),
+        );
+        stats.has_voted = tower.has_voted(slot);
+        stats.is_recent = tower.is_recent(slot);
+    }
+
+    pub fn set_root(&mut self, _my_pubkey: &Pubkey, new_root: Slot) {
+        let dropped_banks = self
+            .bank_forks
+            .write()
+            .unwrap()
+            .set_root(new_root, None, None);
+        drop(dropped_banks);
+
+        let bank_forks = self.bank_forks.read().unwrap();
+        self.progress.handle_new_root(&bank_forks);
+        self.tbft_structs
+            .heaviest_subtree_fork_choice
+            .set_tree_root((new_root, bank_forks.root_bank().hash()));
     }
 
     pub fn create_and_vote_new_branch(

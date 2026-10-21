@@ -44,7 +44,6 @@ use {
 };
 
 type DuplicateSlotSender = Sender<Slot>;
-pub(crate) type DuplicateSlotReceiver = Receiver<Slot>;
 
 #[derive(Default)]
 struct WindowServiceMetrics {

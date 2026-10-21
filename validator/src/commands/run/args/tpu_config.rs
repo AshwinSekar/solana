@@ -83,7 +83,6 @@ pub(crate) fn new_config(
     };
 
     Ok(ValidatorTpuConfig {
-        vote_use_quic: false,
         tpu_quic_server_config,
         tpu_fwd_quic_server_config,
         vote_quic_server_config,

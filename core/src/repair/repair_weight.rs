@@ -1,13 +1,15 @@
 use {
     crate::{
-        consensus::{heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice, tree_diff::TreeDiff},
+        consensus::{
+            DUPLICATE_THRESHOLD, heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
+            tree_diff::TreeDiff,
+        },
         repair::{
             repair_generic_traversal::{get_closest_completion, get_unknown_last_index},
             repair_service::{RepairEligibility, RepairMetrics, RepairService},
             repair_weighted_traversal,
             serve_repair::ShredRepairType,
         },
-        replay_stage::DUPLICATE_THRESHOLD,
     },
     ahash::{AHashMap, AHashSet},
     solana_clock::{Epoch, Slot},

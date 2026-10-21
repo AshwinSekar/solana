@@ -1,5 +1,7 @@
 pub mod ancestor_hashes_service;
 pub mod block_id_repair_service;
+// Tower replay was the only production caller; repair tests still exercise the state machine.
+#[cfg(feature = "dev-context-only-utils")]
 pub mod cluster_slot_state_verifier;
 pub mod duplicate_repair_status;
 #[cfg(feature = "dev-context-only-utils")]

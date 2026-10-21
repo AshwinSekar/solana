@@ -3,7 +3,6 @@ use {
         cluster_info_vote_listener::SlotVoteTracker,
         cluster_slots_service::slot_supporters::SlotSupporters,
         consensus::{Stake, ThresholdDecision, VotedStakes},
-        replay_stage::SUPERMINORITY_THRESHOLD,
     },
     solana_clock::Slot,
     solana_hash::Hash,
@@ -19,6 +18,8 @@ use {
         time::Instant,
     },
 };
+
+const SUPERMINORITY_THRESHOLD: f64 = 1f64 / 3f64;
 
 type VotedSlot = Slot;
 type ExpirationSlot = Slot;

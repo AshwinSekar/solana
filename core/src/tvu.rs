@@ -4,15 +4,13 @@
 use {
     crate::{
         admin_rpc_post_init::{KeyUpdaterType, KeyUpdaters},
-        banking_trace::BankingTracer,
         block_creation_loop::ReplayHighestFrozen,
         cluster_info_vote_listener::{
-            DuplicateConfirmedSlotsReceiver, GossipVerifiedVoteHashReceiver, VoteTracker,
+            DuplicateConfirmedSlotsReceiver, GossipVerifiedVoteHashReceiver,
         },
         cluster_slots_service::{ClusterSlotsService, cluster_slots::ClusterSlots},
         commitment_service::AggregateCommitmentService,
         completed_data_sets_service::CompletedDataSetsSender,
-        consensus::{Tower, tower_storage::TowerStorage},
         cost_update_service::CostUpdateService,
         drop_bank_service::DropBankService,
         epoch_specs::EpochSpecs,
@@ -22,8 +20,6 @@ use {
         },
         replay_stage::{ReplayReceivers, ReplaySenders, ReplayStage, ReplayStageConfig},
         shred_fetch_stage::{SHRED_FETCH_CHANNEL_SIZE, ShredFetchStage},
-        voting_service::VotingService,
-        warm_quic_cache_service::WarmQuicCacheService,
         window_service::{WindowService, WindowServiceChannels},
     },
     agave_bls_sigverify::{
@@ -47,7 +43,6 @@ use {
     agave_votor_transport::{PeerList, endpoint::QuicDatagramEndpoint},
     arc_swap::ArcSwap,
     crossbeam_channel::{Receiver, Sender, bounded, unbounded},
-    solana_client::connection_cache::ConnectionCache,
     solana_clock::Slot,
     solana_geyser_plugin_manager::block_metadata_notifier_interface::BlockMetadataNotifierArc,
     solana_gossip::{
@@ -66,7 +61,6 @@ use {
         shred::filter::TurbineMode,
     },
     solana_net_utils::{PinnedXdpSender, quic_socket::QuicSocket},
-    solana_poh::{poh_controller::PohController, poh_recorder::PohRecorder},
     solana_pubkey::Pubkey,
     solana_rpc::{
         max_slots::MaxSlots, optimistically_confirmed_bank_tracker::BankNotificationSenderConfig,
@@ -79,7 +73,6 @@ use {
         snapshot_controller::SnapshotController,
         transaction_execution::TransactionStatusSender,
         validated_block_finalization::ValidatedBlockFinalizationCert,
-        vote_sender_types::ReplayVoteSender,
     },
     solana_streamer::evicting_sender::EvictingSender,
     solana_turbine::{XdpSender as TurbineXdpSender, retransmit_stage::RetransmitStage},
@@ -125,10 +118,8 @@ pub struct Tvu {
     replay_stage: ReplayStage,
     blockstore_cleanup_service: BlockstoreCleanupService,
     cost_update_service: CostUpdateService,
-    voting_service: VotingService,
     bls_voting_service: BLSVotingService,
     peer_list_service: PeerListService,
-    warm_quic_cache_service: Option<WarmQuicCacheService>,
     drop_bank_service: DropBankService,
     duplicate_shred_listener: DuplicateShredListener,
     bls_sigverifier: JoinHandle<()>,
@@ -154,7 +145,6 @@ pub struct TvuConfig {
     pub repair_validators: Option<HashSet<Pubkey>>,
     // Validators which should be given priority when serving repairs
     pub repair_whitelist: Arc<RwLock<HashSet<Pubkey>>>,
-    pub wait_for_vote_to_start_leader: bool,
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
     pub shred_sigverify_threads: NonZeroUsize,
@@ -171,7 +161,6 @@ impl Default for TvuConfig {
             shred_version: 0,
             repair_validators: None,
             repair_whitelist: Arc::new(RwLock::new(HashSet::default())),
-            wait_for_vote_to_start_leader: false,
             replay_forks_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             replay_transactions_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
@@ -230,10 +219,6 @@ impl Tvu {
         ledger_signal_receiver: Receiver<bool>,
         update_parent_receiver: UpdateParentReceiver,
         rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
-        poh_recorder: &Arc<RwLock<PohRecorder>>,
-        poh_controller: PohController,
-        tower: Tower,
-        tower_storage: Arc<dyn TowerStorage>,
         vote_history: VoteHistory,
         vote_history_storage: Arc<dyn VoteHistoryStorage>,
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
@@ -242,12 +227,10 @@ impl Tvu {
         turbine_mode: TurbineMode,
         transaction_status_sender: Option<TransactionStatusSender>,
         entry_notification_sender: Option<EntryNotifierSender>,
-        vote_tracker: Arc<VoteTracker>,
         retransmit_slots_sender: Sender<Slot>,
         gossip_verified_vote_hash_receiver: GossipVerifiedVoteHashReceiver,
         verified_voter_slots_sender: EvictingSender<VerifiedVotorSlotsMessage>,
         verified_voter_slots_receiver: Receiver<VerifiedVotorSlotsMessage>,
-        replay_vote_sender: ReplayVoteSender,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
         bank_notification_sender: Option<BankNotificationSenderConfig>,
         duplicate_confirmed_slots_receiver: DuplicateConfirmedSlotsReceiver,
@@ -256,11 +239,9 @@ impl Tvu {
         block_metadata_notifier: Option<BlockMetadataNotifierArc>,
         wait_to_vote_slot: Option<Slot>,
         snapshot_controller: Option<Arc<SnapshotController>>,
-        banking_tracer: Arc<BankingTracer>,
         outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
         cluster_slots: Arc<ClusterSlots>,
         slot_status_notifier: Option<SlotStatusNotifier>,
-        vote_connection_cache: Arc<ConnectionCache>,
         votor_init: AlpenglowInitializationState,
         reward_aggregates_sender: Sender<RewardInput>,
     ) -> Result<Self, String> {
@@ -515,15 +496,13 @@ impl Tvu {
 
         let (cost_update_sender, cost_update_receiver) = unbounded();
         let (drop_bank_sender, drop_bank_receiver) = unbounded();
-        let (voting_sender, voting_receiver) = unbounded();
         let (bls_sender, bls_receiver) = bounded(MAX_BLS_MESSAGES_TO_SEND);
 
-        let (lockouts_sender, votor_commitment_sender, commitment_service) =
-            AggregateCommitmentService::new(
-                exit.clone(),
-                block_commitment_cache.clone(),
-                rpc_subscriptions.clone(),
-            );
+        let (votor_commitment_sender, commitment_service) = AggregateCommitmentService::new(
+            exit.clone(),
+            block_commitment_cache.clone(),
+            rpc_subscriptions.clone(),
+        );
         let (own_votes_sender, own_votes_receiver) =
             EvictingSender::new_bounded(MAX_ALPENGLOW_PACKET_NUM);
         let (footer_certs_sender, footer_certs_receiver) = bounded(MAX_ALPENGLOW_PACKET_NUM);
@@ -571,19 +550,14 @@ impl Tvu {
             bank_notification_sender,
             ancestor_hashes_replay_update_sender,
             retransmit_slots_sender,
-            replay_vote_sender,
             cluster_slots_update_sender,
             cost_update_sender,
-            voting_sender,
-            bls_sender,
             drop_bank_sender,
             block_metadata_notifier,
             dumped_slots_sender,
             votor_event_sender,
-            own_votes_sender,
             footer_certs_sender,
             optimistic_parent_sender,
-            lockouts_sender,
             votor_commitment_sender,
         };
 
@@ -605,34 +579,16 @@ impl Tvu {
             authorized_voter_keypairs,
             exit: exit.clone(),
             leader_schedule_cache: leader_schedule_cache.clone(),
-            block_commitment_cache,
-            wait_for_vote_to_start_leader: tvu_config.wait_for_vote_to_start_leader,
-            tower_storage: tower_storage.clone(),
-            wait_to_vote_slot,
             replay_forks_threads: tvu_config.replay_forks_threads,
             replay_transactions_threads: tvu_config.replay_transactions_threads,
             blockstore: blockstore.clone(),
             bank_forks: bank_forks.clone(),
             cluster_info: cluster_info.clone(),
-            poh_recorder: poh_recorder.clone(),
-            poh_controller,
-            tower,
-            vote_tracker,
-            cluster_slots,
-            banking_tracer,
             snapshot_controller,
             replay_highest_frozen,
             highest_parent_ready,
             replay_arena: tvu_config.replay_arena,
         };
-
-        let voting_service = VotingService::new(
-            voting_receiver,
-            cluster_info.clone(),
-            poh_recorder.clone(),
-            tower_storage,
-            vote_connection_cache.clone(),
-        );
 
         let bls_voting_service = BLSVotingService::new(
             bls_receiver,
@@ -640,9 +596,6 @@ impl Tvu {
             votor_egress,
             highest_finalized,
         );
-
-        let warm_quic_cache_service =
-            create_cache_warmer_if_needed(vote_connection_cache, cluster_info, poh_recorder, &exit);
 
         let cost_update_service = CostUpdateService::new(cost_update_receiver);
 
@@ -682,10 +635,8 @@ impl Tvu {
             replay_stage,
             blockstore_cleanup_service,
             cost_update_service,
-            voting_service,
             bls_voting_service,
             peer_list_service,
-            warm_quic_cache_service,
             drop_bank_service,
             duplicate_shred_listener,
             bls_sigverifier,
@@ -707,11 +658,7 @@ impl Tvu {
         self.blockstore_cleanup_service.join()?;
         self.replay_stage.join()?;
         self.cost_update_service.join()?;
-        self.voting_service.join()?;
         self.bls_voting_service.join()?;
-        if let Some(warmup_service) = self.warm_quic_cache_service {
-            warmup_service.join()?;
-        }
         self.drop_bank_service.join()?;
         self.duplicate_shred_listener.join()?;
         if let Some(rt) = self.votor_transport_runtime.take() {
@@ -731,32 +678,11 @@ impl Tvu {
     }
 }
 
-fn create_cache_warmer_if_needed(
-    vote_connection_cache: Arc<ConnectionCache>,
-    cluster_info: &Arc<ClusterInfo>,
-    poh_recorder: &Arc<RwLock<PohRecorder>>,
-    exit: &Arc<AtomicBool>,
-) -> Option<WarmQuicCacheService> {
-    let vote_connection_cache = Some(vote_connection_cache).filter(|cache| cache.use_quic());
-
-    (vote_connection_cache.is_some()).then(|| {
-        WarmQuicCacheService::new(
-            vote_connection_cache,
-            cluster_info.clone(),
-            poh_recorder.clone(),
-            exit.clone(),
-        )
-    })
-}
-
 #[cfg(test)]
 pub mod tests {
     use {
         super::*,
-        crate::{
-            admin_rpc_post_init::KeyUpdaters, block_creation_loop::ReplayHighestFrozen,
-            consensus::tower_storage::FileTowerStorage,
-        },
+        crate::{admin_rpc_post_init::KeyUpdaters, block_creation_loop::ReplayHighestFrozen},
         agave_votor::{
             event::{VotorEventReceiver, VotorEventSender},
             vote_history::VoteHistory,
@@ -776,7 +702,6 @@ pub mod tests {
         solana_rpc::optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         solana_runtime::{bank::Bank, bank_forks_controller::BankForksControllerHandle},
         solana_signer::Signer,
-        solana_tpu_client::tpu_client::{DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC},
         std::sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -814,8 +739,8 @@ pub mod tests {
         let bank = bank_forks.read().unwrap().working_bank();
         let (
             exit,
-            poh_recorder,
-            poh_controller,
+            _poh_recorder,
+            _poh_controller,
             _transaction_recorder,
             poh_service,
             _entry_receiver,
@@ -827,22 +752,10 @@ pub mod tests {
         let (_gossip_verified_vote_hash_sender, gossip_verified_vote_hash_receiver) = bounded(1024);
         let (verified_voter_slots_sender, verified_voter_slots_receiver) =
             EvictingSender::new_bounded(1024);
-        let (replay_vote_sender, _replay_vote_receiver) = bounded(1024);
         let (_, gossip_confirmed_slots_receiver) = bounded(1024);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
         let outstanding_repair_requests = Arc::<RwLock<OutstandingShredRepairs>>::default();
         let cluster_slots = Arc::new(ClusterSlots::default_for_tests());
-        let connection_cache = if DEFAULT_VOTE_USE_QUIC {
-            ConnectionCache::new_quic_for_tests(
-                "connection_cache_vote_quic",
-                DEFAULT_TPU_CONNECTION_POOL_SIZE,
-            )
-        } else {
-            ConnectionCache::with_udp(
-                "connection_cache_vote_udp",
-                DEFAULT_TPU_CONNECTION_POOL_SIZE,
-            )
-        };
         let replay_highest_frozen = Arc::new(ReplayHighestFrozen::default());
         let (leader_window_info_sender, _leader_window_info_receiver) = bounded(1024);
         let (optimistic_parent_sender, optimistic_parent_receiver) = bounded(1024);
@@ -882,10 +795,6 @@ pub mod tests {
                 block_commitment_cache.clone(),
                 OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
             ))),
-            &poh_recorder,
-            poh_controller,
-            Tower::default(),
-            Arc::new(FileTowerStorage::default()),
             VoteHistory::default(),
             Arc::new(NullVoteHistoryStorage::default()),
             &leader_schedule_cache,
@@ -894,12 +803,10 @@ pub mod tests {
             TurbineMode::default(),
             None, // transaction_status_sender
             None, // entry_notification_sender
-            Arc::<VoteTracker>::default(),
             retransmit_slots_sender,
             gossip_verified_vote_hash_receiver,
             verified_voter_slots_sender,
             verified_voter_slots_receiver,
-            replay_vote_sender,
             None, // completed_data_sets_sender
             None, // bank_notification_sender
             gossip_confirmed_slots_receiver,
@@ -908,11 +815,9 @@ pub mod tests {
             None, // block_metadata_notifier
             None, // wait_to_vote_slot
             None, // snapshot_controller
-            BankingTracer::new_disabled(),
             outstanding_repair_requests,
             cluster_slots,
             None, // slot_status_notifier
-            Arc::new(connection_cache),
             AlpenglowInitializationState {
                 alpenglow_slot_clock: SharedAlpenglowSlotClock::default(),
                 leader_window_info_sender,

@@ -270,7 +270,7 @@ impl<T: Clone> StatusCache<T> {
     /// This is never called concurrently with add_root(), and for a slot to be a root there must be
     /// no new entries for that slot, so there are no races.
     ///
-    /// See ReplayStage::handle_new_root() => BankForks::set_root() =>
+    /// See root_utils::set_bank_forks_root() => BankForks::set_root() =>
     /// BankForks::do_set_root_return_metrics() => root_slot_deltas()
     pub fn root_slot_deltas(&self) -> Vec<SlotDelta<T>> {
         self.roots()

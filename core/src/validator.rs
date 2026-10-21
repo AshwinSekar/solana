@@ -12,7 +12,7 @@ use {
         cluster_info_vote_listener::VoteTracker,
         completed_data_sets_service::CompletedDataSetsService,
         consensus::{
-            ExternalRootSource, Tower, reconcile_blockstore_roots_with_external_source,
+            ExternalRootSource, reconcile_blockstore_roots_with_external_source,
             tower_storage::{NullTowerStorage, TowerStorage},
             verify_blockstore_root_with_vote_history,
         },
@@ -53,7 +53,6 @@ use {
         accounts_update_notifier_interface::AccountsUpdateNotifier,
         utils::validate_account_paths_for_direct_io,
     },
-    solana_client::connection_cache::{ConnectionCache, Protocol},
     solana_clock::Slot,
     solana_entry::poh::compute_hash_time,
     solana_epoch_schedule::MAX_LEADER_SCHEDULE_EPOCH_OFFSET,
@@ -154,11 +153,10 @@ use {
         streamer::StakedNodes,
     },
     solana_time_utils::timestamp,
-    solana_tpu_client::tpu_client::{DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC},
     solana_turbine::{self, broadcast_stage::BroadcastStageType},
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     solana_validator_exit::Exit,
-    solana_vote_program::vote_state::{VoteStateV4, handler::VoteStateHandler},
+    solana_vote_program::vote_state::handler::VoteStateHandler,
     std::{
         borrow::Cow,
         cmp,
@@ -364,7 +362,6 @@ pub struct ValidatorConfig {
     /// Run PoH, transaction signature and other transaction verification during blockstore
     /// processing.
     pub run_verification: bool,
-    pub require_tower: bool,
     pub require_vote_history: bool,
     pub tower_storage: Arc<dyn TowerStorage>,
     pub vote_history_storage: Arc<dyn VoteHistoryStorage>,
@@ -388,7 +385,6 @@ pub struct ValidatorConfig {
     pub staked_nodes_overrides: Arc<RwLock<HashMap<Pubkey, u64>>>,
     pub validator_exit: Arc<RwLock<Exit>>,
     pub validator_exit_backpressure: HashMap<String, Arc<AtomicBool>>,
-    pub no_wait_for_vote_to_start_leader: bool,
     pub wait_to_vote_slot: Option<Slot>,
     pub runtime_config: RuntimeConfig,
     pub banking_trace_dir_byte_limit: banking_trace::DirByteLimit,
@@ -444,7 +440,6 @@ impl ValidatorConfig {
             gossip_validators: None,
             max_genesis_archive_unpacked_size: MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
             run_verification: true,
-            require_tower: false,
             require_vote_history: false,
             tower_storage: Arc::new(NullTowerStorage::default()),
             vote_history_storage: Arc::new(NullVoteHistoryStorage::default()),
@@ -468,7 +463,6 @@ impl ValidatorConfig {
             staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
             validator_exit: Arc::new(RwLock::new(Exit::default())),
             validator_exit_backpressure: HashMap::default(),
-            no_wait_for_vote_to_start_leader: true,
             accounts_db_config: ACCOUNTS_DB_CONFIG_FOR_TESTING,
             wait_to_vote_slot: None,
             runtime_config: RuntimeConfig::default(),
@@ -627,8 +621,6 @@ struct TransactionHistoryServices {
 
 /// A struct easing passing Validator TPU Configurations
 pub struct ValidatorTpuConfig {
-    /// Controls if to use QUIC for sending TPU votes
-    pub vote_use_quic: bool,
     /// QUIC server config for regular TPU
     pub tpu_quic_server_config: SwQosQuicStreamerConfig,
     /// QUIC server config for TPU forward
@@ -682,7 +674,6 @@ impl ValidatorTpuConfig {
         let sigverify_threads = NonZeroUsize::new(2).expect("2 is non-zero");
 
         ValidatorTpuConfig {
-            vote_use_quic: DEFAULT_VOTE_USE_QUIC,
             tpu_quic_server_config,
             tpu_fwd_quic_server_config,
             vote_quic_server_config,
@@ -796,7 +787,6 @@ impl Validator {
         info!("debug-assertion status: {DEBUG_ASSERTION_STATUS}");
 
         let ValidatorTpuConfig {
-            vote_use_quic,
             tpu_quic_server_config,
             tpu_fwd_quic_server_config,
             vote_quic_server_config,
@@ -1138,7 +1128,7 @@ impl Validator {
         let (record_sender, record_receiver) = record_channels(transaction_status_sender.is_some());
         let transaction_recorder = TransactionRecorder::new(record_sender);
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
-        let (poh_controller, poh_service_message_receiver) = PohController::new();
+        let (_poh_controller, poh_service_message_receiver) = PohController::new();
         let (bank_forks_controller, bank_forks_controller_receiver) =
             BankForksControllerHandle::new();
         let bank_forks_controller = Arc::new(bank_forks_controller);
@@ -1247,30 +1237,6 @@ impl Validator {
 
         let mut tpu_transactions_forwards_client_sockets =
             Some(node.sockets.tpu_transaction_forwarding_clients);
-
-        let vote_connection_cache = if vote_use_quic {
-            let vote_connection_cache = ConnectionCache::new_with_client_options(
-                "connection_cache_vote_quic",
-                DEFAULT_TPU_CONNECTION_POOL_SIZE,
-                Some(node.sockets.quic_vote_client),
-                Some((
-                    &identity_keypair,
-                    node.info
-                        .tpu_vote(Protocol::QUIC)
-                        .ok_or_else(|| {
-                            ValidatorError::Other(String::from("Invalid QUIC address for TPU Vote"))
-                        })?
-                        .ip(),
-                )),
-                Some((&staked_nodes, &identity_keypair.pubkey())),
-            );
-            Arc::new(vote_connection_cache)
-        } else {
-            Arc::new(ConnectionCache::with_udp(
-                "connection_cache_vote_udp",
-                DEFAULT_TPU_CONNECTION_POOL_SIZE,
-            ))
-        };
 
         let key_notifiers = Arc::new(RwLock::new(KeyUpdaters::default()));
 
@@ -1597,9 +1563,6 @@ impl Validator {
         let blockstore_metric_report_service =
             BlockstoreMetricReportService::new(blockstore.clone(), exit.clone());
 
-        let wait_for_vote_to_start_leader =
-            !waited_for_supermajority && !config.no_wait_for_vote_to_start_leader;
-
         // Pass RecordReceiver from PohService to BlockCreationLoop when shutting down. Gives us a strong guarentee
         // that both block producers are not running at the same time
         let (record_receiver_sender, record_receiver_receiver) = bounded(1);
@@ -1681,13 +1644,13 @@ impl Validator {
             exit.clone(),
         );
 
-        let (tower, vote_history) = process_blockstore.process().map_err(|e| {
+        let vote_history = process_blockstore.process().map_err(|e| {
             ValidatorError::Other(format!(
-                "Unable to restore Tower or VoteHistory and either --require-tower was specified \
-                 or --do-not-require-vote-history was not specified. Aborting {e}"
+                "Unable to restore VoteHistory and --do-not-require-vote-history was not \
+                 specified. Aborting {e}"
             ))
         })?;
-        info!("Tower state: {tower:?}, Vote History state: {vote_history:?}");
+        info!("Vote History state: {vote_history:?}");
 
         migration_status.log_phase();
 
@@ -1724,10 +1687,6 @@ impl Validator {
             ledger_signal_receiver,
             update_parent_receiver,
             rpc_subscriptions.clone(),
-            &poh_recorder,
-            poh_controller,
-            tower,
-            config.tower_storage.clone(),
             vote_history,
             config.vote_history_storage.clone(),
             &leader_schedule_cache,
@@ -1736,12 +1695,10 @@ impl Validator {
             config.turbine_mode.clone(),
             transaction_status_sender.clone(),
             entry_notification_sender.clone(),
-            vote_tracker.clone(),
             retransmit_slots_sender,
             gossip_verified_vote_hash_receiver,
             verified_vote_sender.clone(),
             verified_vote_receiver,
-            replay_vote_sender.clone(),
             completed_data_sets_sender,
             bank_notification_sender.clone(),
             duplicate_confirmed_slots_receiver,
@@ -1750,7 +1707,6 @@ impl Validator {
                 shred_version: node.info.shred_version(),
                 repair_validators: config.repair_validators.clone(),
                 repair_whitelist: config.repair_whitelist.clone(),
-                wait_for_vote_to_start_leader,
                 replay_forks_threads: config.replay_forks_threads,
                 replay_transactions_threads: config.replay_transactions_threads,
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,
@@ -1763,11 +1719,9 @@ impl Validator {
             block_metadata_notifier,
             config.wait_to_vote_slot,
             Some(snapshot_controller.clone()),
-            banking_tracer,
             outstanding_repair_requests.clone(),
             cluster_slots,
             slot_status_notifier,
-            vote_connection_cache,
             AlpenglowInitializationState {
                 alpenglow_slot_clock: alpenglow_slot_clock.clone(),
                 leader_window_info_sender,
@@ -2117,26 +2071,12 @@ impl Validator {
     }
 }
 
-fn active_vote_account_exists_in_bank(bank: &Bank, vote_account: &Pubkey) -> bool {
-    if let Some(account) = &bank.get_account(vote_account)
-        && let Ok(vote_state) = VoteStateV4::deserialize(account.data(), vote_account)
-    {
-        return !vote_state.votes.is_empty();
-    }
-    false
-}
-
 /// Should we require that a vote history file is present
 pub fn should_require_vote_history_file(
     bank: &Bank,
     vote_account: &Pubkey,
     identity: &Pubkey,
 ) -> bool {
-    let Some(genesis_certificate) = bank.get_alpenglow_genesis_certificate() else {
-        // Vote history is only used when Alpenglow is active
-        return false;
-    };
-
     let Some(Ok(vote_state)) = bank
         .get_account(vote_account)
         .map(|acct| wincode::config::deserialize(acct.data(), WINCODE_CONFIG))
@@ -2157,12 +2097,15 @@ pub fn should_require_vote_history_file(
     }
 
     let Some(last_voted_slot) = vote_state_handler.last_voted_slot() else {
-        // New vote account
         return false;
     };
-    let genesis_slot = genesis_certificate.block.slot;
+    let genesis_slot = bank
+        .get_alpenglow_genesis_certificate()
+        .expect("full Alpenglow banks must carry the genesis certificate")
+        .block
+        .slot;
 
-    // We've voted past the alpenglow genesis
+    // A vote history is only required after this identity has participated in Alpenglow.
     last_voted_slot > genesis_slot
 }
 
@@ -2240,90 +2183,6 @@ fn maybe_cluster_restart_with_hard_fork(config: &ValidatorConfig, root_slot: Slo
     }
 
     None
-}
-
-fn post_process_restored_tower(
-    restored_tower: crate::consensus::Result<Tower>,
-    validator_identity: &Pubkey,
-    vote_account: &Pubkey,
-    config: &ValidatorConfig,
-    bank_forks: &BankForks,
-) -> Result<Tower, String> {
-    let mut should_require_tower = config.require_tower;
-
-    let restored_tower = restored_tower.and_then(|tower| {
-        let root_bank = bank_forks.root_bank();
-        let slot_history = root_bank
-            .get_slot_history()
-            .expect("slot history must exist");
-        // make sure tower isn't corrupted first before the following hard fork check
-        let tower = tower.adjust_lockouts_after_replay(root_bank.slot(), &slot_history);
-
-        if let Some(hard_fork_restart_slot) =
-            maybe_cluster_restart_with_hard_fork(config, root_bank.slot())
-        {
-            // intentionally fail to restore tower; we're supposedly in a new hard fork; past
-            // out-of-chain vote state doesn't make sense at all
-            // what if --wait-for-supermajority again if the validator restarted?
-            let message =
-                format!("Hard fork is detected; discarding tower restoration result: {tower:?}");
-            datapoint_error!("tower_error", ("error", message, String),);
-            error!("{message}");
-
-            // unconditionally relax tower requirement so that we can always restore tower
-            // from root bank.
-            should_require_tower = false;
-            return Err(crate::consensus::TowerError::HardFork(
-                hard_fork_restart_slot,
-            ));
-        }
-
-        if let Some(warp_slot) = config.warp_slot {
-            // unconditionally relax tower requirement so that we can always restore tower
-            // from root bank after the warp
-            should_require_tower = false;
-            return Err(crate::consensus::TowerError::HardFork(warp_slot));
-        }
-
-        tower
-    });
-
-    let restored_tower = match restored_tower {
-        Ok(tower) => tower,
-        Err(err) => {
-            let voting_has_been_active =
-                active_vote_account_exists_in_bank(&bank_forks.working_bank(), vote_account);
-            if !err.is_file_missing() {
-                datapoint_error!(
-                    "tower_error",
-                    ("error", format!("Unable to restore tower: {err}"), String),
-                );
-            }
-            if should_require_tower && voting_has_been_active {
-                return Err(format!(
-                    "Requested mandatory tower restore failed: {err}. And there is an existing \
-                     vote_account containing actual votes. Aborting due to possible conflicting \
-                     duplicate votes"
-                ));
-            }
-            if err.is_file_missing() && !voting_has_been_active {
-                // Currently, don't protect against spoofed snapshots with no tower at all
-                info!(
-                    "Ignoring expected failed tower restore because this is the initial validator \
-                     start with the vote account..."
-                );
-            } else {
-                error!(
-                    "Rebuilding a new tower from the latest vote account due to failed tower \
-                     restore: {err}"
-                );
-            }
-
-            Tower::new_from_bankforks(bank_forks, validator_identity, vote_account)
-        }
-    };
-
-    Ok(restored_tower)
 }
 
 fn post_process_restored_vote_history(
@@ -2639,7 +2498,6 @@ pub struct ProcessBlockStore<'a> {
     blockstore_root_scan: Option<BlockstoreRootScan>,
     snapshot_controller: &'a SnapshotController,
     config: &'a ValidatorConfig,
-    tower: Option<Tower>,
     vote_history: Option<VoteHistory>,
     my_shred_version: u16,
 }
@@ -2676,16 +2534,14 @@ impl<'a> ProcessBlockStore<'a> {
             blockstore_root_scan: Some(blockstore_root_scan),
             snapshot_controller,
             config,
-            tower: None,
             vote_history: None,
             my_shred_version,
         }
     }
 
-    pub(crate) fn process(&mut self) -> Result<(Tower, VoteHistory), String> {
-        if let (Some(tower), Some(vote_history)) = (self.tower.as_ref(), self.vote_history.as_ref())
-        {
-            return Ok((tower.clone(), vote_history.clone()));
+    pub(crate) fn process(&mut self) -> Result<VoteHistory, String> {
+        if let Some(vote_history) = self.vote_history.as_ref() {
+            return Ok(vote_history.clone());
         }
 
         // This means we have not fully processed blockstore yet. Attempt to load and process
@@ -2731,28 +2587,6 @@ impl<'a> ProcessBlockStore<'a> {
             blockstore_root_scan.join();
         }
 
-        // Load and post process tower
-        let tower = {
-            let restored_tower = Tower::restore(self.config.tower_storage.as_ref(), self.id);
-            if let Ok(tower) = &restored_tower {
-                // reconciliation attempt 1 of 2 with tower
-                reconcile_blockstore_roots_with_external_source(
-                    ExternalRootSource::Tower(tower.root()),
-                    self.blockstore,
-                    &mut self.original_blockstore_root,
-                )
-                .map_err(|err| format!("Failed to reconcile blockstore with tower: {err:?}"))?;
-            }
-
-            post_process_restored_tower(
-                restored_tower,
-                self.id,
-                self.vote_account,
-                self.config,
-                &self.bank_forks.read().unwrap(),
-            )?
-        };
-
         // Load and post process vote history
         let vote_history = {
             let vote_history =
@@ -2774,9 +2608,9 @@ impl<'a> ProcessBlockStore<'a> {
             self.config,
             self.bank_forks.read().unwrap().root(),
         ) {
-            // reconciliation attempt 2 of 2 with hard fork
-            // it is intentional that we do this second, as having the hard fork root < tower root
-            // is invalid! This means we've hard forked and missed a finalized slot
+            // Reconcile the blockstore with an explicitly requested hard fork after vote-history
+            // validation. A hard-fork root below the restored vote-history root means the
+            // validator missed a finalized slot.
             reconcile_blockstore_roots_with_external_source(
                 ExternalRootSource::HardFork(hard_fork_restart_slot),
                 self.blockstore,
@@ -2786,9 +2620,8 @@ impl<'a> ProcessBlockStore<'a> {
         }
 
         *self.start_progress.write().unwrap() = previous_start_process;
-        self.tower = Some(tower.clone());
         self.vote_history = Some(vote_history.clone());
-        Ok((tower, vote_history))
+        Ok(vote_history)
     }
 }
 
@@ -2855,8 +2688,7 @@ fn maybe_warp_slot(
         );
 
         drop(bank_forks);
-        // Process blockstore after warping bank forks to make sure tower and
-        // bank forks are in sync.
+        // Process blockstore after warping so the ledger and bank forks stay in sync.
         process_blockstore.process()?;
     }
     Ok(())
@@ -3295,7 +3127,6 @@ pub fn is_snapshot_config_valid(snapshot_config: &SnapshotConfig) -> bool {
 mod tests {
     use {
         super::*,
-        agave_votor_messages::certificate::{CertSignature, GenesisCert},
         crossbeam_channel::{RecvTimeoutError, bounded},
         solana_account::state_traits::StateMutWincode,
         solana_entry::entry,
@@ -3308,7 +3139,7 @@ mod tests {
         },
         solana_poh_config::PohConfig,
         solana_sha256_hasher::hash,
-        solana_vote_program::vote_state::{LandedVote, Lockout, VoteStateVersions},
+        solana_vote_program::vote_state::{LandedVote, Lockout, VoteStateV4, VoteStateVersions},
         std::{fs::remove_dir_all, num::NonZeroU64, thread, time::Duration},
     };
 
@@ -3372,7 +3203,10 @@ mod tests {
     #[test]
     fn test_should_require_vote_history_file() {
         use {
-            agave_votor_messages::consensus_message::Block,
+            agave_votor_messages::{
+                certificate::{CertSignature, GenesisCert},
+                consensus_message::Block,
+            },
             solana_account::AccountSharedData,
             solana_bls_signatures::{BLS_SIGNATURE_AFFINE_SIZE, Signature as BLSSignature},
         };
@@ -3382,10 +3216,6 @@ mod tests {
         let vote_account_pubkey = Pubkey::new_unique();
         let identity = Pubkey::new_unique();
 
-        assert!(!active_vote_account_exists_in_bank(
-            &bank,
-            &vote_account_pubkey
-        ));
         assert!(!should_require_vote_history_file(
             &bank,
             &vote_account_pubkey,
@@ -3402,10 +3232,6 @@ mod tests {
             .set_state(&VoteStateVersions::new_v4(vote_state.clone()))
             .unwrap();
         bank.store_account(&vote_account_pubkey, &vote_account);
-        assert!(!active_vote_account_exists_in_bank(
-            &bank,
-            &vote_account_pubkey
-        ));
         assert!(!should_require_vote_history_file(
             &bank,
             &vote_account_pubkey,
@@ -3420,24 +3246,14 @@ mod tests {
             .set_state(&VoteStateVersions::new_v4(vote_state.clone()))
             .unwrap();
         bank.store_account(&vote_account_pubkey, &vote_account);
-        assert!(active_vote_account_exists_in_bank(
-            &bank,
-            &vote_account_pubkey
-        ));
-        assert!(!should_require_vote_history_file(
-            &bank,
-            &vote_account_pubkey,
-            &identity,
-        ));
-
-        let cert = GenesisCert {
+        let genesis_cert = GenesisCert {
             block: Block::new_unique(40),
             signature: CertSignature {
                 signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
                 bitmap: vec![],
             },
         };
-        bank.set_alpenglow_genesis_certificate(&cert);
+        bank.set_alpenglow_genesis_certificate(&genesis_cert);
         assert!(!should_require_vote_history_file(
             &bank,
             &vote_account_pubkey,

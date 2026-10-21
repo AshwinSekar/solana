@@ -25,17 +25,13 @@ use {
     histogram::Histogram,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfoQuery},
     solana_perf::packet::{BytesPacket, PACKETS_PER_BATCH, bytes::Bytes},
-    solana_poh::{
-        poh_controller::PohController, poh_recorder::PohRecorder,
-        transaction_recorder::TransactionRecorder,
-    },
+    solana_poh::{poh_recorder::PohRecorder, transaction_recorder::TransactionRecorder},
     solana_pubkey::Pubkey,
     solana_runtime::{
-        bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
+        bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
         transaction_execution::TransactionStatusSender, vote_sender_types::ReplayVoteSender,
     },
     solana_time_utils::AtomicInterval,
-    solana_unified_scheduler_logic::SchedulingMode,
     std::{
         collections::HashSet,
         num::{NonZeroU64, NonZeroUsize},
@@ -55,6 +51,11 @@ use {
         receive_and_buffer::TransactionViewReceiveAndBuffer,
     },
     vote_worker::VoteWorker,
+};
+#[cfg(feature = "dev-context-only-utils")]
+use {
+    solana_poh::poh_controller::PohController, solana_runtime::bank::Bank,
+    solana_unified_scheduler_logic::SchedulingMode,
 };
 
 pub mod transaction_scheduler;
@@ -878,6 +879,7 @@ pub enum BankingControlMsg {
     },
 }
 
+#[cfg(feature = "dev-context-only-utils")]
 pub(crate) fn update_bank_forks_and_poh_recorder_for_new_tpu_bank(
     bank_forks: &RwLock<BankForks>,
     poh_controller: &mut PohController,

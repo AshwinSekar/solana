@@ -1183,7 +1183,6 @@ impl TestValidator {
             warp_slot: config.warp_slot,
             validator_exit: config.validator_exit.clone(),
             blockstore_cleanup_strategy: config.blockstore_cleanup_strategy,
-            no_wait_for_vote_to_start_leader: true,
             staked_nodes_overrides: config.staked_nodes_overrides.clone(),
             accounts_db_config,
             runtime_config,

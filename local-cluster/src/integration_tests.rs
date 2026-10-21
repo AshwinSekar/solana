@@ -175,7 +175,7 @@ pub fn run_cluster_partition<C>(
     on_before_partition_resolved: impl FnOnce(&mut LocalCluster, &mut C),
     on_partition_resolved: impl FnOnce(&mut LocalCluster, &mut C),
     ticks_per_slot: Option<u64>,
-    no_wait_for_vote_to_start_leader: bool,
+    wait_for_supermajority_at_slot_zero: bool,
     additional_accounts: Vec<(Pubkey, AccountSharedData)>,
 ) {
     agave_logger::setup_with_default(AG_DEBUG_LOG_FILTER);
@@ -189,7 +189,7 @@ pub fn run_cluster_partition<C>(
     let mint_lamports = crate::local_cluster::DEFAULT_MINT_LAMPORTS
         + node_stakes.iter().sum::<u64>().saturating_mul(2);
     let turbine_mode = TurbineMode::new(TurbineModeKind::Enabled);
-    let wait_for_supermajority = if no_wait_for_vote_to_start_leader {
+    let wait_for_supermajority = if wait_for_supermajority_at_slot_zero {
         // This helps nodes get a little more in sync by waiting for
         // supermajority to observe slot 0. It still doesn't provide perfect
         // synchronization because there is quite a bit of work todo after the
@@ -204,7 +204,6 @@ pub fn run_cluster_partition<C>(
     };
     let mut validator_config = ValidatorConfig {
         wait_for_supermajority,
-        no_wait_for_vote_to_start_leader,
         turbine_mode: turbine_mode.clone(),
         ..ValidatorConfig::default_for_test()
     };
@@ -233,12 +232,7 @@ pub fn run_cluster_partition<C>(
         }
     };
 
-    // Always ensure at least one node is allowed to build blocks.
     let mut validator_configs = make_identical_validator_configs(&validator_config, num_nodes);
-    validator_configs
-        .first_mut()
-        .unwrap()
-        .no_wait_for_vote_to_start_leader = true;
     let slots_per_epoch = 2048;
     // Shared handle to the votor peer-socket override maps on each validator.
     // We populate it below to blackhole all peers (simulating a partition),

@@ -1,5 +1,5 @@
 use {
-    crate::{consensus::Stake, replay_stage::DUPLICATE_THRESHOLD},
+    crate::consensus::{DUPLICATE_THRESHOLD, Stake},
     solana_pubkey::Pubkey,
     std::{
         collections::HashMap,

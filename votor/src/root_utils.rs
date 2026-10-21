@@ -87,16 +87,10 @@ pub(crate) fn set_root(
     }
 }
 
-/// Sets the new root, additionally performs the callback after setting the bank forks root
-/// During this transition period where both replay stage and voting loop can root depending on the feature flag we
-/// have a callback that cleans up progress map and other tower bft structures. Then the callgraph is
+/// Sets the new root and invokes the callback after updating bank forks.
 ///
-/// ReplayStage::check_and_handle_new_root -> root_utils::check_and_handle_new_root(callback)
-///                                                             |
-///                                                             v
-/// ReplayStage::handle_new_root           -> root_utils::set_bank_forks_root(callback) -> callback()
-///
-/// Votor does not need the progress map or other tower bft structures, so it will not use the callback.
+/// The callback lets callers update state that must observe the new bank-forks root. Callers
+/// without additional root-local state can pass a no-op.
 #[allow(clippy::too_many_arguments)]
 pub fn check_and_handle_new_root<CB>(
     parent_slot: Slot,
